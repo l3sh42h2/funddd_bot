@@ -1,5 +1,8 @@
-"""OKX DEX на EVM — спот-нога SpotLeg (trade_spec §4: «Guards before signing», «Gas», «Result»). Сейчас BSC;
-Robinhood Chain (4663) — тот же класс со своей сетью (allowlist роутера и spender для неё — сначала вживую).
+"""OKX DEX на EVM — спот-нога SpotLeg (trade_spec §4: «Guards before signing», «Gas», «Result»). BSC и Robinhood
+Chain (4663, Arbitrum Nitro L2) — тот же класс, сеть только в chain/chain_id/RPC (tconfig.py). Allowlist роутера и
+spender для 4663 пока ПУСТ (13.09.2026: доки OKX не отвечают с этой машины, см. tconfig.py у OKX_ROUTERS) — своп
+и approve на этой сети сейчас всегда отказывают гардом "router"/"spender" с текстом «не подтверждён»; снять адреса
+и заполнить allowlist — задача доктора на VPS с ключом, отдельно от этой копии.
 
 Путь клипа: /approve-transaction → approve токену (если allowance не хватает) → /swap → гарды → предполётный
 eth_estimateGas → EvmWallet.send_and_wait → разбор чека. Подписывается ТОЛЬКО то, что прошло все гарды; любой
@@ -7,7 +10,7 @@ eth_estimateGas → EvmWallet.send_and_wait → разбор чека. Подп�
 
 Гарды до подписи — каждый против своей подмены ответа API:
   получатель: поле получателя, если оно вообще есть в ответе, = наш кошелёк (swapReceiverAddress мы не шлём);
-  tx.from = кошелёк, tx.value = 0 (вход — ERC-20, BNB роутеру не отдаём);
+  tx.from = кошелёк, tx.value = 0 (вход — ERC-20, нативную монету сети — BNB/ETH — роутеру не отдаём);
   tx.to — роутер из allowlist (OKX меняла роутер 30.03 и 04.08.2026: новый = стоп и отчёт, а не «принять»);
   токены маршрута и fromTokenAmount = запрошенные;
   не honeypot (ни вход, ни выход); taxRate = 0, если владелец не разрешил токены с налогом (пусто = не разрешил);
@@ -191,7 +194,11 @@ def _check_trim(tail: bytes, chain: str, quoted: int) -> None:
         raise GuardError("calldata_tail", f"хвост calldata ({len(tail)} байт) — не trim OKX: возможна чужая "
                                           "комиссия; стоп")
     expect, rate, to = int.from_bytes(tail[7:32], "big"), int.from_bytes(tail[38:44], "big"), "0x" + tail[44:].hex()
-    if to not in tconfig.OKX_TRIM_RECEIVERS.get(tconfig.chain_index(chain), frozenset()):
+    ci = tconfig.chain_index(chain)
+    if to not in tconfig.OKX_TRIM_RECEIVERS.get(ci, frozenset()):
+        if not tconfig.OKX_TRIM_RECEIVERS.get(ci):
+            raise GuardError("calldata_tail", f"получатель trim OKX для сети {ci} не подтверждён — allowlist пуст "
+                                              "(сеть новая): снять живым /swap при doctor")
         raise GuardError("calldata_tail", f"получатель trim {to} не из allowlist OKX — стоп")
     if rate > tconfig.OKX_TRIM_RATE_MAX:
         raise GuardError("calldata_tail", f"доля trim {rate} больше увиденной вживую {tconfig.OKX_TRIM_RATE_MAX}")
@@ -234,9 +241,14 @@ def check_swap(resp: Any, *, chain: str, wallet: str, token_in: str, token_out: 
     if _lc(tx.get("from")) != me:
         raise GuardError("from", f"tx.from = {tx.get('from')}, а кошелёк {wallet}")
     if _uint(tx.get("value", "0"), "value", "tx.value") != 0:
-        raise GuardError("value", f"tx.value = {tx.get('value')}: своп ERC-20 не отдаёт BNB")
+        native = tconfig.NATIVE_SYMBOL.get(chain, "нативные")
+        raise GuardError("value", f"tx.value = {tx.get('value')}: своп ERC-20 не отдаёт {native}")
     to = tx.get("to")
     if not tconfig.router_allowed(chain, to if isinstance(to, str) else None):
+        if not tconfig.router_confirmed(chain):
+            raise GuardError("router", f"адрес роутера OKX для сети {tconfig.chain_index(chain)} не подтверждён — "
+                                       "allowlist пуст (сеть новая): снять живым /swap при doctor и отдать "
+                                       "владельцу на подтверждение")
         raise GuardError("router", f"незнакомый роутер {to}: OKX меняла роутер 30.03 и 04.08 — стоп, нужен новый "
                                    "адрес в allowlist после проверки владельцем")
     ft, tt = rr.get("fromToken") or {}, rr.get("toToken") or {}
@@ -291,6 +303,10 @@ def check_approve(resp: Any, *, chain: str, token: str, amount: int) -> tuple[st
         raise GuardError("shape", "ответ /approve-transaction не объект")
     sp = resp.get("dexContractAddress")
     if not tconfig.spender_allowed(chain, sp if isinstance(sp, str) else None):
+        if not tconfig.spender_confirmed(chain):
+            raise GuardError("spender", f"адрес spender OKX (TokenApprove) для сети {tconfig.chain_index(chain)} "
+                                        "не подтверждён — allowlist пуст (сеть новая): снять живым "
+                                        "/approve-transaction при doctor и отдать владельцу на подтверждение")
         raise GuardError("spender", f"незнакомый spender {sp} — стоп, нужен allowlist после проверки владельцем")
     want = tconfig.SEL_APPROVE + _word(sp) + f"{int(amount):064x}"
     data = str(resp.get("data") or "").lower()
@@ -436,16 +452,23 @@ class OkxEvmSpot:
             raise GuardError("slippage", f"clip_slippage_pct {clip} шире потолка slippage_pct {slip}")
         return clip if clip is not None else slip
 
+    def _native_symbol(self) -> str:
+        """Имя нативной монеты сети для текста гардов (BSC — BNB, Robinhood Chain — ETH); неизвестная сеть здесь
+        не бывает — chain_id уже проверен в __init__ через tconfig.CHAIN_IDS."""
+        return tconfig.NATIVE_SYMBOL.get(self.chain, "нативных")
+
     def _check_native(self, gas_limit: int, gas_price: int, cfg) -> None:
-        """Газ без потолка, но оплатимым он быть обязан: BNB ≥ лимит × цена (+ резерв владельца, если задан)."""
+        """Газ без потолка, но оплатимым он быть обязан: нативной монеты сети ≥ лимит × цена (+ резерв владельца,
+        если задан)."""
+        native = self._native_symbol()
         try:
             bal = self.rpc.native_balance(self.wallet)
         except Exception as e:           # noqa
-            raise GuardError("native", f"баланс BNB не прочитан: {redact(e)}") from None
+            raise GuardError("native", f"баланс {native} не прочитан: {redact(e)}") from None
         reserve = cfg.get("dex.native_reserve") or D(0)
         need = int(gas_limit) * int(gas_price) + int((D(reserve) * WEI).to_integral_value(ROUND_CEILING))
         if bal < need:
-            raise GuardError("native", f"BNB {bal} wei < газ {gas_limit}×{gas_price} + резерв {reserve}")
+            raise GuardError("native", f"{native} {bal} wei < газ {gas_limit}×{gas_price} + резерв {reserve}")
 
     def _net_gas_price(self, api_gp: int) -> int:
         try:
