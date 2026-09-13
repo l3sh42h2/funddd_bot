@@ -34,8 +34,11 @@ def test_legacy_owner_files_unchanged(tmp_path, case):
     cfg = owner.load(ROOT / "deploy" / "owner.toml.example" if c["text"] is None else write(tmp_path, c["text"]))
     assert cfg.frozen()["values"] == c["values"]                       # копия сделки — байт-в-байт прежняя
     assert cfg.mode == c["mode"] and cfg.unresolved_auto() == c["unresolved_auto"]
-    assert cfg.live_missing("aster") == c["live_missing"]
-    assert cfg.live_missing("hyperliquid", "bsc") == c["live_missing_hl"]
+    # владелец 13.09: «количество сделок устанавливаю я» — limits.max_open_deals больше не обязателен для live
+    # (снимок снят раньше этого решения); остальной список — прежний, в прежнем порядке
+    drop = {"limits.max_open_deals"}
+    assert cfg.live_missing("aster") == [k for k in c["live_missing"] if k not in drop]
+    assert cfg.live_missing("hyperliquid", "bsc") == [k for k in c["live_missing_hl"] if k not in drop]
     assert set(cfg.frozen()["values"]) == set(owner.LEGACY_SCHEMA) == set(c["keys"])
     assert owner.OwnerCfg.from_frozen(cfg.frozen_json()).values == cfg.values
     # старая связка включена без новых ключей; новая — выключена и ничего не требует от старой

@@ -651,7 +651,8 @@ class OwnerCfg:
         wallet = f"wallets.{chain}"
         self._known(wallet)
         keys = ["telegram.owner_id", wallet, *_VENUE_WALLETS.get(perp_venue, ()),
-                "limits.deal_max_usd_per_leg", "limits.max_open_deals", "limits.daily_loss_stop_usd",
+                "limits.deal_max_usd_per_leg", "limits.daily_loss_stop_usd",   # max_open_deals — не обязателен
+                # (владелец 13.09: «количество сделок устанавливаю я»): нет ключа — лимита числа сделок нет
                 "dex.slippage_pct", "dex.impact_cap_pct", "dex.approve_policy", "dex.broadcast",
                 "dex.allow_tax_tokens", "dex.native_reserve",
                 *(f"perp.{perp_venue}.{k}" for k in _PERP if f"perp.{perp_venue}.{k}" not in OPTIONAL),
