@@ -1,0 +1,23 @@
+[Unit]
+Description=funding_bot trader (Telegram-бот владельца + исполнитель фазы 2; сделки только по его команде)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=admin
+WorkingDirectory=/home/admin/hyper/funding_bot
+# БЕЗ «-»: без .env (токен бота, ключи) трейдер не стартует вовсе (у коллектора «-» уместен — у него ключ необязателен)
+EnvironmentFile=/home/admin/hyper/funding_bot/.env
+ExecStart=/home/admin/hyper/funding_bot/.venv/bin/funding_bot trader
+Restart=always
+RestartSec=5
+# 78 — ошибка настройки (нет TG_BOT_TOKEN, битый owner.toml, ключ не сошёлся с адресом, часы > 2 с): по кругу не лечится
+RestartPreventExitStatus=78
+KillSignal=SIGTERM
+# SIGTERM: новое не начинается, текущая пара ног (своп → хедж) доводится; 180 с — с запасом на 90 с отмены tx
+TimeoutStopSec=180
+StandardOutput=append:/home/admin/hyper/funding_bot/logs/trader.log
+StandardError=append:/home/admin/hyper/funding_bot/logs/trader.log
+
+[Install]
+WantedBy=multi-user.target

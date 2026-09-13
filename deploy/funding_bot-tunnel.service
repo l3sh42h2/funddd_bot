@@ -1,0 +1,17 @@
+[Unit]
+# Публичная ссылка на дашборд (владелец 12.09: «публичный адрес», «чтоб у друга открывался»; без пароля — на странице
+# только публичные рыночные данные). Быстрый туннель Cloudflare: исходящее соединение с сервера, входящих портов нет.
+# Ссылка https://…trycloudflare.com живёт, пока живёт этот процесс: выкаты его НЕ перезапускают (deploy трогает только
+# collector и web); текущая ссылка — в журнале службы и в runtime/public_url.txt.
+Description=funding_bot public link (Cloudflare quick tunnel to 127.0.0.1:8792)
+After=network-online.target funding_bot-web.service
+Wants=network-online.target
+
+[Service]
+User=admin
+ExecStart=/bin/sh -c 'exec /usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8792 2>&1 | tee /home/admin/hyper/funding_bot/logs/tunnel.log | grep --line-buffered -o "https://[a-z0-9-]*\.trycloudflare\.com" | while read u; do echo "$u" > /home/admin/hyper/funding_bot/runtime/public_url.txt; done'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

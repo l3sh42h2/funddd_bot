@@ -1,0 +1,19 @@
+[Unit]
+Description=funding_bot collector (Aster/Binance public data -> sqlite + table.json)
+After=network-online.target
+
+[Service]
+User=admin
+WorkingDirectory=/home/admin/hyper/funding_bot
+# ключ OKX DEX (владелец кладёт сам; «-» — без файла служба тоже стартует, площадка просто выключена)
+EnvironmentFile=-/home/admin/hyper/funding_bot/.env
+ExecStart=/home/admin/hyper/funding_bot/.venv/bin/funding_bot collector
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=append:/home/admin/hyper/funding_bot/logs/collector.log
+StandardError=append:/home/admin/hyper/funding_bot/logs/collector.log
+
+[Install]
+WantedBy=multi-user.target

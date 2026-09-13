@@ -1,0 +1,22 @@
+[project]
+name = "funding_bot"
+version = "0.1.0"
+description = "Фарм фандинга Binance <-> Aster: коллектор публичных данных + живой дашборд (фаза 1)"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.28"]
+
+[project.scripts]
+funding_bot = "funding_bot.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# фаза 2 (исполнение): подпись EIP-712 для Aster v3 и транзакций BSC. Та же версия, что у соседних проектов
+# (polypin3, polypin-f); на сервере ставится один раз вручную — ensure_installed в деплое идёт с --no-deps.
+trade = ["eth-account==0.13.7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

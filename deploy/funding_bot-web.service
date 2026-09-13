@@ -1,0 +1,20 @@
+[Unit]
+Description=funding_bot dashboard (localhost only, reached over an ssh tunnel on 8792)
+After=network-online.target
+
+[Service]
+User=admin
+WorkingDirectory=/home/admin/hyper/funding_bot
+# CABINET_LOGIN и CABINET_PASS_HASH личного кабинета (/cabinet; строку хэша печатает `funding_bot cabinet-hash`).
+# Свой файл, НЕ .env: веб — публичный процесс (туннель), ключам торгового контура в его окружении не место.
+# Лежит в runtime/: выкат заменяет папку проекта целиком и сохраняет только runtime/ и .env (12.09 файл в корне
+# пропал при первом же выкате). «-» — без файла дашборд стартует, кабинет просто выключен («кабинет не настроен»)
+EnvironmentFile=-/home/admin/hyper/funding_bot/runtime/cabinet.env
+ExecStart=/home/admin/hyper/funding_bot/.venv/bin/funding_bot serve --port 8792 --host 127.0.0.1
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/admin/hyper/funding_bot/logs/web.log
+StandardError=append:/home/admin/hyper/funding_bot/logs/web.log
+
+[Install]
+WantedBy=multi-user.target
