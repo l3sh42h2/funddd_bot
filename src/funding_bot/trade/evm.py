@@ -1,8 +1,11 @@
 """EVM-нога фазы 2 (trade_spec §4, §1): чтение цепи с переключением узлов и ЕДИНСТВЕННЫЙ писатель кошелька.
+Сети: BSC (chainId 56) и Robinhood Chain (chainId 4663, Arbitrum Nitro L2 — см. tconfig.py); класс один на обе,
+сеть задаётся списком RPC и chain_id при создании (tconfig.rpc_urls(chain) / tconfig.CHAIN_IDS[chain]).
 
-EvmRpc — JSON-RPC поверх requests. Чтение переключается по списку BSC_RPC_URLS: публичные узлы режут частоту и
-падают, а «ни один узел не ответил» — это НЕИЗВЕСТНО (RpcUnavailable), а не пустой баланс. Ответ узла с ошибкой
-(откат симуляции) — RpcError: это ответ по существу, у другого узла он будет тем же.
+EvmRpc — JSON-RPC поверх requests. Чтение переключается по списку RPC сети (свой — переменной окружения,
+BSC_RPC_URLS / ROBINHOOD_RPC_URLS, см. tconfig.rpc_urls): публичные узлы режут частоту и падают, а «ни один узел
+не ответил» — это НЕИЗВЕСТНО (RpcUnavailable), а не пустой баланс. Ответ узла с ошибкой (откат симуляции) —
+RpcError: это ответ по существу, у другого узла он будет тем же.
 
 EvmWallet.send_and_wait — одна транзакция от подписи до чека:
   - flock runtime/evm_<addr>.lock: один писатель на кошелёк, даже если по ошибке запущены два процесса;
@@ -11,11 +14,13 @@ EvmWallet.send_and_wait — одна транзакция от подписи д
   - nonce = eth_getTransactionCount(addr, "pending"); pending > latest — в сети висит наша прежняя транзакция, и новую
     на новом nonce НЕ подписываю (lphedge брал nonce по latest — это ломалось на зависших);
   - legacy EIP-155 {nonce, gasPrice, gas, to, value, data, chainId}: base fee на BSC = 0, тип 0 принимается (12.09);
+    на Robinhood Chain (Arbitrum Nitro) base fee > 0, но приоритетная комиссия (eth_feeHistory reward) всегда 0 —
+    тип 0 (legacy) сеть тоже принимает (13.09, живой узел; см. tconfig.py) — второй тип транзакции не заводим;
   - сырые байты и хэш уходят в БД через on_signed ДО отправки (запись-до): упавший процесс найдёт хэш и nonce и
     спросит сеть, а не подпишет новую;
   - график зависшей (§1): 15 с без чека — ищем по хэшу; узел её не знает и nonce свободен — те же сырые байты ещё
-    раз; 30 с — тот же nonce и calldata по цене ×1.2; 90 с — 0 BNB самому себе на том же nonce и SentUnknown
-    (сделка на паузу, решает владелец). Новый своп на новом nonce, пока старый висит, — никогда.
+    раз; 30 с — тот же nonce и calldata по цене ×1.2; 90 с — 0 нативных (BNB/ETH) самому себе на том же nonce и
+    SentUnknown (сделка на паузу, решает владелец). Новый своп на новом nonce, пока старый висит, — никогда.
 Любое исключение после первой отправки становится SentUnknown: деньги, возможно, уже потрачены, и «повторить другим
 путём» нельзя (lphedge: запасной маршрут свопа потратил вход второй раз).
 """
@@ -166,11 +171,13 @@ def classify_send_error(message: str) -> str:
 
 
 class EvmRpc:
-    """JSON-RPC узлов сети. Чтение — с переключением по списку (липко: последний ответивший идёт первым)."""
+    """JSON-RPC узлов сети. Чтение — с переключением по списку (липко: последний ответивший идёт первым).
+    urls не задан — берутся публичные по умолчанию для chain (tconfig.rpc_urls; chain="bsc" — прежнее поведение,
+    ни байта не меняет)."""
 
     def __init__(self, urls: tuple[str, ...] | list[str] | None = None, session: requests.Session | None = None,
-                 timeout: float = RPC_TIMEOUT_S):
-        self.urls = tuple(urls) if urls else tconfig.bsc_rpc_urls()
+                 timeout: float = RPC_TIMEOUT_S, chain: str = "bsc"):
+        self.urls = tuple(urls) if urls else tconfig.rpc_urls(chain)
         if not self.urls:
             raise ValueError("нет ни одного RPC")
         self._s = session or requests.Session()

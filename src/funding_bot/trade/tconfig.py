@@ -39,7 +39,7 @@ UNIT_PX_RATIO_MAX = Decimal(3)          # вход: цена контракта 
 SHOW_LIQ_ALERT_X = Decimal("1.25")      # до ликвидации меньше 1.25 × порога тревоги — ⚠️. Не 2×: при
                                         # liq_alert "auto" (½ расстояния на входе) 2× = само расстояние
                                         # на входе, и строка мигала бы от любого сдвига цены (12.09)
-SHOW_NATIVE_SWAPS_MIN = 20              # газовой монеты (BNB) меньше чем на 20 свопов — ⚠️
+SHOW_NATIVE_SWAPS_MIN = 20              # газовой монеты сети (BNB/ETH, см. NATIVE_SYMBOL) меньше чем на 20 свопов — ⚠️
 SHOW_LEVERAGE = 1                       # плечо не 1x …
 SHOW_MARGIN_TYPE = "ISOLATED"           # … ISOLATED — ⚠️
 
@@ -50,37 +50,82 @@ MARK_S = 300                            # раз в 5 мин для каждой
 MARK_STALE_S = 900                      # расчёт старше 15 мин — в кабинете серым «устарело»
 MARK_KEEP_S = 7 * 86400                 # строки deal_marks старше 7 суток чистятся (последняя строка сделки остаётся)
 
-# --- EVM: транзакции (BSC) -----------------------------------------------------------------------
+# --- EVM: транзакции (BSC, Robinhood Chain) --------------------------------------------------------
 TX_LOOKUP_S = 15            # нет чека — ищем по хэшу; неизвестна — те же сырые байты ещё раз
 TX_BUMP_S = 30              # тот же nonce и calldata по цене ×TX_BUMP
-TX_CANCEL_S = 90            # 0 BNB самому себе на том же nonce → SentUnknown, сделка на паузу
+TX_CANCEL_S = 90            # 0 нативных самому себе на том же nonce → SentUnknown, сделка на паузу
 TX_BUMP = Decimal("1.2")    # geth-узлам нужна надбавка ≥10 %
 TX_RECEIPT_POLL_S = 1.0
 CANCEL_GAS = 21_000
 GAS_LIMIT_TX_MULT = Decimal("1.5")    # документация OKX: «increase this value by 50%»
-GAS_LIMIT_EST_MULT = Decimal("1.3")   # запас над eth_estimateGas (он же — предполётная симуляция)
-CHAIN_IDS = {"bsc": 56}
+GAS_LIMIT_EST_MULT = Decimal("1.3")   # запас над eth_estimateGas (он же — предполётная симуляция); на Robinhood
+                                      # Chain (Arbitrum Nitro) этот же запас покрывает и L1-комиссию — см. ниже
+# chainId сети = chainIndex OKX для EVM-сетей (config.OKX_DEX_CHAINS, тот же EIP-155 id). Проверено вживую 13.09.2026:
+# eth_chainId публичного RPC Robinhood Chain вернул 0x1237 = 4663 — совпадает.
+CHAIN_IDS = {"bsc": 56, "robinhood": 4663}
+# Нативный газ сети — только для текста гардов и отчёта (расчёты везде в wei, от сети не зависят): BSC — BNB,
+# Robinhood Chain — ETH (docs.robinhood.com/chain: L1 — Ethereum, газ в ETH; eth_getBalance ноги той же цепи).
+NATIVE_SYMBOL = {"bsc": "BNB", "robinhood": "ETH"}
 ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 SEL_BALANCE_OF = "0x70a08231"
 SEL_ALLOWANCE = "0xdd62ed3e"
 SEL_APPROVE = "0x095ea7b3"
 
-# Публичные RPC BSC по умолчанию; своё — BSC_RPC_URLS (через запятую). Чтение переключается по списку, отправка —
-# нет (исход неизвестной отправки выясняется по хэшу, а не повтором через другой узел).
+# Публичные RPC по умолчанию; своё — переменной окружения (через запятую, см. RPC_ENV_BY_CHAIN). Чтение
+# переключается по списку, отправка — нет (исход неизвестной отправки выясняется по хэшу, а не повтором через
+# другой узел).
 BSC_RPC_DEFAULTS = ("https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org")
+# Robinhood Chain (13.09.2026, документация + живой RPC с Мака). Единственный публичный узел в документации:
+# rpc.mainnet.chain.robinhood.com (docs.robinhood.com/chain/run-a-full-node, robinhood.com/us/en/support/articles/
+# robinhood-chain-mainnet) — RPC_URLS с одним адресом, как у любой новой сети, второго публичного не нашлось.
+# eth_chainId → 0x1237 (4663); блок несёт l1BlockNumber/sendRoot/sendCount — признаки Arbitrum Nitro, и
+# документация это подтверждает прямо: «Robinhood Chain is an Arbitrum Chain running Arbitrum Nitro» (L1 —
+# Ethereum, нативный газ — ETH). eth_feeHistory отдаёт baseFeePerGas > 0 (в сети есть EIP-1559), но reward
+# (приоритетная комиссия) на всех последних блоках — 0, eth_maxPriorityFeePerGas тоже 0 — подписываем как и
+# раньше legacy-транзакцией (тип 0, EIP-155): Arbitrum Nitro принимает её наравне с EIP-1559, EvmWallet._sign_persist
+# менять не нужно. L1-комиссию отдельно не считаем и оракул L1 (как у OP-стека) не дёргаем: eth_estimateGas сети
+# уже включает её в L2-газ — это поведение Arbitrum Nitro, живой замер 13.09: перевод ETH без calldata
+# 21000 → 21225 газа, с ~40 байтами calldata → 21890 (регрессия — tests/test_rh_evm.py); существующий запас
+# GAS_LIMIT_EST_MULT (×1.3 над оценкой) и так с запасом это покрывает.
+ROBINHOOD_RPC_DEFAULTS = ("https://rpc.mainnet.chain.robinhood.com",)
+RPC_DEFAULTS_BY_CHAIN = {"bsc": BSC_RPC_DEFAULTS, "robinhood": ROBINHOOD_RPC_DEFAULTS}
+RPC_ENV_BY_CHAIN = {"bsc": "BSC_RPC_URLS", "robinhood": "ROBINHOOD_RPC_URLS"}
+
+
+def rpc_urls(chain: str, environ=None) -> tuple[str, ...]:
+    """Публичные RPC сети по умолчанию, переопределяемые своей переменной окружения (список через запятую).
+    Неизвестная сеть — KeyError (гард не должен молча взять чужой список)."""
+    c = str(chain).strip().lower()
+    if c not in RPC_DEFAULTS_BY_CHAIN:
+        raise KeyError(f"нет RPC по умолчанию для сети: {chain}")
+    env = os.environ if environ is None else environ
+    raw = (env.get(RPC_ENV_BY_CHAIN[c]) or "").strip()
+    urls = tuple(u.strip() for u in raw.split(",") if u.strip())
+    return urls or RPC_DEFAULTS_BY_CHAIN[c]
 
 
 def bsc_rpc_urls(environ=None) -> tuple[str, ...]:
-    env = os.environ if environ is None else environ
-    raw = (env.get("BSC_RPC_URLS") or "").strip()
-    urls = tuple(u.strip() for u in raw.split(",") if u.strip())
-    return urls or BSC_RPC_DEFAULTS
+    return rpc_urls("bsc", environ)
+
+
+def robinhood_rpc_urls(environ=None) -> tuple[str, ...]:
+    return rpc_urls("robinhood", environ)
 
 
 # --- OKX DEX: allowlist контрактов, увиденных вживую 12.09 --------------------------------------
 # Адреса берутся из каждого ответа API, а НЕ отсюда; здесь — только список допустимых. Роутер OKX менялся 30.03 и
 # 04.08.2026 («update whitelist»): незнакомый роутер или spender = стоп и отчёт владельцу, а не молчаливое «принять».
 # Ключ — chainIndex OKX (как config.OKX_DEX_STABLES); адреса в нижнем регистре.
+# Robinhood Chain (4663) здесь НЕТ ЗАПИСИ — оставлено пустым намеренно, не забыто: web3.okx.com и www.okx.com
+# 13.09.2026 не отвечают с этой машины (TLS-хендшейк рвётся ещё до ответа — тот же периметр, что и раньше пускал
+# живые запросы только с VPS, см. шапку okxdex.py, здесь — не VPS), а публичный репозиторий OKX
+# github.com/okxlabs/DEX-Router-EVM-V1 (DEPLOYMENT.md) сеть 4663 не перечисляет вовсе и даже для BSC называет
+# ДРУГИЕ роутер/spender, чем увиденные вживую 12.09 здесь (0x3156…54a0 / 0xd99c…eE98 против 0x5994…4dec /
+# 0x2c34…7cDD6) — то есть другой продукт/версия контракта, как источник для 4663 не годится. Пустой allowlist
+# делает router_allowed/spender_allowed False для ЛЮБОГО адреса на этой сети; evm_swap.check_swap/check_approve
+# отличают это отдельным текстом «не подтверждён» (см. tconfig.router_confirmed/spender_confirmed) от «OKX сменила
+# роутер», и отказывают в отправке. Снять адреса — живым /swap и /approve-transaction с ключом (doctor на VPS),
+# затем владелец подтверждает и они добавляются сюда — так же, как были добавлены для BSC.
 OKX_ROUTERS = {"56": frozenset({"0x5994814f2c4040b863a0125a45de152a8c2a4dec"})}
 OKX_SPENDERS = {"56": frozenset({"0x2c34a2fb1d0b4f55de51e1d0bdefaddce6b7cdd6"})}   # TokenApprove; старый 0x6015…ffaba8 — 0 событий
 # calldata роутера: dagSwapByOrderId(uint256 orderId, BaseRequest, RouterPath[]) — единственный метод во всех живых
@@ -89,11 +134,16 @@ OKX_SPENDERS = {"56": frozenset({"0x2c34a2fb1d0b4f55de51e1d0bdefaddce6b7cdd6"})}
 SEL_DAG_SWAP = "0xf2c42696"
 DAG_SWAP_TYPES = ("uint256", "(uint256,address,uint256,uint256,uint256)",
                   "(address[],address[],uint256[],bytes[],uint256)[]")
+# Селектор/ABI — общий на все сети (не per-chain словарь): для 4663 НЕ подтверждён тем же способом, что и роутер
+# (доки OKX недоступны — см. выше), но отдельно это неопасно — decode_dag_swap уже отказывает («selector») на любой
+# незнакомый метод, а до calldata дело и не дойдёт: router_allowed откажет раньше (allowlist 4663 пуст).
 # Хвост calldata после ABI (роутер читает его с конца) — «trim» OKX, 64 байта во всех живых ответах: слово 1 = флаг +
 # 0x80 + ожидаемый выход (= toTokenAmount), слово 2 = флаг + доля + получатель. Доля берётся только с выхода СВЕРХ
 # ожидаемого. Иное в хвосте (например, флаги комиссии 0x3ca20afc2aaa/…2bbb на чужой адрес) — стоп.
 OKX_TRIM_FLAG = "777777771111"
 OKX_TRIM_RATE_MAX = 100                 # увиденная вживую доля; больше — стоп
+# 4663 здесь тоже нет записи — та же причина, что у OKX_ROUTERS/OKX_SPENDERS выше; на практике до этой проверки
+# своп 4663 не доходит (router_allowed отказывает раньше), запись — для полноты и будущего doctor-скрипта.
 OKX_TRIM_RECEIVERS = {"56": frozenset({"0xfa00a9ed787f3793db668bff3e6e6e7db0f92a1b"})}
 
 
@@ -129,6 +179,16 @@ def router_allowed(chain: str, addr: str | None) -> bool:
 
 def spender_allowed(chain: str, addr: str | None) -> bool:
     return bool(addr) and addr.lower() in OKX_SPENDERS.get(chain_index(chain), frozenset())
+
+
+def router_confirmed(chain: str) -> bool:
+    """Есть ли для сети хоть один подтверждённый вживую адрес роутера (allowlist не пуст). False у новой сети
+    (например 4663) — evm_swap даёт отдельное сообщение «не подтверждён», а не «OKX сменила роутер»."""
+    return bool(OKX_ROUTERS.get(chain_index(chain)))
+
+
+def spender_confirmed(chain: str) -> bool:
+    return bool(OKX_SPENDERS.get(chain_index(chain)))
 
 
 # --- Aster v3 ----------------------------------------------------------------------------------
