@@ -758,13 +758,30 @@ def delta_base(spot_raw: int, short: Decimal, spec: InstrumentSpec) -> Decimal:
 
 
 # --- замороженная спецификация сделки (types.InstrumentSpec schema 2) --------------------------------------------
+def _canonical_hl_account_id(value: str | None) -> str | None:
+    """Normalize only EVM addresses in runtime's HL scope; preserve all other identities.
+
+    Registry records/hashes and already stored deal specifications stay unchanged.
+    Legacy/opaque account identifiers retain their exact comparison semantics.
+    """
+    if value is None:
+        return None
+    parts = value.split(":")
+    if (len(parts) == 5 and parts[0] == "hyperliquid"
+            and _EVM_ADDR_RE.fullmatch(parts[2]) and _EVM_ADDR_RE.fullmatch(parts[3])):
+        parts[2], parts[3] = parts[2].lower(), parts[3].lower()
+        return ":".join(parts)
+    return value
+
+
 def deal_spec(spec: InstrumentSpec, *, account_id: str | None = None,
               now: float | datetime | None = None) -> DealInstrument:
     """Запись реестра → спецификация сделки schema 2 (deals.inst_json, inst_hash намерений): mint с регистром,
     программа токена, котировка, Fs/Fp, перп (площадка/сеть/dex/fullcoin) и scope счёта, статус identity.
     Счёт — из записи или из owner.toml (wallets.sol_hl); заданы оба и разные — отказ, не угадываем. Допуск live здесь
     не решается (entry_blockers): спецификация описывает, ЧТО торгует сделка, а не разрешение торговать."""
-    acct = spec.perp.account_id
+    acct = _canonical_hl_account_id(spec.perp.account_id)
+    account_id = _canonical_hl_account_id(account_id)
     if account_id is not None:
         if acct is not None and acct != account_id:
             raise RegistryError(f"{spec.instrument_id}: счёт {account_id} ≠ account_id записи {acct}")
