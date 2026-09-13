@@ -141,12 +141,8 @@ class Handler(BaseHTTPRequestHandler):
                 kind = "data" if path == "/data.json" else "page"
                 self._send(_cached(kind, gz), "application/json" if kind == "data" else "text/html; charset=utf-8", gz=gz)
             elif path == "/status":
-                t = load_table(); now = int(time.time())
-                st = {"age_s": (now - t["tick_ts"]) if t.get("tick_ts") else None}
-                for k in ("tick_ts", "pid", "started_ts", "n_ff", "n_sf", "n_mismatch_ff", "n_mismatch_sf", "n_unknown_ff",
-                          "n_unknown_sf", "ident", "n_incomplete_ff", "n_incomplete_sf",
-                          "n_stale_ff", "n_stale_sf", "backfill", "repair", "notes", "health", "src_age"):
-                    st[k] = t.get(k)
+                from .market_snapshot import load_health
+                st = load_health()
                 self._send(json.dumps(st).encode(), "application/json")
             else:
                 self._send(b"not found", "text/plain; charset=utf-8", 404)

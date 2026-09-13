@@ -490,7 +490,8 @@ def test_funding_history_expands_with_running_total(tmp_path, monkeypatch):
     assert 'всего: <b class="mono g">+0.25\u00a0$</b>' in h and "показаны последние" not in h
     x = _card(tmp_path, did="DXSS")
     assert 'всего: <b class="mono r">−0.50\u00a0$</b>' in x and "+0.1200" not in x
-    monkeypatch.setattr(cabinet, "HIST_MAX", 2)                                  # длинная история — последние N
+    from funding_bot.core import readmodel
+    monkeypatch.setattr(readmodel, "HIST_MAX", 2)                                  # длинная история — последние N
     h = _card(tmp_path)
     assert "показаны последние 2 из 3" in h and h.count("<tr><td>") == 2 and "+0.25\u00a0$" in h
     # история — только за сессией: без cookie ни страница, ни deals.json её не отдают

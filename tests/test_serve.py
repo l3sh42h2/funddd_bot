@@ -8,6 +8,8 @@ def test_gzip_for_big_json_plain_for_status_and_curl(tmp_path, monkeypatch):
     rows = [dict(key=f"k{i}", base=f"B{i}", windows={}) for i in range(500)]
     (tmp_path / "t.json").write_text(json.dumps(dict(ts=1, tick_ts=1, pid=42, ff_rows=rows, sf_rows=[], n_ff=500, n_sf=0)))
     monkeypatch.setattr(config, "TABLE_PATH", tmp_path / "t.json")
+    from funding_bot.market_snapshot import publish_health
+    publish_health(dict(json.loads(config.TABLE_PATH.read_text()), schema_version=1), config.TABLE_PATH)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"

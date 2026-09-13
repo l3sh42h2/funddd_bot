@@ -774,6 +774,8 @@ class Collector:
                     window_labels={str(w): config.WINDOW_LABELS.get(w, f"{w} ч") for w in config.WINDOWS_H})
 
     def write_table(self, table: dict):
+        from .market_snapshot import publish_health
+        table = dict(table, schema_version=1, snapshot_id=str(time.time_ns()), generated_at=time.time())
         tmp = str(self.table_path) + ".tmp"
         os.makedirs(os.path.dirname(str(self.table_path)), exist_ok=True)
         # dumps целиком, а не dump кусками: dump идёт через iterencode и тысячи мелких write — на 19.5 МБ (8 площадок,
@@ -782,6 +784,7 @@ class Collector:
         with open(tmp, "w") as f:
             f.write(body)
         os.replace(tmp, self.table_path)
+        publish_health(table, self.table_path)
 
     def disk_free_gb(self) -> float:
         try:

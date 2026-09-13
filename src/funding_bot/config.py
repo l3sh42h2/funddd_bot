@@ -8,8 +8,8 @@ from pathlib import Path
 ROOT = Path(os.environ.get("FUNDING_BOT_ROOT", Path(__file__).resolve().parents[2]))
 RUNTIME = Path(os.environ.get("FUNDING_BOT_RUNTIME", ROOT / "runtime"))
 DB_PATH = RUNTIME / "funding_bot.db"
-TABLE_PATH = RUNTIME / "table.json"        # живое состояние коллектора для веб-процесса
-OWNER_PATH = RUNTIME / "owner.toml"        # параметры владельца (фаза 2), пусто = запрет
+TABLE_PATH = Path(os.environ.get("FUNDING_TABLE_PATH", RUNTIME / "table.json"))        # живое состояние коллектора для веб-процесса
+OWNER_PATH = Path(os.environ.get("FUNDING_OWNER_PATH", RUNTIME / "owner.toml"))        # параметры владельца (фаза 2), пусто = запрет
 
 USER_AGENT = "funding_bot/0.1 (+ireland)"
 HTTP_TIMEOUT = 15

@@ -1,0 +1,28 @@
+[Unit]
+Description=funding_bot Telegram and dashboard interface
+After=network-online.target
+Wants=network-online.target
+Conflicts=funding_bot-trader.service funding_bot-web.service
+
+[Service]
+User=funding-interface
+Group=funding-interface
+SupplementaryGroups=funding-ipc funding-market
+WorkingDirectory=/opt/funding-bot/current
+EnvironmentFile=/var/lib/funding-bot/secrets/interface.env
+ExecStart=/opt/funding-bot/current/.venv/bin/funding_bot interface --port 8792 --host 127.0.0.1
+UMask=0077
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+TimeoutStopSec=45
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/funding-bot/interface
+ReadOnlyPaths=/var/lib/funding-bot/collector/public
+InaccessiblePaths=/var/lib/funding-bot/core /var/lib/funding-bot/shared /var/lib/funding-bot/collector/funding_bot.db
+
+[Install]
+WantedBy=multi-user.target

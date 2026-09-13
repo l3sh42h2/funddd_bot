@@ -9,6 +9,7 @@ from pathlib import Path
 from ..ipc.paths import interface_state
 from ..ipc.protocol import Client, RpcError
 from ..market_snapshot import atomic_json
+from ..build_info import BUILD_ID
 
 log = logging.getLogger(__name__)
 
@@ -49,16 +50,30 @@ class State:
 
 
 class Interface:
-    def __init__(self, api, sender, client=None, state=None):
+    def __init__(self, api, sender, client=None, state=None, *, check_startup=False):
         self.api, self.sender = api, sender
         self.client, self.state = client or Client(), state or State()
         self.stop = threading.Event()
+        self.started = time.time()
+        self.last_renew = self.started
+        self.check_startup = check_startup
         self.last_poll = None
         self.last_core = None
         self.inflight = set()
         self.inflight_lock = threading.RLock()
 
+    def health(self):
+        now = time.time()
+        return dict(schema_version=1,build_id=BUILD_ID,pid=os.getpid(),updated_at=now,
+                    last_poll_at=self.last_poll,last_core_at=self.last_core,
+                    ready=self.last_poll is not None and 0 <= now-self.last_poll <= 105)
+
     def poll_once(self):
+        if self.check_startup:
+            self.api.get_me()
+            if (self.api.get_webhook_info() or {}).get('url'):
+                raise RpcError('telegram_webhook_configured')
+            self.check_startup = False
         # On first split, import old offset through core (never by opening trade.db).
         floor = self.client.call('get_offset_floor')['offset']
         self.last_core = time.time()
@@ -80,6 +95,10 @@ class Interface:
             try:
                 self.poll_once()
             except Exception as e:
+                now = time.time()
+                if now - max(self.last_poll or self.started, self.last_renew) >= 105:
+                    self.api.renew()
+                    self.last_renew = now
                 log.warning('interface poll paused: %s', type(e).__name__)
                 self.stop.wait(3)
 
@@ -152,12 +171,8 @@ def run_interface(port=8792, host='127.0.0.1', environ=None):
     # Exactly one Telegram poller. Separate lock from execution so interface can restart independently.
     with ExecutionLock(interface_state().with_suffix('.lock')):
         api = TgApi(token)
-        api.get_me()
-        if (api.get_webhook_info() or {}).get('url'):
-            log.error('Webhook configured; not starting a competing poller')
-            return 78
         sender = Sender(TgApi(token)).start()
-        ui = Interface(api, sender)
+        ui = Interface(api, sender, check_startup=True)
         server = ThreadingHTTPServer((host, port), Handler)
         server.daemon_threads = True
         for target in (ui.poll, ui.deliver, server.serve_forever):
@@ -165,7 +180,7 @@ def run_interface(port=8792, host='127.0.0.1', environ=None):
         signal.signal(signal.SIGTERM, lambda *_:ui.stop.set())
         signal.signal(signal.SIGINT, lambda *_:ui.stop.set())
         while not ui.stop.wait(1):
-            pass
+            atomic_json(ui.state.path.with_name("interface_health.json"), ui.health(), 0o600)
         server.shutdown()
         server.server_close()
         sender.close(10)

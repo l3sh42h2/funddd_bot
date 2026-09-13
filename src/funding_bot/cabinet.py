@@ -2,7 +2,7 @@
 авторизации будут мои сделки … без возможности управления, просто их статусы»). Кнопка на дашборде — отдельная задача;
 здесь — маршруты /cabinet (их подключает serve.py):
 
-  GET  /cabinet             без сессии — форма входа, с сессией — сделки из runtime/trade.db
+  GET  /cabinet             без сессии — форма входа, с сессией — приватная проекция торгового ядра через IPC
   POST /cabinet/login       логин и пароль → cookie сессии → 303 на /cabinet
   POST /cabinet/logout      сессия удаляется → 303 на /cabinet
   GET  /cabinet/deals.json  тот же список для автообновления страницы (раз в 15 с); без сессии — 401
@@ -27,19 +27,19 @@ Secure — если запрос пришёл по https (X-Forwarded-Proto / CF
 обоих случаях), после неудачи — задержка. CSRF: Origin/Referer на POST (если есть) должен совпасть с хостом страницы;
 плюс SameSite=Strict.
 
-trade.db открывается только на чтение ('file:…?mode=ro' + query_only): кабинет не может ни записать, ни создать базу.
+Торговая БД принадлежит core. Production-кабинет получает DTO по IPC и не открывает trade.db.
 Ни одна строка trade.db не попадает в /data.json и на публичную страницу — это отдельные маршруты с сессией.
 Ответы кабинета: no-store, X-Frame-Options DENY, CSP без внешних источников (стиль и скрипт — по sha256 содержимого).
 """
 from __future__ import annotations
-import base64, getpass, hashlib, hmac, html, ipaddress, json, logging, math, os, secrets, sqlite3, sys, threading, time
+import base64, getpass, hashlib, hmac, html, ipaddress, json, logging, math, os, secrets, sys, threading, time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from . import config
-from .trade import marks as tmarks, tconfig
+from .cabinet_text import STATE_VIEW, REASON_TEXT, reason_text, event_text
 from .trade.report import dval, fmt_num
 
 log = logging.getLogger(__name__)
@@ -339,311 +339,26 @@ def same_origin(req: Req, extra_hosts=()) -> bool:
     return host in allowed
 
 
-# --- trade.db только на чтение ---------------------------------------------------------------------------
-def open_ro(path) -> sqlite3.Connection:
-    """Соединение, которое не может писать: URI mode=ro (базу не создаст и не изменит) + query_only."""
-    p = Path(path)
-    if not p.is_file():
-        raise FileNotFoundError(str(p))
-    con = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=5, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA query_only=ON")
-    return con
+# SQL/data helpers moved to core.readmodel. Runtime Cabinet uses IPC only.
+def __getattr__(name):
+    # Offline compatibility for existing unit tests/tools, not used by interface entrypoint.
+    if name in ('open_ro','load_deals','funding_history','_pnl_view','_liq_view','_row_key','_dv'):
+        from .core import readmodel
+        return getattr(readmodel, name)
+    raise AttributeError(name)
 
-
-def _dv(v) -> D | None:
-    """TEXT из БД → Decimal; битое или бесконечное — None (страница не падает из-за одной строки)."""
+_TERMINAL = ('CLOSED', 'ABORTED')
+def _dv(v):
     try:
         x = dval(v)
+        return x if x is None or x.is_finite() else None
     except (ArithmeticError, ValueError, TypeError):
         return None
-    return x if x is None or x.is_finite() else None
 
 
-def _row_key(d: dict):
-    """Ключ строки пары в table.json: спот DEX «<chainIndex>:<токен>», перп, символ (как dexleg строит строку). EVM-адрес —
-    нижним регистром (как раньше); mint Solana (501) — base58 как есть: регистр значим (S01)."""
-    try:
-        ci = tconfig.chain_index(d["chain"])
-    except (KeyError, TypeError):
-        return None
-    spot = f"{ci}:{d['token']}"
-    return (spot if _sol_spot(spot) else spot.lower(), d["perp_venue"], d["symbol"])
+def _sol_spot(spot):
+    return str(spot).startswith('501:')
 
-
-def _sol_spot(spot: str) -> bool:
-    return str(spot).startswith("501:")
-
-
-def _is_sol(d: dict) -> bool:
-    from .trade.runtime import is_sol_deal
-    try:
-        return is_sol_deal(d)
-    except Exception:                           # noqa — битая строка сделки: карточка BSC-вида, а не падение страницы
-        return False
-
-
-SOL_ROUTE = {"jupiter_build_v2": "Jupiter", "jupiter_order_v2": "Jupiter Order", "okx_solana_v6": "OKX"}
-IDENT_TEXT = {"reviewed_override": "подтверждено владельцем", "verified_source": "подтверждено источником"}
-
-
-def _sol_view(con: sqlite3.Connection, d: dict) -> dict:
-    """Связка Solana × Hyperliquid: сеть, mint (как есть), фактические маршруты клипов, точный рынок HL и основание
-    соответствия — из замороженной спецификации сделки и журнала (не из политики «auto»)."""
-    from .trade import sol_ledger
-    inst = sol_ledger.inst_of(d)
-    try:
-        routes = sol_ledger.ledger(con, d, fee_rate=None).routes
-    except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError):
-        routes = ()
-    return {"mint": d.get("token"), "fullcoin": inst.get("perp_symbol") or d.get("symbol"),
-            "routes": tuple(dict.fromkeys(SOL_ROUTE.get(r, r) for r in routes)),
-            "identity": IDENT_TEXT.get(inst.get("identity_status")), "ident_to": str(inst.get("identity_expires_at")
-                                                                                    or "")[:10]}
-
-
-_TERMINAL = ("CLOSED", "ABORTED")
-_DEX_UNKNOWN = ("DEX_SENT", "DEX_UNKNOWN")        # как engine.deal_book: исход свопа не выяснен
-_PERP_OPEN = ("INTENT", "SENT", "UNKNOWN")        # исход заявки не выяснен
-
-
-def load_deals(con: sqlite3.Connection, limit: int = DEALS_MAX, now: float | None = None) -> dict:
-    """Все сделки (кроме черновиков — планов без «да»), новые сверху: статус, PnL (оценка трейдера или итог), у активной
-    — «до ликвидации» (positionRisk из оценки трейдера) и история выплат фандинга (funding_income).
-    Объёмы и средние ног карточка больше не показывает (правка владельца 13.09: «лишняя инфа»); остались только пометки
-    «исход свопа / заявки выясняется» — клип в DEX_SENT/DEX_UNKNOWN, заявка сделки (префикс client_id fb-<сделка>-, как
-    engine.deal_book) в INTENT/SENT/UNKNOWN."""
-    deals = [dict(r) for r in con.execute("SELECT * FROM deals WHERE state != 'DRAFT' ORDER BY created DESC, id DESC "
-                                          "LIMIT ?", (int(limit),))]
-    drafts = con.execute("SELECT count(*) FROM deals WHERE state = 'DRAFT'").fetchone()[0]
-    if not deals:
-        return {"deals": [], "drafts": drafts}
-    opened = {r[0]: r[1] for r in con.execute("SELECT deal_id, MIN(approved) FROM intents WHERE kind = 'entry' "
-                                               "AND approved IS NOT NULL GROUP BY deal_id")}
-    qs = lambda xs: ",".join("?" * len(xs))                                        # noqa: E731
-    spot_unknown = {r[0] for r in con.execute(f"SELECT DISTINCT i.deal_id FROM clips c JOIN intents i ON i.id = c.intent_id "
-                                              f"WHERE c.state IN ({qs(_DEX_UNKNOWN)})", _DEX_UNKNOWN)}
-    perp_unknown = set()
-    for (cid,) in con.execute(f"SELECT client_id FROM perp_orders WHERE client_id LIKE 'fb-%' "
-                              f"AND state IN ({qs(_PERP_OPEN)})", _PERP_OPEN):
-        parts = str(cid).split("-")
-        if len(parts) >= 3:
-            perp_unknown.add(parts[1])
-    now = time.time() if now is None else now
-    out = []
-    for d in deals:
-        last = con.execute("SELECT e.ts, e.kind, e.json, i.kind AS ikind FROM exec_events e LEFT JOIN intents i "
-                           "ON i.id = e.intent_id WHERE e.deal_id = ? ORDER BY e.ts DESC, e.rowid DESC LIMIT 1",
-                           (d["id"],)).fetchone()
-        v = _deal_view(d, opened.get(d["id"]), d["id"] in spot_unknown, d["id"] in perp_unknown, last)
-        if _is_sol(d):
-            v["sol"], v["unit"] = _sol_view(con, d), "USDC"
-        v["pnl"] = _pnl_view(con, d, now)
-        if d.get("state") not in _TERMINAL:
-            v["liq"] = None if v["sim"] else _liq_view(con, d, now)
-            v["hist"] = None if v["sim"] else funding_history(con, d)
-        out.append(v)
-    return {"deals": out, "drafts": drafts}
-
-
-def _liq_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
-    """«До ликвидации» — последняя оценка трейдера С flags.liq (positionRisk; trade/marks.py): строка, где чтение не
-    удалось, прошлое не стирает — показывается прошлое со своим временем, старше MARK_STALE_S — «устарело»."""
-    try:
-        r = con.execute("SELECT flags_json FROM deal_marks WHERE deal_id = ? AND CASE WHEN json_valid(flags_json) "
-                        "THEN json_type(flags_json, '$.liq') END = 'object' ORDER BY ts DESC, rowid DESC LIMIT 1",
-                        (d["id"],)).fetchone()
-    except sqlite3.OperationalError:            # трейдер старой версии: deal_marks ещё нет
-        return None
-    if r is None:
-        return None
-    try:
-        lq = json.loads(r[0]).get("liq")
-        ts = float(lq.get("ts"))
-    except (TypeError, ValueError, AttributeError):
-        return None
-    if not math.isfinite(ts):
-        return None
-    price, mark = _dv(lq.get("price")), _dv(lq.get("mark"))
-    return {"price": price, "mark": mark, "ts": ts, "dist": tmarks.liq_distance(price, mark),
-            "stale": now - ts > tconfig.MARK_STALE_S}
-
-
-HIST_MAX = 200                          # строк истории выплат в карточке (всего — по всем)
-
-
-def funding_history(con: sqlite3.Connection, d: dict) -> dict:
-    """Выплаты фандинга сделки: funding_income площадки и символа сделки с её открытия — те же границы, что у фандинга в
-    PnL (marks.journal). rows — (время с, сумма $, итог с начала), новые сверху, не больше HIST_MAX; total — по всем.
-    Связка Solana × Hyperliquid — фактические userFunding счёта сделки в её окне (sol_ledger), USDC."""
-    if _is_sol(d):
-        from .trade import sol_ledger
-        try:
-            rows = [(int(t * 1000), x) for t, x in sol_ledger.funding_rows(con, d)]
-        except (sqlite3.Error, TypeError, ValueError):
-            rows = []
-    else:
-        try:
-            start = int(float(d["created"]) * 1000)
-            rows = con.execute("SELECT ts, income FROM funding_income WHERE venue = ? AND symbol = ? AND ts >= ? "
-                               "ORDER BY ts, tran_id", (d["perp_venue"], d["symbol"], start)).fetchall()
-        except (sqlite3.OperationalError, TypeError, ValueError):
-            return {"rows": [], "n": 0, "total": ZERO}
-    acc, out = ZERO, []
-    for ts, inc in rows:
-        x = _dv(inc)
-        if x is None or ts is None:
-            continue
-        acc += x
-        out.append((int(ts) / 1000, x, acc))
-    return {"rows": out[::-1][:HIST_MAX], "n": len(out), "total": acc}
-
-
-def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
-    """PnL для карточки. Активная — последняя оценка трейдера из deal_marks (trade/marks.py; кабинет в биржи не ходит).
-    Закрытая — итог: строка final трейдера (с газом в $), без неё — по журналу здесь же (engine._deal_pnl без газа:
-    цены BNB у кабинета нет — так и подписано). Отменённая — ничего."""
-    st = d.get("state")
-    if st == "ABORTED":
-        return None
-    try:
-        mk = tmarks.decode(con.execute("SELECT * FROM deal_marks WHERE deal_id = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
-                                       (d["id"],)).fetchone())
-    except sqlite3.OperationalError:            # трейдер старой версии ещё не создал deal_marks — расчёта нет
-        mk = None
-    if st == "CLOSED":
-        if mk is not None and mk["flags"].get("final") and mk["pnl_now"] is not None:
-            out = {"final": True, "total": mk["pnl_now"], "no_gas": False}
-            if mk["flags"].get("accounting_complete") is False:
-                out["incomplete"] = True
-            return out
-        if _is_sol(d):
-            from .trade import sol_ledger
-            return sol_ledger.realized_view(con, d)
-        try:
-            j = tmarks.journal(con, d, until_ms=int(float(d.get("updated") or now) * 1000))
-        except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError) as e:
-            log.warning("кабинет: итог %s не посчитан: %s", d.get("id"), type(e).__name__)
-            return None
-        gas = j.gas_usd(None)                   # газа не было — 0; был — в $ не перевести
-        return {"final": True, "total": j.spot_flow + j.perp_flow - j.fees + (j.funding or ZERO) - (gas or ZERO),
-                "no_gas": gas is None}
-    if mk is None or mk["flags"].get("final"):
-        return {"final": False, "mark": None}
-    return {"final": False, "mark": mk, "stale": now - mk["ts"] > tconfig.MARK_STALE_S}
-
-
-def _deal_view(d: dict, opened, spot_unknown: bool, perp_unknown: bool, last) -> dict:
-    ev = None
-    if last is not None:
-        try:
-            data = json.loads(last["json"]) if last["json"] else {}
-        except ValueError:
-            data = {}
-        ev = (event_text(last["kind"], data if isinstance(data, dict) else {}, last["ikind"]), last["ts"])
-    return {
-        "id": d["id"], "coin": d.get("coin"), "chain": d.get("chain"), "venue": d.get("perp_venue"),
-        "symbol": d.get("symbol"), "leg_usd": _dv(d.get("leg_usd")), "state": d.get("state"), "reason": d.get("reason"),
-        "sim": bool(d.get("sim")), "opened": opened or d.get("created"),
-        "closed": d.get("updated") if d.get("state") in _TERMINAL else None,
-        "spot_unknown": spot_unknown, "perp_unknown": perp_unknown,
-        "last": ev, "row_key": _row_key(d), "live": None, "liq": None, "hist": None,
-    }
-
-
-# --- тексты статусов и событий ---------------------------------------------------------------------------
-STATE_VIEW = {"OPEN": ("🟢", "открыта", "st-open"), "ENTERING": ("🔄", "входит", "st-run"),
-              "EXITING": ("🔄", "выходит", "st-run"), "PAUSED": ("⏸️", "пауза", "st-pause"),   # FE0F — эмодзи, а не «II»
-              "HALTED_MISMATCH": ("🛑", "остановлена: расхождение", "st-halt"), "CLOSED": ("✅", "закрыта", "st-done"),
-              "ABORTED": ("⚪", "отменена", "st-done"), "DRAFT": ("📝", "черновик", "st-done")}
-
-# причины паузы движка (Pause(reason, …) в trade/engine.py, reconcile) → человеческий текст без технических деталей
-REASON_TEXT = {
-    "error": "сбой исполнителя", "stop": "стоп владельца", "terminate": "служба останавливалась",
-    "owner": "owner.toml не прочитан", "owner_missing": "в owner.toml не хватает параметров",
-    "mode": "режим запрещает отправки", "native": "мало BNB на газ", "limit": "сработал лимит владельца",
-    "funding": "фандинг не прочитан", "funding_sign": "фандинг сменил знак", "exec_time": "исполнение дольше допустимого",
-    "plan_ab": "план устарел — нужен свежий", "book_unknown": "журнал сделки неполон — нужна сверка",
-    "hedge_deficit": "ноги не сбалансированы", "position_unknown": "позиция на бирже не прочитана",
-    "position_mismatch": "позиция не совпадает с журналом", "setup": "настройка перпа не удалась",
-    "approve_unknown": "исход разрешения токена неизвестен", "approve_refused": "разрешение токена не отправлено",
-    "approve_failed": "разрешение токена не прошло", "dex_unknown": "исход свопа выясняется",
-    "dex_refused": "своп не отправлен", "dex_revert": "своп откатился дважды",
-    "perp_refused": "заявка на перпе не отправлена", "perp_unknown": "исход заявки на перпе выясняется",
-    "perp_rejected": "заявка на перпе нулевая после округления", "reduce_only_reject": "биржа отклонила откуп шорта",
-    "busy": "токен или символ заняты другой сделкой", "state": "состояние сделки изменилось",
-    "replan": "остаток не планируется", "changed": "дельта ног сменила знак", "wallet_unknown": "баланс кошелька не прочитан",
-    "restart": "перезапуск во время исполнения", "entry": "вход не завершён", "exit": "выход не завершён",
-    "rehedge": "дохедж не завершён", "undo": "откат не завершён", "inst_unverified": "инструмент сделки не подтверждён",
-}
-
-
-def reason_text(reason) -> str | None:
-    """Код причины → текст; русская причина (их пишет сам движок: «сверено владельцем», «перп закрыт, спот остался…») —
-    как есть; незнакомый латинский код и детали после «restart:» — не показываются."""
-    if not reason:
-        return None
-    r = str(reason).strip()
-    if r in REASON_TEXT:
-        return REASON_TEXT[r]
-    if r.startswith("restart"):
-        return "после перезапуска ноги не сошлись — нужна сверка"
-    if any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in r):
-        return r[:200]
-    return None
-
-
-_START = {"entry": "вход начат", "exit": "выход начат", "rehedge": "дохедж начат", "undo": "откат начат"}
-_FIXED = {"rehedge": "дохедж выполнен", "undo": "откат выполнен"}
-_PLAN = {"entry": "вход", "exit": "выход", "rehedge": "дохедж", "undo": "откат"}
-
-
-def event_text(kind: str, data: dict, ikind: str | None = None) -> str:
-    """Последнее событие exec_events → короткий текст для владельца (без хэшей, чисел заявок и текстов ошибок)."""
-    k = data.get("intent_kind") or ikind
-    st = data.get("state")
-    if kind == "proposed":
-        return "предложен план: " + _PLAN.get(k, "исполнение")
-    if kind == "start":
-        return _START.get(k, "исполнение начато")
-    if kind == "requote":
-        return "перекотировка не прошла — план отменён"
-    if kind == "requote_ok":
-        return "котировка обновлена, исполнение идёт"
-    if kind == "paused":
-        head = {"HALTED_MISMATCH": "остановка", "ABORTED": "вход отменён"}.get(st, "пауза")
-        why = reason_text(data.get("reason"))
-        return f"{head}: {why}" if why else head
-    if kind == "auto_unwind":
-        return "автооткат голой ноги"
-    if kind == "approve":
-        return "разрешение токена выдано" if data.get("status") == "ok" else "разрешение токена не прошло"
-    if kind == "dex_not_sent":
-        return "своп не отправлен"
-    if kind == "dex":
-        return {"ok": "своп на DEX выполнен", "reverted": "своп на DEX откатился"}.get(data.get("status"),
-                                                                                      "исход свопа выясняется")
-    if kind == "perp_unknown":
-        return "исход заявки на перпе выясняется"
-    if kind == "replan":
-        return "остаток перепланирован"
-    if kind == "fixed":
-        return _FIXED.get(k, "исполнение завершено")
-    if kind == "final":
-        if st == "CLOSED":
-            return "выход завершён — сделка закрыта"
-        if st == "OPEN":
-            return "частичный выход завершён" if k == "exit" else "вход завершён"
-        return "исполнение завершено"
-    if kind in ("reconcile_clip", "reconcile_order"):
-        return "сверка после перезапуска"
-    if kind == "restart_check":
-        m = data.get("matched")
-        return "проверка после перезапуска: " + ("ноги сходятся" if m is True else "расхождение" if m is False else "идёт")
-    return "событие исполнения"
-
-
-# --- числа ------------------------------------------------------------------------------------------------
 def _trim(s: str) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
@@ -1035,7 +750,7 @@ def deals_page(snap: dict) -> Resp:
 # --- кабинет ----------------------------------------------------------------------------------------------
 class Cabinet:
     def __init__(self, environ=None, db_path=None, *, clock=time.time, sleep=time.sleep,
-                 fail_delay_s: float = FAIL_DELAY_S):
+                 fail_delay_s: float = FAIL_DELAY_S, snapshot_loader=None):
         env = os.environ if environ is None else environ
         login, raw = (env.get(ENV_LOGIN) or "").strip(), (env.get(ENV_HASH) or "").strip()
         self._hash = parse_hash(raw) if raw else None
@@ -1046,7 +761,12 @@ class Cabinet:
             self.why_off = f"{ENV_HASH} не в формате scrypt$n$r$p$соль$хэш"
         else:
             self.why_off = None
-        self.db_path = Path(db_path) if db_path else tconfig.TRADE_DB_PATH
+        self.db_path = Path(db_path) if db_path else None
+        self.snapshot_loader = snapshot_loader
+        if self.snapshot_loader is None and db_path is not None:
+            # Explicit legacy test backend only. Production instance() never passes a db_path.
+            from .core.readmodel import legacy_snapshot
+            self.snapshot_loader = lambda: legacy_snapshot(self.db_path, self.clock())
         self.clock, self.sleep, self.fail_delay_s = clock, sleep, fail_delay_s
         self.sessions = Sessions(clock=clock)
         self.limiter = Limiter(clock=clock)
@@ -1160,66 +880,10 @@ class Cabinet:
 
     # --- данные ---
     def snapshot(self) -> dict:
-        now = self.clock()
-        try:
-            con = open_ro(self.db_path)
-        except FileNotFoundError:
-            return {"now": now, "deals": [], "drafts": 0, "err": None}     # сделок ещё не было — базы нет
-        except sqlite3.Error as e:
-            log.warning("кабинет: trade.db не открылась: %s", e)
-            return {"now": now, "deals": [], "drafts": 0, "err": "журнал сделок не открылся"}
-        try:
-            data = load_deals(con, now=now)
-        except sqlite3.Error as e:
-            log.warning("кабинет: trade.db не прочитана: %s", e)
-            return {"now": now, "deals": [], "drafts": 0, "err": "журнал сделок не прочитан"}
-        finally:
-            con.close()
-        if any(d["state"] not in _TERMINAL for d in data["deals"]):
-            live, tick = self._live_rows()
-            # свежесть — по возрасту снимка коллектора СЕЙЧАС (растёт и без нового файла): старше STALE_S (как чип
-            # дашборда), время из будущего или строка сама «устарела» — серым «устарело»
-            old = tick is None or abs(now - tick) > config.STALE_S
-            for d in data["deals"]:
-                row = live.get(d["row_key"]) if d["state"] not in _TERMINAL and d["row_key"] is not None else None
-                if row is not None:
-                    d["live"] = dict(row, ts=tick, stale=row["stale"] or old)
-        return {"now": now, **data, "err": None}
-
-    def _live_rows(self) -> tuple[dict, float | None]:
-        """Строки DEX-пар из table.json (ставка 1ч, курсовой и цены ног для активных сделок) и время снимка коллектора
-        (tick_ts); разбирается раз на снимок коллектора."""
-        path = config.TABLE_PATH
-        try:
-            mt = os.stat(path).st_mtime_ns
-        except OSError:
-            return {}, None
-        with self._tbl_lock:
-            if self._tbl[0] == mt:
-                return self._tbl[1], self._tbl[2]
-        try:
-            with open(path) as f:
-                t = json.load(f)
-        except (OSError, ValueError):
-            return {}, None
-        if not isinstance(t, dict):
-            return {}, None
-        try:
-            tick = float(t.get("tick_ts") or t.get("ts") or 0) or None
-        except (TypeError, ValueError):
-            tick = None
-        if tick is not None and not math.isfinite(tick):      # NaN «моложе» любого порога — за свежее не выдать
-            tick = None
-        idx = {}
-        for r in t.get("sf_rows") or []:
-            if isinstance(r, dict) and r.get("spot_ex") == DEX_SPOT:
-                spot = str(r.get("spot") or "")
-                idx[(spot if _sol_spot(spot) else spot.lower(), r.get("perp_ex"), r.get("perp"))] = {
-                    "rate_h": r.get("spread"), "gap": r.get("gap"), "px_spot": r.get("px_spot"),
-                    "px_perp": r.get("px_perp"), "stale": bool(r.get("stale"))}
-        with self._tbl_lock:
-            self._tbl = (mt, idx, tick)
-        return idx, tick
+        if self.snapshot_loader is not None:
+            return self.snapshot_loader()
+        from .interface.projections import fetch_positions
+        return fetch_positions(now=self.clock())
 
 
 _inst: Cabinet | None = None

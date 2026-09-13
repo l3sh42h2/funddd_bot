@@ -5,13 +5,14 @@ runtime/owner.toml и задаются владельцем (пусто = зап
 from __future__ import annotations
 import os
 from decimal import Decimal
+from pathlib import Path
 from .. import config
 
 # --- файлы runtime -------------------------------------------------------------------------------
-TRADE_DB_PATH = config.RUNTIME / "trade.db"       # отдельно от funding_bot.db: не спорит с чистками коллектора
+TRADE_DB_PATH = Path(os.environ.get("FUNDING_TRADE_DB", config.RUNTIME / "trade.db"))       # отдельно от funding_bot.db: не спорит с чистками коллектора
 OWNER_PATH = config.OWNER_PATH
-OKX_PACE_LOCK = config.RUNTIME / "okxdex.pace"    # общий темп ключа OKX (1 запрос/с) между коллектором и трейдером
-TRADING_BUSY = config.RUNTIME / "trading.busy"    # пока есть — коллектор пропускает задание DEX
+OKX_PACE_LOCK = Path(os.environ.get("FUNDING_OKX_PACE", config.RUNTIME / "okxdex.pace"))    # общий темп ключа OKX (1 запрос/с) между коллектором и трейдером
+TRADING_BUSY = Path(os.environ.get("FUNDING_TRADING_BUSY", config.RUNTIME / "trading.busy"))    # пока есть — коллектор пропускает задание DEX
 TG_HEALTH = config.RUNTIME / "tg_health.json"     # живость опроса для remote_verify.sh
 EVM_LOCK_FMT = "evm_{addr}.lock"                  # один писатель на кошелёк: flock рядом с trade.db
 

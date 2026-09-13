@@ -1,0 +1,25 @@
+[Unit]
+Description=funding_bot public market collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=funding-collector
+Group=funding-collector
+SupplementaryGroups=funding-market funding-pace
+WorkingDirectory=/opt/funding-bot/current
+EnvironmentFile=/var/lib/funding-bot/secrets/collector.env
+ExecStart=/opt/funding-bot/current/.venv/bin/funding_bot collector
+UMask=0027
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/funding-bot/collector /var/lib/funding-bot/shared
+InaccessiblePaths=/var/lib/funding-bot/core /var/lib/funding-bot/interface
+
+[Install]
+WantedBy=multi-user.target

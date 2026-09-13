@@ -38,7 +38,7 @@ BATCH = 100
 SWAP_PATH = "/api/v6/dex/aggregator/swap"
 APPROVE_PATH = "/api/v6/dex/aggregator/approve-transaction"
 # Общий темп ключа между процессами (= trade.tconfig.OKX_PACE_LOCK; здесь без импорта trade — коллектору он не нужен)
-PACE_PATH = config.RUNTIME / "okxdex.pace"
+PACE_PATH = Path(os.environ.get("FUNDING_OKX_PACE", config.RUNTIME / "okxdex.pace"))
 PACE_AHEAD_MAX_S = 60.0     # слот в файле дальше этого — мусор или часы ушли назад: не ждать часами
 
 
@@ -135,6 +135,8 @@ class OkxDex:
                 try:
                     slot = self._shared_slot(now, slot)
                 except OSError as e:
+                    if os.environ.get("FUNDING_PROCESS") in ("core", "collector"):
+                        raise  # Split processes must never fall back to two independent provider quotas.
                     log.warning("okxdex: общий темп (%s) недоступен: %s — дальше темп только этого процесса",
                                 self.pace_path, e)
                     self.pace_path = None
