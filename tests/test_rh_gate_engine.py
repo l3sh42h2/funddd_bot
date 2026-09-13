@@ -357,3 +357,20 @@ def test_guard_uses_profile_mode_not_general_mode(tmp_path):
     assert fx.sends(e) == n, "после перевода связки в readonly ни свопа, ни заявки"
     assert store.get_deal(e.con, p.deal_id)["state"] != DealState.CLOSED
     assert any("readonly" in h for h in [*e.hooks.reports, *(h for _i, h in e.hooks.progresses)]), e.hooks.reports
+
+
+def test_position_zero_right_after_fill_is_reread_not_halted(tmp_path):
+    """Gate сразу после первого филла коротко отвечает «позиции нет» (0) — сверка перечитывает, сделка открывается."""
+    e = rh_env(tmp_path)
+    real, lied = e.perp.position, []
+
+    def flaky(s):
+        r = real(s)
+        if r != 0 and not lied:
+            lied.append(r)
+            return D(0)
+        return r
+    e.perp.position = flaky
+    p = _open(e)
+    assert lied, "сценарий не сработал"
+    assert store.get_deal(e.con, p.deal_id)["state"] == DealState.OPEN

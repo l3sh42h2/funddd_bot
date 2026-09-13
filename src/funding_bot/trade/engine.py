@@ -1984,13 +1984,18 @@ class Engine:
             raise Pause("plan_ab", "α/β «auto» не заморожены в плане — исполнение не начинаю, нужна свежая команда")
         return lim.alpha, lim.beta_bps, False
 
-    def _position(self, run: Run) -> D | None:
+    def _position(self, run: Run, expect: D | None = None) -> D | None:
+        """Позиция перпа: до 3 чтений, пока не прочитана — и, если задан expect (шорт журнала), пока не совпала:
+        короткий «позиции нет» сразу после первого филла нового контракта (Gate POSITION_NOT_FOUND → 0) — повод
+        перечитать, а не остановить сделку (проверка Fable 14.09). Совпало с первого раза — одно чтение, как раньше."""
+        pos = None
         for i in range(3):
             pos = run.legs.perp.position(run.symbol)
-            if pos is not None:
+            if pos is not None and (expect is None or pos == expect):
                 return pos
-            self.sleep(1.0)
-        return None
+            if i < 2:
+                self.sleep(1.0)
+        return pos
 
     def _invariant(self, run: Run, position: bool = True) -> DealBook:
         """0 ≤ токены − |шорт|·m < шаг·m по журналу (в токенах); в live — и шорт по positionRisk (контракты). Иначе
@@ -2009,7 +2014,7 @@ class Engine:
             if not (getattr(run, "kind", None) == "exit" and (spec.get("all") or spec.get("perp_only"))):
                 raise Pause("inst_unverified", f"{v.m_unknown_text(run.did)} ({bk.inst_why})")
         if position and not run.legs.sim:
-            pos = self._position(run)
+            pos = self._position(run, expect=-bk.short)
             vl = v.VENUE_LABEL.get(run.legs.perp.venue, run.legs.perp.venue)
             if pos is None:
                 raise Pause("position_unknown", f"позиция {vl} не прочитана — ноги не сверить")
