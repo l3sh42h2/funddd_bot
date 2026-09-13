@@ -1,0 +1,33 @@
+{
+ "captured_utc": "2026-09-13T13:11:53.531789+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getAccountInfo",
+ "params": [
+  "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+  {
+   "encoding": "base64",
+   "commitment": "finalized"
+  }
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": {
+   "context": {
+    "apiVersion": "4.3.0-rc.0",
+    "slot": 446711178
+   },
+   "value": {
+    "data": [
+     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAilZvzBmLAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/wMLND/KPYVoFpU7otoC4VT9HaKQiSLUc+85gnwtA/EwCjAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAf/Aws0P8o9hWgWlTui2gLhVP0dopCJItRz7zmCfC0D8OAAAAVGhlIEJsYWNrIEJ1bGwFAAAAQU5TRU1AAAAAaHR0cHM6Ly9tZXRhLnV4ZW50by5pby9kYXRhLzdmNGM4NDQ4LWMzOGUtNGMzNC1hYTM3LWEyOGNmZjk4MDZkMAAAAAA=",
+     "base64"
+    ],
+    "executable": false,
+    "lamports": 25840695235,
+    "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "rentEpoch": 18446744073709551615,
+    "space": 401
+   }
+  },
+  "id": 3
+ }
+}

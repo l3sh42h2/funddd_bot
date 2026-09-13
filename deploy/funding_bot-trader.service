@@ -14,8 +14,16 @@ RestartSec=5
 # 78 — ошибка настройки (нет TG_BOT_TOKEN, битый owner.toml, ключ не сошёлся с адресом, часы > 2 с): по кругу не лечится
 RestartPreventExitStatus=78
 KillSignal=SIGTERM
-# SIGTERM: новое не начинается, текущая пара ног (своп → хедж) доводится; 180 с — с запасом на 90 с отмены tx
-TimeoutStopSec=180
+# SIGTERM: новое не начинается, начатая пара ног (своп → хедж) доводится: tg/bot.py ждёт STOP_WAIT_S = 250 с, потом
+# досылка Telegram 10 с. Худший штатный случай — связка SOL×HL, своп отправлен прямо перед сигналом:
+#   Solana — ждём finalized или доказанное истечение: срок blockhash ≈150 блоков (≈60–80 с) + финальность ≈32 слота
+#   (≈13 с) → WAIT_S 90 с + отправка 10 с + последний опрос двух RPC 4×10 с + 2 с ≈ 142 с;
+#   Hyperliquid — стакан 15 с + IOC 15 с + разбор UNKNOWN по cloid до expiresAfter 30 с + 5 с часов + 3 опроса по 2 с
+#   + последний статус 15 с + позиция 15 с ≈ 101 с.
+# ≈243 с ≤ 250; 280 = 250 + 10 (досылка) + 20 запаса. BSC (90 с отмены tx) укладывается. RPC, зависшие сверх своих
+# таймаутов, могут не уложиться: тогда выход по STOP_WAIT_S, запись-до в журнале — рестарт разбирает ТУ ЖЕ попытку,
+# нового свопа нет. Числа сверяет tests/test_sol_c4_release.py с константами кода.
+TimeoutStopSec=280
 StandardOutput=append:/home/admin/hyper/funding_bot/logs/trader.log
 StandardError=append:/home/admin/hyper/funding_bot/logs/trader.log
 

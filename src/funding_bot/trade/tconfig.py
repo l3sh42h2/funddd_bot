@@ -97,9 +97,25 @@ OKX_TRIM_RATE_MAX = 100                 # увиденная вживую дол
 OKX_TRIM_RECEIVERS = {"56": frozenset({"0xfa00a9ed787f3793db668bff3e6e6e7db0f92a1b"})}
 
 
-def chain_index(chain: str) -> str:
-    """'bsc' → '56'; '56' → '56'. Неизвестная сеть — KeyError (гард не должен молча пропустить)."""
+# Имена сетей (ТЗ SOL×HL 13.09): разбор команд и строка таблицы пишут «sol» (dexleg.TAG), коллектор и OKX —
+# «solana». Синоним нормализует только ИМЯ сети, адресов не касается (base58 Solana регистрозависим). chainIndex
+# 501 — id сети у OKX, а не наш: сама сеть сверяется по getGenesisHash (trade/instruments.py).
+CHAIN_ALIASES = {"sol": "solana"}
+
+
+def canonical_chain(chain: str) -> str:
+    """'sol' / 'SOL' / 'solana' → 'solana'; 'bsc' → 'bsc'. Неизвестная сеть — KeyError."""
     c = str(chain).strip().lower()
+    c = CHAIN_ALIASES.get(c, c)
+    if c in config.OKX_DEX_CHAINS:
+        return c
+    raise KeyError(f"неизвестная сеть: {chain}")
+
+
+def chain_index(chain: str) -> str:
+    """'bsc' → '56'; '56' → '56'; 'sol' → '501'. Неизвестная сеть — KeyError (гард не должен молча пропустить)."""
+    c = str(chain).strip().lower()
+    c = CHAIN_ALIASES.get(c, c)
     if c in config.OKX_DEX_CHAINS:
         return config.OKX_DEX_CHAINS[c]
     if c in config.OKX_DEX_CHAINS.values():

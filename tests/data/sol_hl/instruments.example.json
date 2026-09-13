@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "instruments": [
+    {
+      "instrument_id": "ansem_sol_para_v1",
+      "version": 1,
+      "profile_id": "sol_best_hyperliquid",
+      "display_symbol": "ANSEM",
+      "enabled_for_live": false,
+      "spot": {
+        "network": "solana-mainnet",
+        "genesis_hash": null,
+        "mint": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+        "decimals": 6,
+        "token_program": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        "observed_extensions": ["metadataPointer", "tokenMetadata"]
+      },
+      "quote": {
+        "network": "solana-mainnet",
+        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "decimals": 6,
+        "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+      },
+      "units": {
+        "spot_units_in_base": "1",
+        "perp_units_in_base": "1",
+        "status": "candidate_pending_mapping_acceptance"
+      },
+      "perp": {
+        "network": "mainnet",
+        "venue": "hyperliquid",
+        "dex": "para",
+        "fullcoin": "para:ANSEM",
+        "account_id": null,
+        "collateral_token_id_observed": 0,
+        "observed_asset_id": 180025,
+        "asset_id_policy": "resolve_and_verify_from_current_full_metadata",
+        "observed_sz_decimals": 0,
+        "observed_max_leverage": 3,
+        "observed_margin_mode": "noCross"
+      },
+      "identity": {
+        "status": "pending_underlying_evidence",
+        "source_scanner_status": "unknown",
+        "source_scanner_reason": "dex_link:other_cex_only",
+        "evidence": [
+          "../evidence/ansem_solana_mint.json",
+          "../evidence/hl_public_evidence.json",
+          "https://www.kucoin.com/announcement/en-kucoin-alpha-token-migration-to-spot-trading-the-black-bull-ansem"
+        ],
+        "direct_oracle_mint_evidence": null,
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "review_reason": null,
+        "expires_at": null
+      },
+      "snapshot": {
+        "solana_observed_at": "2026-09-13T10:50:15.991871+00:00",
+        "solana_slot": 446684264,
+        "hyperliquid_observed_at": "2026-09-13T10:47:55.240667+00:00",
+        "must_refresh_before_live": true
+      }
+    }
+  ]
+}

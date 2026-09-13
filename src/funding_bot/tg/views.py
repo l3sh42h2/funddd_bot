@@ -520,7 +520,8 @@ def start_reply(chat_id: int | None, user_id: int | None) -> str:
     return f"chat_id: <code>{escape(chat_id)}</code>\nuser_id: <code>{escape(user_id)}</code>"
 
 
-def help_text(sim: bool = False) -> str:
+def help_text(sim: bool = False, sol: bool = False) -> str:
+    """sol — связка Solana × Hyperliquid включена в owner.toml: строка её команд (иначе текст прежний)."""
     lines = [
         "<b>Команды</b> (только владелец):",
         "<code>вход AIW3 okx·bsc aster 500</code> — план, 500 $ на ногу",
@@ -529,6 +530,9 @@ def help_text(sim: bool = False) -> str:
         "<code>дохедж id</code> · <code>откат id</code> — для голой ноги",
         f"Деньги двигаются только после ✅ под планом; план живёт {tconfig.PLAN_TTL_S} с",
     ]
+    if sol:
+        lines.insert(3, "<code>вход ANSEM sol-auto hyperliquid·para 150</code> — Solana × Hyperliquid, 150 USDC · "
+                        "<code>позиции sol</code>")
     return _sim("\n".join(lines), sim)
 
 
@@ -687,6 +691,10 @@ def intent_head(intent: Mapping | None, deal: Mapping | None = None) -> PlanHead
               deal_usd=deal["leg_usd"] if deal else None)
     sim = bool(deal["sim"]) if deal else bool(spec.get("sim"))
     kind = str(intent["kind"])
+    if spec.get("profile") == "sol_best_hyperliquid" and kind == "entry" and _d(spec.get("usd")) is not None:
+        # связка Solana × Hyperliquid: вход — бюджет USDC (не $ и не «на ногу»)
+        u = _leg_num(spec.get("usd"))
+        return PlanHead(f"Вход {escape(coin)} · {u} USDC", f"✅ Войти {u} USDC", sim)
     return PlanHead(plan_title(kind, coin, **kw), ok_label(kind, **kw), sim)
 
 

@@ -37,6 +37,10 @@ def main(argv=None):
     pl.add_argument("usd", help="сумма на ногу, USDT")
     sub.add_parser("cabinet-hash", help="хэш пароля личного кабинета: пароль из stdin (с терминала — без эха) → "
                                         "строка CABINET_PASS_HASH=… для runtime/cabinet.env")
+    # связка SOL×HL, только чтение; свои ключи команды разбирает sol_doctor (импорт — только при вызове)
+    sh = sub.add_parser("sol-hl", help="связка SOL×HL, только чтение: doctor | quote-compare | hl-preflight | record")
+    sh.add_argument("sol_cmd", choices=["doctor", "quote-compare", "hl-preflight", "record"])
+    sh.add_argument("sol_args", nargs=argparse.REMAINDER, help="ключи команды: funding_bot sol-hl doctor --help")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -127,6 +131,9 @@ def main(argv=None):
         except Refused as e:
             print(to_plain(e.html), file=sys.stderr)
             return 1
+    elif a.cmd == "sol-hl":
+        from . import sol_doctor
+        return sol_doctor.main([a.sol_cmd, *a.sol_args])
     return 0
 
 

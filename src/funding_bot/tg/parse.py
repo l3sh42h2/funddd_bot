@@ -15,12 +15,21 @@
 
 Цель «выход»/«продолжить»/«дохедж»/«откат» — id сделки/намерения ИЛИ монета. Различает движок по базе:
 «DEGEN» по форме похож на id (D + 4 знака алфавита id), поэтому parse только подсказывает looks_like_id().
+
+Связка Solana × Hyperliquid (ТЗ SOL×HL §14) — отдельные команды ProfileEntry / ProfileExit / ProfilePositions:
+  вход ANSEM sol-auto hyperliquid·para 200     (лучший маршрут из Jupiter и OKX; 200 — USDC на вход)
+  вход ANSEM jupiter·sol hyperliquid·para 200  (только Jupiter)     вход ANSEM okx·sol hyperliquid·para 200
+  выход ANSEM sol [всё | 500 ansem | 120 usdc]  выход ANSEM 500 ansem   позиции sol
+«hyperliquid·para» — площадка + dex, не тикер. Монета — как написана (регистр у HL значим); mint и fullcoin из текста
+не берутся — «ANSEM» разрешает движок по реестру профиля. Новый разбор включается только там, где старый отказал, и
+только в узнаваемой форме: прежние команды BSC дают прежний результат и прежний текст отказа.
 """
 from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from .. import config
+from ..trade.owner import LEGACY_PROFILE, SOL_HL
 
 # сети спота OKX DEX: подпись строки таблицы (dexleg.TAG: bsc/sol/rh) и синонимы
 SPOT_CHAINS = {"bsc": "bsc", "bnb": "bsc", "sol": "sol", "solana": "sol", "rh": "rh", "robinhood": "rh"}
@@ -110,7 +119,45 @@ class Unknown:
     name: str = "unknown"
 
 
-Command = Entry | Exit | Positions | Status | Stop | Resume | Rehedge | Undo | Help | Start | Unknown
+@dataclass(frozen=True)
+class ProfileEntry:
+    """Вход связки (ТЗ SOL×HL §7). spot_policy — политика выбора маршрута, а не фактический исполнитель клипа."""
+    coin: str               # как написано, без префикса dex (регистр значим: kPEPE ≠ KPEPE)
+    spot_policy: str        # auto | jupiter | okx
+    spot_chain: str         # solana
+    perp_venue: str         # hyperliquid
+    perp_dex: str | None    # para; None — не назван: движок берёт единственную запись реестра профиля
+    usdc: Decimal           # бюджет USDC на вход (ExactIn), не USD и не USDT
+    profile: str = SOL_HL
+    name: str = "profile_entry"
+
+    @property
+    def fullcoin(self) -> str | None:
+        return f"{self.perp_dex}:{self.coin}" if self.perp_dex else None
+
+
+@dataclass(frozen=True)
+class ProfileExit:
+    """Выход связки (ТЗ §8): цель — токены (tokens) или USDC (движок переведёт в сырые токены при предложении и покажет);
+    оба None — всё, что принадлежит сделке."""
+    target: str             # id сделки или монета как написаны (id движок сверяет без регистра)
+    profile: str | None     # связка, если названа («sol», «hyperliquid·para»)
+    perp_dex: str | None
+    tokens: Decimal | None
+    usdc: Decimal | None
+    name: str = "profile_exit"
+
+
+@dataclass(frozen=True)
+class ProfilePositions:
+    """«позиции sol» — позиции одной связки. name как у Positions: старый бот покажет все позиции (безвредно)."""
+    profile: str
+    perp_dex: str | None = None
+    name: str = "positions"
+
+
+Command = (Entry | Exit | Positions | Status | Stop | Resume | Rehedge | Undo | Help | Start | Unknown | ProfileEntry
+           | ProfileExit | ProfilePositions)
 
 _SLASH = {"/status": "статус", "/positions": "позиции", "/stop": "стоп", "/help": "помощь", "/start": "/start"}
 _WORDS = {
@@ -211,12 +258,16 @@ def parse(text: str) -> Command:
         return Stop()
     if kind in ("positions", "status", "help", "start"):
         if args:
+            if kind == "positions" and len(args) == 1 and (pw := _profile_word(args[0])):
+                return ProfilePositions(*pw)
             return Unknown(raw, f"«{head}» без аргументов")
         return {"positions": Positions, "status": Status, "help": Help, "start": Start}[kind]()
     if kind == "entry":
-        return _entry(raw, args)
+        res = _entry(raw, args)
+        return (_profile_entry(raw, args, _raw_args(text, len(args))) or res) if isinstance(res, Unknown) else res
     if kind == "exit":
-        return _exit(raw, args)
+        res = _exit(raw, args)
+        return (_profile_exit(raw, args, _raw_args(text, len(args))) or res) if isinstance(res, Unknown) else res
     if kind == "resume":
         if not args:
             return Resume()
@@ -282,6 +333,154 @@ def _exit(raw: str, args: list[str]) -> Command:
     if usd is None:
         return Unknown(raw, f"сумма «{' '.join(rest)[:20]}» не понята — число USDT или «всё»")
     return Exit(target, usd, False)
+
+
+# --- связка Solana × Hyperliquid --------------------------------------------------------------------
+SOL_POLICIES = {"auto": "auto", "best": "auto", "jupiter": "jupiter", "jup": "jupiter", "okx": "okx", "okxdex": "okx"}
+SOL_WORDS = frozenset({"sol", "solana"})
+PROFILE_ROUTES = {("solana", "hyperliquid"): SOL_HL}       # (сеть спота, площадка перпа) → связка
+PROFILE_WORDS = {"sol": SOL_HL, "solana": SOL_HL, SOL_HL: SOL_HL, "bsc": LEGACY_PROFILE, LEGACY_PROFILE: LEGACY_PROFILE}
+_DEX_RE = re.compile(r"^[a-z0-9]{1,16}$")
+_RAW_COIN_RE = re.compile(r"^(?:([A-Za-z0-9]{1,16}):)?\$?([A-Za-z0-9]{1,20})$")
+_TOKENS_RE = re.compile(r"^(\d{1,12})(?:[.,](\d{1,9}))?$")
+_TOKEN_WORDS = frozenset({"токен", "токена", "токенов", "tok", "token", "tokens", "шт"})
+PROFILE_ENTRY_FMT = ("вход <монета> <sol-auto | jupiter·sol | okx·sol> hyperliquid·<dex> <USDC>, например: "
+                     "вход ANSEM sol-auto hyperliquid·para 200")
+PROFILE_EXIT_FMT = "выход <id|монета> [sol | hyperliquid·<dex>] [<N> <монета|токенов> | <USDC> | всё]"
+
+
+def _raw_args(text: str, n: int) -> list[str] | None:
+    """Аргументы как написаны (регистр монеты), в тех же позициях, что у normalize(); расхождение — None."""
+    toks = (text or "").replace(" ", " ").strip().split()[1:]
+    return toks if len(toks) == n else None
+
+
+def _parts(tok: str) -> list[str]:
+    return [p for p in _SEP_RE.split(tok) if p]
+
+
+def _sol_policy(tok: str) -> str | None:
+    """«sol-auto» / «auto·sol» / «best·sol» / «jupiter·sol» / «jup:solana» / «okx·sol» → политика; иначе None."""
+    parts = _parts(tok)
+    if len(parts) != 2:
+        return None
+    a, b = parts
+    if a in SOL_WORDS and b in SOL_POLICIES:
+        return SOL_POLICIES[b]
+    if a in SOL_POLICIES and b in SOL_WORDS:
+        return SOL_POLICIES[a]
+    return None
+
+
+def _perp_dex(tok: str) -> tuple[str, str | None] | None:
+    """«hyperliquid·para» / «hl:para» → ('hyperliquid', 'para'); «hyperliquid» → ('hyperliquid', None)."""
+    parts = _parts(tok)
+    if not parts or len(parts) > 2 or parts[0] not in PERP_ALIASES:
+        return None
+    if len(parts) == 2 and not _DEX_RE.match(parts[1]):
+        return None
+    return PERP_ALIASES[parts[0]], (parts[1] if len(parts) == 2 else None)
+
+
+def _profile_word(tok: str) -> tuple[str, str | None] | None:
+    """Имя связки в команде: «sol», «solana», «bsc», id профиля или перп с dex («hyperliquid·para»)."""
+    if tok in PROFILE_WORDS:
+        return PROFILE_WORDS[tok], None
+    pv = _perp_dex(tok)
+    if pv and pv[1] is not None and ("solana", pv[0]) in PROFILE_ROUTES:
+        return PROFILE_ROUTES[("solana", pv[0])], pv[1]
+    return None
+
+
+def _usdc_of(toks: list[str]) -> Decimal | None:
+    """Сумма USDC: «200», «$200», «200$», «200 usdc», «200usdc». USDT здесь — отказ: котировка связки в USDC."""
+    if len(toks) == 2:
+        a, b = toks
+        if b in ("usdc", "$"):
+            toks = [a + b]
+        elif a == "$":
+            toks = [b]
+        else:
+            return None
+    if len(toks) != 1:
+        return None
+    t = toks[0]
+    for suf in ("usdc", "$"):
+        if t.endswith(suf):
+            t = t[: -len(suf)]
+            break
+    t = t.removeprefix("$")
+    m = _AMOUNT_RE.match(t)
+    if not m:
+        return None
+    d = Decimal(m.group(1) + ("." + m.group(2) if m.group(2) else ""))
+    return d if d > 0 else None
+
+
+def _profile_entry(raw: str, args: list[str], raw_args: list[str] | None) -> Command | None:
+    """None — не синтаксис связки (остаётся ответ старого разбора)."""
+    if raw_args is None or len(args) < 4:
+        return None
+    rest = args[1:]
+    policy, used = _sol_policy(rest[0]), 1
+    if policy is None and len(rest) >= 2 and rest[0] in SOL_POLICIES and rest[1] in SOL_WORDS:   # «jupiter sol»
+        policy, used = SOL_POLICIES[rest[0]], 2
+    if policy is None:
+        return None
+    rest = rest[used:]
+    pv = _perp_dex(rest[0]) if rest else None
+    if policy == "okx" and not (pv and pv[1]):       # okx·sol + перп без dex — старая форма, её ответ
+        return None
+    if not rest:
+        return Unknown(raw, "формат: " + PROFILE_ENTRY_FMT)
+    if pv is None:
+        return Unknown(raw, f"перп «{rest[0][:20]}» не понят — нужно hyperliquid·<dex>, например hyperliquid·para")
+    venue, dex = pv
+    profile = PROFILE_ROUTES.get(("solana", venue))
+    if profile is None:
+        return Unknown(raw, f"связки sol → {venue} нет (есть: sol → hyperliquid·<dex>)")
+    m = _RAW_COIN_RE.match(raw_args[0])
+    if m is None:
+        return Unknown(raw, f"монета «{raw_args[0][:20]}» — латиница и цифры (можно dex:МОНЕТА)")
+    cdex, coin = (m.group(1) or "").lower() or None, m.group(2)
+    if cdex and dex and cdex != dex:
+        return Unknown(raw, f"dex монеты «{cdex}» ≠ dex перпа «{dex}»")
+    amt = rest[1:]
+    usdc = _usdc_of(amt)
+    if usdc is None:
+        return Unknown(raw, f"сумма «{' '.join(amt)[:20]}» не понята — число USDC на вход, например 200")
+    return ProfileEntry(coin, policy, "solana", venue, dex or cdex, usdc, profile)
+
+
+def _profile_exit(raw: str, args: list[str], raw_args: list[str] | None) -> Command | None:
+    """None — не синтаксис связки. Своя форма — только с именем связки или с количеством в токенах."""
+    if raw_args is None or not args:
+        return None
+    m = _RAW_COIN_RE.match(raw_args[0])
+    rest = args[1:]
+    profile = dex = None
+    if rest and (pw := _profile_word(rest[0])):
+        (profile, dex), rest = pw, rest[1:]
+    coin = m.group(2).lower() if m else None
+    tokens = usdc = None
+    if not rest or (len(rest) == 1 and rest[0] in _ALL_WORDS):
+        pass
+    elif len(rest) == 2 and (rest[1] in _TOKEN_WORDS or rest[1] == coin) and (tm := _TOKENS_RE.match(rest[0])):
+        tokens = Decimal(tm.group(1) + ("." + tm.group(2) if tm.group(2) else ""))
+        if tokens <= 0:
+            return Unknown(raw, "количество токенов — больше нуля")
+    elif profile is not None and (usdc := _usdc_of(rest)) is not None:
+        pass
+    else:
+        return Unknown(raw, "формат: " + PROFILE_EXIT_FMT) if profile is not None else None
+    if profile is None and tokens is None:
+        return None
+    if m is None:
+        return Unknown(raw, f"цель «{raw_args[0][:20]}» не понята — id сделки или монета")
+    cdex = (m.group(1) or "").lower() or None
+    if cdex and dex and cdex != dex:
+        return Unknown(raw, f"dex монеты «{cdex}» ≠ dex связки «{dex}»")
+    return ProfileExit(raw_args[0].replace("$", ""), profile, dex or cdex, tokens, usdc)
 
 
 # --- данные кнопок --------------------------------------------------------------------------------

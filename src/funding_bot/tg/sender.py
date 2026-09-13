@@ -58,19 +58,26 @@ def to_plain(text: str) -> str:
 
 # Белый список ссылок: только страница транзакции в обозревателе сети. Хэш — ровно 0x + 64 hex: ни кавычка, ни «>»,
 # ни чужой домен в href не пройдут, даже если строка пришла из данных.
-TX_URLS = {"bsc": "https://bscscan.com/tx/"}
+TX_URLS = {"bsc": "https://bscscan.com/tx/", "sol": "https://solscan.io/tx/", "solana": "https://solscan.io/tx/",
+           "hyperliquid": "https://app.hyperliquid.xyz/explorer/tx/"}
 _TX_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}")
-_LINK_RE = re.compile(r'<a href="https://bscscan\.com/tx/0x[0-9a-fA-F]{64}">')
+_SOL_SIG_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{64,88}")    # подпись Solana: base58 64 байт (регистр значим)
+_TX_ID_RE = {"bsc": _TX_HASH_RE, "hyperliquid": _TX_HASH_RE, "sol": _SOL_SIG_RE, "solana": _SOL_SIG_RE}
+_LINK_RE = re.compile(r'<a href="(?:https://bscscan\.com/tx/0x[0-9a-fA-F]{64}'
+                      r'|https://app\.hyperliquid\.xyz/explorer/tx/0x[0-9a-fA-F]{64}'
+                      r'|https://solscan\.io/tx/[1-9A-HJ-NP-Za-km-z]{64,88})">')
 _PAIRED = ("b", "i", "u", "s", "code", "pre")
 
 
 def tx_link(tx_hash: str | None, chain: str = "bsc", text: str | None = None) -> str:
-    """<a href="https://bscscan.com/tx/0x…">текст</a>; хэш не прошёл белый список или сеть неизвестна — простой
-    текст (экранирован). Подпись по умолчанию — короткий хэш «0x4b5e…1764»."""
+    """<a href="https://bscscan.com/tx/0x…">текст</a> (Solana — solscan.io по подписи, Hyperliquid — обозреватель HL по
+    хэшу 0x…); id не прошёл белый список сети или сеть неизвестна — простой текст (экранирован). Подпись по умолчанию —
+    короткий id «0x4b5e…1764»."""
     h = str(tx_hash or "")
     label = escape(text if text is not None else (f"{h[:6]}…{h[-4:]}" if len(h) > 12 else h))
-    base = TX_URLS.get(str(chain or ""))
-    if base is None or not _TX_HASH_RE.fullmatch(h):
+    c = str(chain or "")
+    base, rx = TX_URLS.get(c), _TX_ID_RE.get(c)
+    if base is None or rx is None or not rx.fullmatch(h):
         return label
     return f'<a href="{html.escape(base + h, quote=True)}">{label}</a>'
 

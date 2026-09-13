@@ -1,0 +1,63 @@
+{
+ "captured_utc": "2026-09-13T13:11:53.071412+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getAccountInfo",
+ "params": [
+  "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+  {
+   "encoding": "jsonParsed",
+   "commitment": "finalized"
+  }
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": {
+   "context": {
+    "apiVersion": "4.3.0-rc.0",
+    "slot": 446711177
+   },
+   "value": {
+    "data": {
+     "parsed": {
+      "info": {
+       "decimals": 6,
+       "extensions": [
+        {
+         "extension": "metadataPointer",
+         "state": {
+          "authority": null,
+          "metadataAddress": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
+         }
+        },
+        {
+         "extension": "tokenMetadata",
+         "state": {
+          "additionalMetadata": [],
+          "mint": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+          "name": "The Black Bull",
+          "symbol": "ANSEM",
+          "updateAuthority": null,
+          "uri": "https://meta.uxento.io/data/7f4c8448-c38e-4c34-aa37-a28cff9806d0"
+         }
+        }
+       ],
+       "freezeAuthority": null,
+       "isInitialized": true,
+       "mintAuthority": null,
+       "supply": "997367850423946"
+      },
+      "type": "mint"
+     },
+     "program": "spl-token-2022",
+     "space": 401
+    },
+    "executable": false,
+    "lamports": 25840695235,
+    "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "rentEpoch": 18446744073709551615,
+    "space": 401
+   }
+  },
+  "id": 2
+ }
+}

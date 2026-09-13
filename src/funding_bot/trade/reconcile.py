@@ -28,6 +28,7 @@ from .. import config
 from . import marks, report, store, tconfig
 from .engine import DealBook, Legs, backfill_instruments, deal_book, dget
 from .keys import redact
+from .runtime import ProfileDown, is_sol_deal, legs_of
 from .store import ClipState, DealState, DexTxState, PerpOrderState
 
 log = logging.getLogger(__name__)
@@ -448,6 +449,9 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
             ints.setdefault(it["deal_id"], []).append(it)
     out = []
     for d in store.active_deals(con):
+        if is_sol_deal(d):                     # связка SOL × HL: свои ноги и сверка (X12); BSC-путь ниже прежний
+            out.append(_sol_restart(con, d, legs_fn, ints, ts))
+            continue
         legs = legs_fn(bool(d["sim"]))
         try:
             chk = check_deal(con, d, legs, resolve=True, seed=True)
@@ -468,6 +472,40 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
     return StartupReport(interrupted, expired, drafts, out, wallet_problems, bf)
 
 
+def _sol_legs(legs_fn, d: dict) -> tuple[Any, str | None]:
+    """Ноги сделки связки SOL × HL через реестр и почему их нет: не собраны — (None, причина сбоя сборки), связки
+    в процессе нет — (None, None). «Не сверена», а не ноги BSC и не «флэт»."""
+    try:
+        return legs_of(legs_fn, d), None
+    except ProfileDown as e:                   # сбой сборки реестр помнит (last_error); «не подключена» — нет
+        log.warning("ноги связки для %s: %s", d["id"], redact(e))
+        built = (getattr(legs_fn, "last_error", None) or {}).get(e.profile)
+        return None, (str(e.reason)[:200] if built else None)
+    except Exception as e:                     # noqa — прочее: сделка остаётся видна
+        log.warning("ноги связки для %s: %s", d["id"], redact(e))
+        return None, f"{type(e).__name__}: {redact(e)}"[:200]
+
+
+def _sol_restart(con, d: dict, legs_fn, ints: dict, ts: float) -> "DealRestart":
+    from . import sol_flow
+    legs, down = _sol_legs(legs_fn, d)
+    try:
+        chk = sol_flow.check_deal(con, d, legs, resolve=True, down=down)
+    except Exception as e:                     # noqa — сверка не удалась — «не прочитано», а не «совпало»
+        log.exception("сверка %s", d["id"])
+        chk = DealCheck(d["id"], None, f"сверка упала: {type(e).__name__}: {redact(e)[:120]}", deal_book(con, d["id"]))
+    cur = store.get_deal(con, d["id"])["state"]
+    if cur == DealState.ABORTED:               # сверка сняла пустую сделку (исход выяснен): решать нечего
+        new, reason, fields = DealState.ABORTED, None, {}
+    else:
+        new, reason, fields = _decide(d["state"], chk, bool(ints.get(d["id"])), int(d["token_dec"]), chk.step)
+    if new != cur:
+        store.set_deal_state(con, d["id"], new, reason=reason, **fields)
+    store.event(con, "restart_check", deal_id=d["id"], old=d["state"], new=str(new), matched=chk.matched,
+                detail=chk.detail, now=ts)
+    return DealRestart(deal=d, check=chk, old=d["state"], new=str(new), intents=ints.get(d["id"], []))
+
+
 def restart_clip(con, intent: dict) -> tuple[int | None, int | None]:
     """(последний клип, клипов по плану) — для строки «♻️ … (клип 2/3)»."""
     r = con.execute("SELECT MAX(seq) FROM clips WHERE intent_id=?", (intent["id"],)).fetchone()
@@ -481,21 +519,43 @@ def restart_clip(con, intent: dict) -> tuple[int | None, int | None]:
 
 # --- «позиции» -------------------------------------------------------------------------------------------
 def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_deal: str | None = None,
-              resolve: bool = True) -> tuple[list[dict], bool | None, str | None]:
+              resolve: bool = True, profile: str | None = None) -> tuple[list[dict], bool | None, str | None]:
     """Строки для views.PositionView по правде (balanceOf, positionRisk), сверка с журналом. Сделку, которую сейчас
-    ведёт исполнитель, не сверяем: посреди клипа кошелёк и журнал законно расходятся."""
+    ведёт исполнитель, не сверяем: посреди клипа кошелёк и журнал законно расходятся. profile — только сделки одной
+    связки («позиции sol»)."""
+    from .runtime import profile_of_deal
     rows, verdicts, problems = [], [], []
     for d in store.active_deals(con):
+        if profile is not None and profile_of_deal(d) != profile:
+            continue
         dec = int(d["token_dec"])
-        legs = legs_fn(bool(d["sim"]))
+        sol = is_sol_deal(d)                   # связка SOL × HL: свои ноги, сверка, учёт (sol_ledger)
+        down = None
+        if sol:
+            legs, down = _sol_legs(legs_fn, d)
+        else:
+            legs = legs_fn(bool(d["sim"]))
         if d["id"] == busy_deal:
             chk = DealCheck(d["id"], None, "идёт исполнение — сверю после", deal_book(con, d["id"]))
         else:
             try:
-                chk = check_deal(con, d, legs, resolve=resolve)
+                if sol:
+                    from . import sol_flow
+                    chk = sol_flow.check_deal(con, d, legs, resolve=resolve, down=down)
+                else:
+                    chk = check_deal(con, d, legs, resolve=resolve)
             except Exception as e:             # noqa
                 chk = DealCheck(d["id"], None, f"сверка упала: {redact(e)[:120]}", deal_book(con, d["id"]))
         bk = chk.book
+        if sol and store.get_deal(con, d["id"])["state"] == DealState.ABORTED:
+            continue                           # сверка сняла пустую сделку: позиции нет, строке не место
+        if sol:
+            rows.append(_sol_row(con, d, legs, chk, now=now,
+                                 fresh=resolve and d["id"] != busy_deal and legs is not None))
+            verdicts.append(chk.matched)
+            if chk.matched is not True:
+                problems.append(f"{d['id']}: {chk.detail}")
+            continue
         spot_px = mark = rate = liq = None
         income: list[dict] = []
         if legs is not None:
@@ -508,7 +568,7 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
                 mark, rate = fr[0], fr[1]
             except Exception:                  # noqa
                 pass
-            if not legs.sim:
+            if not legs.sim and not sol:
                 start = int(float(d["created"]) * 1000)
                 try:
                     store.add_funding_income(con, legs.perp.venue, legs.perp.funding_income(d["symbol"], start))
@@ -529,8 +589,9 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
         sim = bool(d["sim"])
         # «PnL сейчас · при выходе»: последний расчёт трейдера (моложе MARK_S) или свежий той же функцией (marks);
         # сделку, которую ведёт исполнитель, не оцениваем заново. Фандинг только что добран — второй раз не читаем.
-        pm = marks.for_positions(con, d, legs, now=now, fresh=resolve and d["id"] != busy_deal and legs is not None,
-                                 px_ask=spot_px)
+        pm = None if sol else marks.for_positions(con, d, legs, now=now,
+                                                  fresh=resolve and d["id"] != busy_deal and legs is not None,
+                                                  px_ask=spot_px)
         spot_units = bk.tokens_raw if sim else chk.wallet_units
         pos = (-bk.short if bk.short is not None else None) if sim else chk.position
         num = report.positions_numbers(spot_units=spot_units, dec_token=dec, spot_px=spot_px, position_amt=pos,
@@ -565,6 +626,78 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
         return rows, None, None
     matched = False if False in verdicts else (True if all(v is True for v in verdicts) else None)
     return rows, matched, ("; ".join(problems) or None)
+
+
+def _sol_mark(con, d: dict, legs, *, now: float, fresh: bool) -> dict | None:
+    """«PnL сейчас · при выходе» сделки связки: оценка трейдера моложе MARK_S или свежая (sol_ledger, пишется в
+    deal_marks); идёт исполнение — только таблица, не старше MARK_STALE_S."""
+    from . import sol_ledger
+    last = marks.decode(store.last_mark(con, d["id"]))
+    recent = last if (last is not None and not last["flags"].get("final")
+                      and now - last["ts"] < tconfig.MARK_STALE_S) else None
+    if recent is not None and (now - recent["ts"] < tconfig.MARK_S or not fresh):
+        return recent
+    if not fresh or legs is None:
+        return recent
+    try:
+        m = sol_ledger.mark(con, d, legs, now=now, cfg=marks.sol_cfg(d))
+        marks.save(con, m)
+    except Exception as e:                     # noqa — «позиции» без строки PnL, но не без позиций
+        log.warning("оценка %s для «позиций»: %s", d["id"], redact(e))
+        return recent
+    return m.as_dict()
+
+
+def _sol_row(con, d: dict, legs, chk: DealCheck, *, now: float, fresh: bool) -> dict:
+    """Строка «позиций» сделки связки: спот — книга СДЕЛКИ (свои токены владельца в кошельке — не её), шорт — позиция HL
+    (симуляция — книга), фандинг — фактические userFunding окна сделки, PnL и ликвидация — из оценки sol_ledger."""
+    from . import sol_ledger
+    from .sol_flow import _step
+    bk = chk.book
+    dec = int(d["token_dec"])
+    sim = bool(d["sim"])
+    pm = _sol_mark(con, d, legs, now=now, fresh=fresh)
+    inst = sol_ledger.inst_of(d)
+    try:
+        m = D(str(inst.get("units_per_contract") or 1)) / D(str(inst.get("spot_units_per_token") or 1))
+    except (ArithmeticError, ValueError):
+        m = D(1)
+    mark_px = rate = None
+    step = None
+    if legs is not None:
+        try:
+            fr = legs.perp.funding(d["symbol"])
+            mark_px, rate = fr[0], fr[1]
+        except Exception:                      # noqa
+            pass
+        try:
+            step = _step(legs.perp)
+        except Exception:                      # noqa
+            step = None
+    spot_px = pm["px_dex"] if pm else None
+    pos = (-bk.short if bk.short is not None else None) if sim else chk.position
+    income = [] if sim else [{"income": str(v)} for _t, v in sol_ledger.funding_rows(con, d)]
+    num = report.positions_numbers(spot_units=bk.tokens_raw if bk.known else None, dec_token=dec, spot_px=spot_px,
+                                   position_amt=pos, mark=mark_px, unrealized=None, income_rows=income,
+                                   created=float(d["created"]), now=now, book_tokens=bk.tokens(dec) if bk.known else None,
+                                   book_short=bk.short, m=m)
+    liq = None
+    lq = (pm or {}).get("flags", {}).get("liq") if pm else None
+    if isinstance(lq, dict):
+        dist = marks.liq_distance(lq.get("price"), lq.get("mark"))
+        liq = dist * 100 if dist is not None else None
+    usd_h = (rate / _period_h(con, d["id"]) * num["short_usd"]) if (rate is not None
+                                                                     and num["short_usd"] is not None) else None
+    cost, exit_est = _entry_costs(con, d["id"])
+    payback = report.payback_h(cost, exit_est, usd_h, ZERO if sim else num["funding_usd"])
+    return dict(deal_id=d["id"], coin=d["coin"], state=d["state"], chain=d["chain"], perp_venue=d["perp_venue"],
+                spot_qty=num["spot_tokens"], spot_usd=num["spot_usd"], perp_qty=pos, perp_usd=num["short_usd"],
+                upnl_usd=_upnl(con, d["id"], bk.short, mark_px), delta_qty=num["delta"], delta_usd=num["delta_usd"],
+                funding_usd=None if sim else num["funding_usd"], funding_n=None if sim else num["funding_count"],
+                held_s=max(now - float(d["created"]), 0.0), liq_dist_pct=liq, liq_alert_pct=None, reason=d["reason"],
+                sim=sim, step=None if step is None else step * m, leg_usd=None, payback_h=payback,   # бюджет USDC ≠ «$ на ногу»
+                pnl_now_usd=pm["pnl_now"] if pm else None, pnl_exit_usd=pm["pnl_exit"] if pm else None,
+                pnl_uncovered=bool(pm and pm["flags"].get("uncovered")), m_unknown=False)
 
 
 def _period_h(con, deal_id: str) -> D:

@@ -876,3 +876,94 @@ def pick_perp(book: Book, side: str, qty: D, f: Filters, fee_taker: D, lim: Limi
     return PerpPick(alpha=a, beta_bps=b, band=bool(band and a is not None and b is not None), alpha_auto=a_auto,
                     beta_auto=b_auto, children=ch, cost=pc, waits=w, expected_s=exp,
                     exec_time_max_s=exec_time_max(lim, exp))
+
+
+# --- связка SOL × HL: клип по реальным котировкам выбранного маршрута (ТЗ §5.3) ----------------------------------
+@dataclass(frozen=True)
+class RouteClip:
+    """Оценка ОДНОГО клипа по свежей котировке победителя и стакану HL — без кривой k/r: минимумы разных роутеров
+    и пулов в одну кривую не складываются (R11). Предварительная оценка: исполнитель считает хедж по чеку.
+    Токены — в токенах спота, qty/capacity — в единицах размера перпа (контракты), деньги — в котировке (USDC)."""
+    side: str                        # entry | exit
+    tokens: D                        # вход: ожидаемые токены; выход: продаваемые токены сделки
+    tokens_min: D | None             # вход: при минимальном выходе свопа (on-chain порог)
+    stable: D                        # вход: списание USDC (ExactIn); выход: ожидаемые USDC
+    stable_min: D | None             # выход: при минимальном выходе
+    qty: D                           # вход: SELL на ожидаемые токены; выход: BUY reduceOnly
+    qty_min: D | None                # вход: при минимальном выходе
+    capacity: D                      # вход: одобренный предел хеджа (ожидаемое + разрешённый излишек); выход = qty
+    perp_vwap: D                     # по стакану на весь qty не хуже cap_px
+    perp_notional: D
+    perp_fee: D | None               # по применимой ставке; None — ставка неизвестна (не 0)
+    external: D | None               # внешние расходы спота в котировке; None — неизвестны
+    basis_gross_bps: D               # (цена перпа / цена спота − 1) на базовую единицу
+    basis_all_in_bps: D | None       # то же за вычетом внешних расходов спота и комиссии перпа; None — неизвестно
+    residual_tokens: D               # вход: токены без хеджа (меньше шага перпа) при ожидаемом выходе
+    children: tuple = ()             # ((qty, кэп цены),) — одна дочерняя IOC на клип; остаток — по новой книге
+
+    def as_est(self) -> dict:
+        return {k: getattr(self, k) for k in ("tokens", "tokens_min", "stable", "stable_min", "qty", "qty_min",
+                                              "capacity", "perp_vwap", "perp_notional", "perp_fee", "external",
+                                              "basis_gross_bps", "basis_all_in_bps", "residual_tokens")}
+
+
+def _walk_cap(levels: Sequence[tuple[D, D]], qty: D, cap: D, side: str) -> tuple[D, D] | None:
+    """VWAP на ВЕСЬ qty только по уровням не хуже кэпа; не хватает — None (последний уровень не продолжается)."""
+    left, notional = qty, ZERO
+    for p, q in levels:
+        if (p < cap) if side == "SELL" else (p > cap):
+            break
+        take = min(left, q)
+        notional += take * p
+        left -= take
+        if left <= 0:
+            return notional / qty, notional
+    return None
+
+
+def route_clip(*, side: str, amount_in_raw: int, dec_in: int, dec_out: int, expected_out_raw: int,
+               min_out_raw: int | None, external: D | None, book: Book, step: D, fs: D, fp: D, fee_rate: D | None,
+               cap_px: D, surplus_tokens: D = ZERO, close_qty: D | None = None) -> RouteClip:
+    """Вход: USDC → токены (SELL шорт на floor(T·Fs/Fp) к шагу по бидам); выход: токены → USDC (BUY reduceOnly
+    close_qty по аскам). Стакан не покрывает весь объём не хуже cap_px — PlanRefused (объём неизвестен, не «почти»)."""
+    if side not in KINDS:
+        raise ValueError(f"side: {side!r}")
+    if step <= 0 or fs <= 0 or fp <= 0:
+        raise ValueError("шаг и единицы перпа — положительные")
+    with localcontext() as ctx:
+        ctx.prec = 50
+        a_in = D(amount_in_raw) / D(10) ** dec_in
+        exp_out = D(expected_out_raw) / D(10) ** dec_out
+        min_out = None if min_out_raw is None else D(min_out_raw) / D(10) ** dec_out
+        if side == "entry":
+            tokens, stable, tokens_min, stable_min = exp_out, a_in, min_out, None
+            qty = floor_to(tokens * fs / fp, step)
+            qty_min = None if tokens_min is None else floor_to(tokens_min * fs / fp, step)
+            capacity = floor_to((tokens + max(surplus_tokens, ZERO)) * fs / fp, step)
+            psd, levels = "SELL", book.bids
+        else:
+            tokens, stable, tokens_min, stable_min = a_in, exp_out, None, min_out
+            qty = close_qty if close_qty is not None else floor_to(tokens * fs / fp, step)
+            qty_min, capacity = None, qty
+            psd, levels = "BUY", book.asks
+        if qty <= 0:
+            raise PlanRefused(f"объём клипа меньше шага перпа ({step}) — хеджировать нечего")
+        w = _walk_cap(levels, qty, cap_px, psd)
+        if w is None:
+            raise PlanRefused(f"стакан Hyperliquid не покрывает {qty} по цене не хуже {cap_px} — объём неизвестен")
+        vwap, notional = w
+        fee = None if fee_rate is None else notional * fee_rate
+        spot_px = stable / (tokens * fs)                      # на базовую единицу
+        perp_px = vwap / fp
+        gross = (perp_px / spot_px - 1) * BPS
+        all_in = None
+        if fee is not None and external is not None:
+            if side == "entry":             # шорт по бидам за вычетом комиссии против покупки с расходами
+                all_in = ((notional - fee) / (qty * fp)) / ((stable + external) / (tokens * fs)) * BPS - BPS
+            else:                           # откуп по аскам с комиссией против продажи за вычетом расходов
+                all_in = ((notional + fee) / (qty * fp)) / ((stable - external) / (tokens * fs)) * BPS - BPS
+        residual = tokens - qty * fp / fs if side == "entry" else ZERO
+        return RouteClip(side=side, tokens=tokens, tokens_min=tokens_min, stable=stable, stable_min=stable_min, qty=qty,
+                         qty_min=qty_min, capacity=capacity, perp_vwap=vwap, perp_notional=notional, perp_fee=fee,
+                         external=external, basis_gross_bps=gross, basis_all_in_bps=all_in, residual_tokens=residual,
+                         children=((qty, cap_px),))

@@ -1,0 +1,13 @@
+{
+ "captured_utc": "2026-09-13T13:34:03.154839+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getMinimumBalanceForRentExemption",
+ "params": [
+  82
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": 1066800,
+  "id": 216
+ }
+}

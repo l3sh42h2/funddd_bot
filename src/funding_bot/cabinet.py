@@ -361,12 +361,45 @@ def _dv(v) -> D | None:
 
 
 def _row_key(d: dict):
-    """Ключ строки пары в table.json: спот DEX «<chainIndex>:<токен>», перп, символ (как dexleg строит строку)."""
+    """Ключ строки пары в table.json: спот DEX «<chainIndex>:<токен>», перп, символ (как dexleg строит строку). EVM-адрес —
+    нижним регистром (как раньше); mint Solana (501) — base58 как есть: регистр значим (S01)."""
     try:
         ci = tconfig.chain_index(d["chain"])
     except (KeyError, TypeError):
         return None
-    return (f"{ci}:{d['token']}".lower(), d["perp_venue"], d["symbol"])
+    spot = f"{ci}:{d['token']}"
+    return (spot if _sol_spot(spot) else spot.lower(), d["perp_venue"], d["symbol"])
+
+
+def _sol_spot(spot: str) -> bool:
+    return str(spot).startswith("501:")
+
+
+def _is_sol(d: dict) -> bool:
+    from .trade.runtime import is_sol_deal
+    try:
+        return is_sol_deal(d)
+    except Exception:                           # noqa — битая строка сделки: карточка BSC-вида, а не падение страницы
+        return False
+
+
+SOL_ROUTE = {"jupiter_build_v2": "Jupiter", "jupiter_order_v2": "Jupiter Order", "okx_solana_v6": "OKX"}
+IDENT_TEXT = {"reviewed_override": "подтверждено владельцем", "verified_source": "подтверждено источником"}
+
+
+def _sol_view(con: sqlite3.Connection, d: dict) -> dict:
+    """Связка Solana × Hyperliquid: сеть, mint (как есть), фактические маршруты клипов, точный рынок HL и основание
+    соответствия — из замороженной спецификации сделки и журнала (не из политики «auto»)."""
+    from .trade import sol_ledger
+    inst = sol_ledger.inst_of(d)
+    try:
+        routes = sol_ledger.ledger(con, d, fee_rate=None).routes
+    except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError):
+        routes = ()
+    return {"mint": d.get("token"), "fullcoin": inst.get("perp_symbol") or d.get("symbol"),
+            "routes": tuple(dict.fromkeys(SOL_ROUTE.get(r, r) for r in routes)),
+            "identity": IDENT_TEXT.get(inst.get("identity_status")), "ident_to": str(inst.get("identity_expires_at")
+                                                                                    or "")[:10]}
 
 
 _TERMINAL = ("CLOSED", "ABORTED")
@@ -403,6 +436,8 @@ def load_deals(con: sqlite3.Connection, limit: int = DEALS_MAX, now: float | Non
                            "ON i.id = e.intent_id WHERE e.deal_id = ? ORDER BY e.ts DESC, e.rowid DESC LIMIT 1",
                            (d["id"],)).fetchone()
         v = _deal_view(d, opened.get(d["id"]), d["id"] in spot_unknown, d["id"] in perp_unknown, last)
+        if _is_sol(d):
+            v["sol"], v["unit"] = _sol_view(con, d), "USDC"
         v["pnl"] = _pnl_view(con, d, now)
         if d.get("state") not in _TERMINAL:
             v["liq"] = None if v["sim"] else _liq_view(con, d, now)
@@ -439,13 +474,21 @@ HIST_MAX = 200                          # строк истории выплат
 
 def funding_history(con: sqlite3.Connection, d: dict) -> dict:
     """Выплаты фандинга сделки: funding_income площадки и символа сделки с её открытия — те же границы, что у фандинга в
-    PnL (marks.journal). rows — (время с, сумма $, итог с начала), новые сверху, не больше HIST_MAX; total — по всем."""
-    try:
-        start = int(float(d["created"]) * 1000)
-        rows = con.execute("SELECT ts, income FROM funding_income WHERE venue = ? AND symbol = ? AND ts >= ? "
-                           "ORDER BY ts, tran_id", (d["perp_venue"], d["symbol"], start)).fetchall()
-    except (sqlite3.OperationalError, TypeError, ValueError):
-        return {"rows": [], "n": 0, "total": ZERO}
+    PnL (marks.journal). rows — (время с, сумма $, итог с начала), новые сверху, не больше HIST_MAX; total — по всем.
+    Связка Solana × Hyperliquid — фактические userFunding счёта сделки в её окне (sol_ledger), USDC."""
+    if _is_sol(d):
+        from .trade import sol_ledger
+        try:
+            rows = [(int(t * 1000), x) for t, x in sol_ledger.funding_rows(con, d)]
+        except (sqlite3.Error, TypeError, ValueError):
+            rows = []
+    else:
+        try:
+            start = int(float(d["created"]) * 1000)
+            rows = con.execute("SELECT ts, income FROM funding_income WHERE venue = ? AND symbol = ? AND ts >= ? "
+                               "ORDER BY ts, tran_id", (d["perp_venue"], d["symbol"], start)).fetchall()
+        except (sqlite3.OperationalError, TypeError, ValueError):
+            return {"rows": [], "n": 0, "total": ZERO}
     acc, out = ZERO, []
     for ts, inc in rows:
         x = _dv(inc)
@@ -470,7 +513,13 @@ def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
         mk = None
     if st == "CLOSED":
         if mk is not None and mk["flags"].get("final") and mk["pnl_now"] is not None:
-            return {"final": True, "total": mk["pnl_now"], "no_gas": False}
+            out = {"final": True, "total": mk["pnl_now"], "no_gas": False}
+            if mk["flags"].get("accounting_complete") is False:
+                out["incomplete"] = True
+            return out
+        if _is_sol(d):
+            from .trade import sol_ledger
+            return sol_ledger.realized_view(con, d)
         try:
             j = tmarks.journal(con, d, until_ms=int(float(d.get("updated") or now) * 1000))
         except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError) as e:
@@ -639,8 +688,8 @@ def _stale(ts) -> str:
     return f"на {_t(ts)} · устарело" if ts else "устарело"
 
 
-def _pnl_usd(x: D | None) -> str:
-    return "—" if x is None else fmt_num(x, 2, sign=True) + " $"
+def _pnl_usd(x: D | None, unit: str = "$") -> str:
+    return "—" if x is None else fmt_num(x, 2, sign=True) + "\u00a0" + unit
 
 
 def pnl_block(v: dict) -> str:
@@ -650,12 +699,20 @@ def pnl_block(v: dict) -> str:
     p = v.get("pnl")
     if not p:
         return ""
+    sol = bool(v.get("sol"))
+    unit = v.get("unit") or "$"                 # связка Solana × Hyperliquid — USDC (не объявляется точным USD)
     e = lambda x: html.escape("" if x is None else str(x))
     cls = lambda x, gray=False: "m" if (gray or x is None) else ("g" if x > 0 else "r" if x < 0 else "")
     big = lambda label, x, gray=False: (f'<div class="pl">{e(label)} <b class="big mono {cls(x, gray)}">'
-                                        f'{e(_pnl_usd(x))}</b></div>')
+                                        f'{e(_pnl_usd(x, unit))}</b></div>')
     if p["final"]:
-        note = '<div class="pn m">газ в $ не учтён: цены BNB у кабинета нет</div>' if p.get("no_gas") else ""
+        notes = []
+        if p.get("no_gas"):
+            notes.append("сеть Solana не учтена: цены SOL у кабинета нет" if sol else
+                         "газ в $ не учтён: цены BNB у кабинета нет")
+        if p.get("incomplete"):
+            notes.append("учёт Hyperliquid догружается — итог не окончательный")
+        note = f'<div class="pn m">{" · ".join(notes)}</div>' if notes else ""
         return f'<div class="pnl">{big("PnL итог", p["total"])}{note}</div>'
     mk = p.get("mark")
     if mk is None:
@@ -664,7 +721,10 @@ def pnl_block(v: dict) -> str:
     fl = mk["flags"]
     note = [_stale(mk["ts"])] if stale else []
     if fl.get("uncovered"):
-        note.append('<span class="unk">стакан не покрывает шорт — остаток по худшей цене</span>')
+        note.append('<span class="unk">стакан HL мельче шорта — выход не оценён</span>' if sol else
+                    '<span class="unk">стакан не покрывает шорт — остаток по худшей цене</span>')
+    if sol and (fl.get("funding_incomplete") or fl.get("fills_incomplete") or fl.get("fees_est")):
+        note.append("учёт Hyperliquid догружается")
     if fl.get("approve") == "unknown":
         note.append("allowance не прочитан — газ approve заложен")
     if fl.get("position") is not None:
@@ -890,7 +950,8 @@ def history_block(v: dict) -> str:
         return ""
     e = lambda x: html.escape("" if x is None else str(x))            # noqa: E731
     sgn = lambda x: "g" if x > 0 else ("r" if x < 0 else "")          # noqa: E731
-    usd = lambda x: fmt_num(x, 4, sign=True) + "\u00a0$"                   # noqa: E731
+    unit = v.get("unit") or "$"
+    usd = lambda x: fmt_num(x, 4, sign=True) + "\u00a0" + unit             # noqa: E731
     if h["n"]:
         rows = "".join(f'<tr><td>{_t(ts)}</td><td class="mono {sgn(x)}">{e(usd(x))}</td><td class="mono">{e(usd(acc))}'
                        f'</td></tr>' for ts, x, acc in h["rows"])
@@ -901,7 +962,7 @@ def history_block(v: dict) -> str:
         body = '<div class="m">выплат пока нет</div>'
     tot = h["total"]
     return (f'<details class="hist" data-deal="{e(v["id"])}"><summary>история выплат</summary>{body}'
-            f'<div class="tot">всего: <b class="mono {sgn(tot)}">{e(_pnl_usd(tot))}</b></div></details>')
+            f'<div class="tot">всего: <b class="mono {sgn(tot)}">{e(_pnl_usd(tot, unit))}</b></div></details>')
 
 
 def deal_card(v: dict) -> str:
@@ -916,8 +977,19 @@ def deal_card(v: dict) -> str:
     for flag, text in (("spot_unknown", "исход свопа выясняется"), ("perp_unknown", "исход заявки выясняется")):
         if v.get(flag):
             out.append(f'<div class="why unk">{text}</div>')
-    out.append(f'<div class="pair">спот okx·{e(v["chain"])} <span class="up">▲</span> | перп {e(v["venue"])} '
-               f'<span class="dn">▼</span> <span class="mono">{e(v["symbol"])}</span> · {e(_usd(v["leg_usd"]))} на ногу</div>')
+    sv = v.get("sol")
+    if sv:                                      # связка Solana × Hyperliquid: фактический маршрут, а не «okx»
+        rt = " · ".join(sv["routes"]) if sv["routes"] else "Jupiter / OKX — лучший"
+        out.append(f'<div class="pair">спот Solana · {e(rt)} <span class="up">▲</span> | перп Hyperliquid '
+                   f'<span class="dn">▼</span> <span class="mono">{e(sv["fullcoin"])}</span> · '
+                   f'{e(fmt_num(v["leg_usd"], 0) if v["leg_usd"] is not None else "—")} USDC</div>')
+        mint = str(sv["mint"] or "")
+        ident = f' · соответствие {e(sv["identity"])} до {e(sv["ident_to"])}' if sv["identity"] else ""
+        out.append(f'<div class="pair">mint <span class="mono" title="{e(mint)}">{e(mint[:4] + "…" + mint[-4:])}'
+                   f'</span>{ident}</div>')
+    else:
+        out.append(f'<div class="pair">спот okx·{e(v["chain"])} <span class="up">▲</span> | перп {e(v["venue"])} '
+                   f'<span class="dn">▼</span> <span class="mono">{e(v["symbol"])}</span> · {e(_usd(v["leg_usd"]))} на ногу</div>')
     out.append(pnl_block(v))
     kv = [_kv("открыта", _t(v["opened"]))]
     if v["state"] in _TERMINAL:
@@ -1141,7 +1213,8 @@ class Cabinet:
         idx = {}
         for r in t.get("sf_rows") or []:
             if isinstance(r, dict) and r.get("spot_ex") == DEX_SPOT:
-                idx[(str(r.get("spot") or "").lower(), r.get("perp_ex"), r.get("perp"))] = {
+                spot = str(r.get("spot") or "")
+                idx[(spot if _sol_spot(spot) else spot.lower(), r.get("perp_ex"), r.get("perp"))] = {
                     "rate_h": r.get("spread"), "gap": r.get("gap"), "px_spot": r.get("px_spot"),
                     "px_perp": r.get("px_perp"), "stale": bool(r.get("stale"))}
         with self._tbl_lock:

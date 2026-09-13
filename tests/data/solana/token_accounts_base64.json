@@ -1,0 +1,87 @@
+{
+ "captured_utc": "2026-09-13T13:34:10.891180+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getMultipleAccounts",
+ "params": [
+  [
+   "4WNw6fF5eGdep7nroX9oAqcZCDdSEiT4EnF7ZiNiy8k8",
+   "68n6nUMcaSYEFxXJmvuC5K117WVKxKaCRvfoSgu1UBJA",
+   "4eZim6VcF85Qd1PNkeUwt86qnyaH9naor2Q9PSkpYwiK",
+   "F9r5KY45RJFbRfcgvs9GwzcubQP6Z2tEeyx4uqp9e8Kv",
+   "EHWN9tUeAzWUjYPpkk69yeoLPRbtVh5hEFuX8o9xpigY",
+   "FxuqW7exk6oxTJVvr652jY1mtyfwhRqdaASs4LsebgcH"
+  ],
+  {
+   "encoding": "base64",
+   "commitment": "confirmed"
+  }
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": {
+   "context": {
+    "apiVersion": "4.3.0-rc.0",
+    "slot": 446715436
+   },
+   "value": [
+    {
+     "data": [
+      "f/Aws0P8o9hWgWlTui2gLhVP0dopCJItRz7zmCfC0D/FQZTs/Y2kARsod89Pimeom0PbmUWoMLOX4BBy5xBch+CgoH0DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAA=",
+      "base64"
+     ],
+     "executable": false,
+     "lamports": 1513840,
+     "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+     "rentEpoch": 18446744073709551615,
+     "space": 170
+    },
+    {
+     "data": [
+      "xvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWHFQZTs/Y2kARsod89Pimeom0PbmUWoMLOX4BBy5xBchwBFPpAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "base64"
+     ],
+     "executable": false,
+     "lamports": 1488440,
+     "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "rentEpoch": 18446744073709551615,
+     "space": 165
+    },
+    {
+     "data": [
+      "xvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWGoSALokpRS51eZQYr+p8frX4+s8Vt1+vrcl0gxtT1/REeyXUYBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "base64"
+     ],
+     "executable": false,
+     "lamports": 2039280,
+     "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+     "rentEpoch": 18446744073709551615,
+     "space": 165
+    },
+    {
+     "data": [
+      "f/Aws0P8o9hWgWlTui2gLhVP0dopCJItRz7zmCfC0D+oSALokpRS51eZQYr+p8frX4+s8Vt1+vrcl0gxtT1/REvDqqUCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAA=",
+      "base64"
+     ],
+     "executable": false,
+     "lamports": 2074080,
+     "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+     "rentEpoch": 18446744073709551615,
+     "space": 170
+    },
+    null,
+    {
+     "data": [
+      "pdthqvFWnacSNMwAHBIwEumDEWeE757ZWOtSXxn6iJbNNiLs8SS4FwXcCYJwYRgDhV7uwLBQWD9NaSULuHtkwE67JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAADxNeh77+3XJH94UDkSIYoMt6c82RDqPMr7rPkiuJGAoAgcAAAAPAAEAAA==",
+      "base64"
+     ],
+     "executable": false,
+     "lamports": 2108880,
+     "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+     "rentEpoch": 18446744073709551615,
+     "space": 175
+    }
+   ]
+  },
+  "id": 221
+ }
+}

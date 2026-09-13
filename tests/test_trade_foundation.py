@@ -395,7 +395,7 @@ SPEC_COLUMNS = {
     "flags": "k v",
     "tg_updates": "update_id ts user_id chat_id text verdict",
     "deals": "id created state reason coin chain token token_dec perp_venue symbol leg_usd owner_json sim carry dust updated "
-             "inst_json",
+             "inst_json perp_scope",
     "intents": "id deal_id kind spec_json plan_json nonce status created expires approved chat msg_id err",
     "clips": "id intent_id seq state planned_in dex_in dex_out perp_qty perp_quote basis_bps carry_in carry_out "
              "recovery created updated",

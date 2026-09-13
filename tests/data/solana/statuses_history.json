@@ -1,0 +1,102 @@
+{
+ "captured_utc": "2026-09-13T13:33:50.453122+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getSignatureStatuses",
+ "params": [
+  [
+   "quxc74gmarBk5jiBGEW78PRuYrHwVGGjBB7wLAytacZjefju1mj1qHQmSfCe7EX9Z5RuycpnijZM5VqnsMaiZMD",
+   "hTQcL7FKKiHfr5LPYiJxpRo5ra88Ga36nRKPJyZfSMKPEUdC6nCBwVT36Bw3W5YrnuFGd9mjKcVeZ4JoCakRuc2",
+   "4G2YYTc42Jg4AYQbuYrCGxKxzVBfTyhfF8z8bKtATdf5114bwPfdjHV3FMBMDP5iCVfS5vtrR43nhJzJKEQd3E5R",
+   "5VEUWNANHuHTumTEHdMyhmkgrMGL8mJzEkRdo9PYfTkaSSxUdhcQs1pwmbXUg1DA25BHh3w4jjid7VVHLHKgwoub",
+   "4R5vpMXePLDUta7smZrSKqz9WdX8KKKagb3bskb3NTVYhiCowq5QSZEcmBkPGX8cG6bxsC8GAm9Q9XVFLTshst2H"
+  ],
+  {
+   "searchTransactionHistory": true
+  }
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": {
+   "context": {
+    "apiVersion": "4.3.0-rc.0",
+    "slot": 446715371
+   },
+   "value": [
+    {
+     "confirmationStatus": "finalized",
+     "confirmations": null,
+     "err": null,
+     "slot": 446711182,
+     "status": {
+      "Ok": null
+     }
+    },
+    {
+     "confirmationStatus": "finalized",
+     "confirmations": null,
+     "err": {
+      "InstructionError": [
+       2,
+       {
+        "Custom": 6000
+       }
+      ]
+     },
+     "slot": 446711060,
+     "status": {
+      "Err": {
+       "InstructionError": [
+        2,
+        {
+         "Custom": 6000
+        }
+       ]
+      }
+     }
+    },
+    {
+     "confirmationStatus": "finalized",
+     "confirmations": null,
+     "err": {
+      "InstructionError": [
+       3,
+       {
+        "Custom": 6001
+       }
+      ]
+     },
+     "slot": 446710496,
+     "status": {
+      "Err": {
+       "InstructionError": [
+        3,
+        {
+         "Custom": 6001
+        }
+       ]
+      }
+     }
+    },
+    {
+     "confirmationStatus": "finalized",
+     "confirmations": null,
+     "err": null,
+     "slot": 446711179,
+     "status": {
+      "Ok": null
+     }
+    },
+    {
+     "confirmationStatus": "finalized",
+     "confirmations": null,
+     "err": null,
+     "slot": 446710967,
+     "status": {
+      "Ok": null
+     }
+    }
+   ]
+  },
+  "id": 208
+ }
+}

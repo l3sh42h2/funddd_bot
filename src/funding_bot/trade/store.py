@@ -15,9 +15,15 @@ client_id заявки), и выясняет исход у сети/биржи, 
 
 Соединение — одно на поток (исполнитель, опрос, задания): транзакции одного соединения из разных потоков
 перемешались бы. isolation_level=None: одиночная запись фиксируется сразу, группа — через tx().
+
+Схема 2 (связка SOL×HL, ТЗ 13.09 §6, §12) — только добавление: журналы Solana (sol_tx_attempts, свидетельства, чеки) и
+Hyperliquid (hl_nonces, hl_order_attempts), корневые цели операций (operations), журнал сравнения маршрутов
+(route_candidates), статьи расходов (fee_events), колонка deals.perp_scope (одна незакрытая сделка на scope перпа).
+Миграция — одной транзакцией вместе с таблицей schema_version; ворота: код не стартует на БД, которой нужен читатель
+новее (min_reader > SCHEMA_VERSION). Прежний код (фаза 1) новых таблиц не видит и работает с этой схемой как раньше.
 """
 from __future__ import annotations
-import json, re, secrets, sqlite3, time
+import hashlib, json, re, secrets, sqlite3, time
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal, InvalidOperation
@@ -34,7 +40,7 @@ CREATE TABLE IF NOT EXISTS tg_updates(update_id INTEGER PRIMARY KEY, ts REAL, us
   verdict TEXT);
 CREATE TABLE IF NOT EXISTS deals(id TEXT PRIMARY KEY, created REAL, state TEXT, reason TEXT, coin TEXT, chain TEXT,
   token TEXT, token_dec INT, perp_venue TEXT, symbol TEXT, leg_usd TEXT, owner_json TEXT, sim INT,
-  carry TEXT, dust TEXT, updated REAL, inst_json TEXT);
+  carry TEXT, dust TEXT, updated REAL, inst_json TEXT, perp_scope TEXT);
 CREATE TABLE IF NOT EXISTS intents(id TEXT PRIMARY KEY, deal_id TEXT, kind TEXT, spec_json TEXT, plan_json TEXT,
   nonce TEXT, status TEXT, created REAL, expires REAL, approved REAL, chat INT, msg_id INT, err TEXT);
 CREATE TABLE IF NOT EXISTS clips(id INTEGER PRIMARY KEY, intent_id TEXT, seq INT, state TEXT, planned_in TEXT,
@@ -80,6 +86,218 @@ CREATE TRIGGER IF NOT EXISTS funding_income_no_delete BEFORE DELETE ON funding_i
 -- оценки только добавляются; удаление — только чистка старых строк (prune_marks)
 CREATE TRIGGER IF NOT EXISTS deal_marks_no_update BEFORE UPDATE ON deal_marks BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 """
+
+# --- схема 2: версия, ворота, журналы SOL×HL ---------------------------------------------------------------------
+# Версия схемы и ворота (M06): код откажется стартовать, если min_reader БД больше его SCHEMA_VERSION — старый код на
+# БД со сделками, которых он не понимает, выбрал бы не те ноги. min_reader только растёт (require_reader).
+SCHEMA_VERSION = 2
+MIN_READER = 2
+
+# состояния trade/solana/journal.AttemptState для частичных индексов (журнал сверяет их с собой при открытии)
+SOL_TX_INFLIGHT_STATES = ("BROADCAST_ATTEMPTED", "SIGNED_DURABLE", "UNKNOWN")
+SOL_TX_OPEN_STATES = SOL_TX_INFLIGHT_STATES + ("CONFIRMED_ERR", "CONFIRMED_OK", "VALIDATED")
+
+
+def _in(states) -> str:
+    return "(" + ", ".join(f"'{s}'" for s in sorted(states)) + ")"
+
+
+# журнал попыток Solana (протокол и проверки — trade/solana/journal.py): запись-до, одна попытка в полёте на кошелёк
+SOL_JOURNAL_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS sol_meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sol_tx_attempts(
+  attempt_id TEXT PRIMARY KEY,
+  network TEXT NOT NULL,                  -- genesis hash сети
+  wallet TEXT NOT NULL,
+  logical_action_id TEXT NOT NULL,        -- экономическое действие (клип/подготовка)
+  predecessor_attempt_id TEXT REFERENCES sol_tx_attempts(attempt_id),
+  clip_ref TEXT,
+  provider TEXT NOT NULL,
+  path TEXT NOT NULL,
+  request_id TEXT,
+  payload_kind TEXT NOT NULL,
+  message_hash TEXT NOT NULL,
+  recent_blockhash TEXT NOT NULL,
+  last_valid_block_height INTEGER,
+  lvbh_exact INTEGER NOT NULL CHECK (lvbh_exact IN (0, 1)),
+  blockhash_slot INTEGER,
+  provider_pending INTEGER NOT NULL DEFAULT 0 CHECK (provider_pending IN (0, 1)),
+  plan_json TEXT NOT NULL,
+  signature TEXT,
+  signed_payload BLOB,
+  state TEXT NOT NULL,
+  outcome_json TEXT,
+  created REAL NOT NULL,
+  updated REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS sol_tx_signature ON sol_tx_attempts(network, signature)
+  WHERE signature IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS sol_tx_request ON sol_tx_attempts(network, provider, request_id)
+  WHERE request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS sol_tx_one_open_per_action ON sol_tx_attempts(logical_action_id)
+  WHERE state IN {_in(SOL_TX_OPEN_STATES)};
+CREATE UNIQUE INDEX IF NOT EXISTS sol_tx_one_inflight_per_wallet ON sol_tx_attempts(network, wallet)
+  WHERE state IN {_in(SOL_TX_INFLIGHT_STATES)};
+CREATE INDEX IF NOT EXISTS sol_tx_state ON sol_tx_attempts(state);
+CREATE INDEX IF NOT EXISTS sol_tx_action ON sol_tx_attempts(logical_action_id);
+-- закреплённое при проверке и подписанные байты не переписываются
+CREATE TRIGGER IF NOT EXISTS sol_tx_pinned BEFORE UPDATE ON sol_tx_attempts
+  WHEN NEW.network IS NOT OLD.network OR NEW.wallet IS NOT OLD.wallet
+    OR NEW.logical_action_id IS NOT OLD.logical_action_id OR NEW.message_hash IS NOT OLD.message_hash
+    OR NEW.recent_blockhash IS NOT OLD.recent_blockhash
+    OR NEW.last_valid_block_height IS NOT OLD.last_valid_block_height OR NEW.lvbh_exact IS NOT OLD.lvbh_exact
+    OR NEW.blockhash_slot IS NOT OLD.blockhash_slot OR NEW.plan_json IS NOT OLD.plan_json
+    OR (OLD.signature IS NOT NULL AND NEW.signature IS NOT OLD.signature)
+    OR (OLD.signed_payload IS NOT NULL AND NEW.signed_payload IS NOT OLD.signed_payload)
+  BEGIN SELECT RAISE(ABORT, 'sol_tx_attempts: pinned fields are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sol_tx_no_delete BEFORE DELETE ON sol_tx_attempts
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+CREATE TABLE IF NOT EXISTS sol_tx_evidence(id INTEGER PRIMARY KEY, attempt_id TEXT NOT NULL
+  REFERENCES sol_tx_attempts(attempt_id), ts REAL NOT NULL, kind TEXT NOT NULL, state_from TEXT, state_to TEXT,
+  json TEXT);
+CREATE INDEX IF NOT EXISTS sol_tx_evidence_attempt ON sol_tx_evidence(attempt_id, id);
+CREATE TRIGGER IF NOT EXISTS sol_tx_evidence_no_update BEFORE UPDATE ON sol_tx_evidence
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sol_tx_evidence_no_delete BEFORE DELETE ON sol_tx_evidence
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+CREATE TABLE IF NOT EXISTS sol_receipts(
+  network TEXT NOT NULL, signature TEXT NOT NULL, logical_leg TEXT NOT NULL,
+  attempt_id TEXT NOT NULL REFERENCES sol_tx_attempts(attempt_id),
+  slot INTEGER NOT NULL, block_time INTEGER, ok INTEGER NOT NULL, err_json TEXT, fee_lamports TEXT NOT NULL,
+  flows_json TEXT NOT NULL, receipt_hash TEXT NOT NULL, commitment TEXT NOT NULL,
+  first_seen REAL NOT NULL, updated REAL NOT NULL,
+  PRIMARY KEY(network, signature, logical_leg));
+-- факт чека неизменен; меняется только уровень финальности
+CREATE TRIGGER IF NOT EXISTS sol_receipts_facts BEFORE UPDATE ON sol_receipts
+  WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.slot IS NOT OLD.slot OR NEW.ok IS NOT OLD.ok
+    OR NEW.err_json IS NOT OLD.err_json OR NEW.fee_lamports IS NOT OLD.fee_lamports
+    OR NEW.flows_json IS NOT OLD.flows_json OR NEW.receipt_hash IS NOT OLD.receipt_hash
+  BEGIN SELECT RAISE(ABORT, 'sol_receipts: facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sol_receipts_no_delete BEFORE DELETE ON sol_receipts
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+"""
+
+# журнал адаптера Hyperliquid (trade/hyperliquid_trade.HlJournal): nonce агента и попытки (client_id ↔ cloid, nonce,
+# хэш действия, подпись, исход). hl_order_attempts — perp_order_attempts ТЗ §12 для HL; deal_id/intent_id/clip_id —
+# прямые ссылки движка (не разбор client_id)
+HL_JOURNAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hl_nonces(network TEXT NOT NULL, signer TEXT NOT NULL, last_nonce INTEGER NOT NULL,
+  updated REAL, PRIMARY KEY(network, signer));
+CREATE TABLE IF NOT EXISTS hl_order_attempts(client_id TEXT PRIMARY KEY, cloid TEXT UNIQUE, kind TEXT NOT NULL,
+  network TEXT NOT NULL, master TEXT NOT NULL, account TEXT NOT NULL, vault TEXT, signer TEXT NOT NULL, dex TEXT,
+  fullcoin TEXT, asset INT, side TEXT, sz TEXT, px TEXT, reduce_only INT, nonce INTEGER NOT NULL,
+  expires_after INTEGER, action_json TEXT NOT NULL, action_hash TEXT NOT NULL, sig_json TEXT, state TEXT NOT NULL,
+  http INT, response_json TEXT, filled TEXT, avg_px TEXT, oid INTEGER, err_kind TEXT, err TEXT, created REAL,
+  signed_ts REAL, resolved_ts REAL, deal_id TEXT, intent_id TEXT, clip_id INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS hl_attempts_nonce ON hl_order_attempts(network, signer, nonce);
+CREATE INDEX IF NOT EXISTS hl_attempts_scope ON hl_order_attempts(network, account, fullcoin, state);
+"""
+_JOURNALS = {"sol": SOL_JOURNAL_SCHEMA, "hl": HL_JOURNAL_SCHEMA}
+
+# учёт HL (ТЗ §12, §13; H15–H17): фактические fills и начисления фандинга счёта — ключ по пространству API (сеть, счёт,
+# fullcoin с dex, время, tid/hash), а не глобальный max(id) площадки; курсор — непрозрачная отметка времени по scope,
+# ставится ТОЛЬКО после записи строк. hash фандинга у HL обычно нулевой — ключ хранит '' вместо NULL (NULL в PRIMARY
+# KEY SQLite уникальность не держит).
+HL_ACCT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hl_fills(network TEXT NOT NULL, account TEXT NOT NULL, coin TEXT NOT NULL,
+  time INTEGER NOT NULL, tid INTEGER NOT NULL, oid INTEGER NOT NULL, cloid TEXT, side TEXT NOT NULL, px TEXT NOT NULL,
+  sz TEXT NOT NULL, fee TEXT NOT NULL, fee_token TEXT, builder_fee TEXT, closed_pnl TEXT, hash TEXT, ingested REAL,
+  PRIMARY KEY(network, account, coin, time, tid));
+CREATE INDEX IF NOT EXISTS hl_fills_cloid ON hl_fills(cloid);
+CREATE TRIGGER IF NOT EXISTS hl_fills_no_update BEFORE UPDATE ON hl_fills BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hl_fills_no_delete BEFORE DELETE ON hl_fills BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TABLE IF NOT EXISTS hl_funding(network TEXT NOT NULL, account TEXT NOT NULL, coin TEXT NOT NULL,
+  time INTEGER NOT NULL, hash TEXT NOT NULL, usdc TEXT NOT NULL, szi TEXT, rate TEXT, ingested REAL,
+  PRIMARY KEY(network, account, coin, time, hash));
+CREATE TRIGGER IF NOT EXISTS hl_funding_no_update BEFORE UPDATE ON hl_funding BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hl_funding_no_delete BEFORE DELETE ON hl_funding BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TABLE IF NOT EXISTS ingest_cursors(scope TEXT PRIMARY KEY, watermark_ms INTEGER, complete INTEGER NOT NULL,
+  gap TEXT, updated REAL NOT NULL);
+"""
+# колонки, добавленные к журналам после их первой версии (таблица могла быть создана раньше)
+_JOURNAL_COLUMNS = {"hl": (("hl_order_attempts", "deal_id", "TEXT"), ("hl_order_attempts", "intent_id", "TEXT"),
+                           ("hl_order_attempts", "clip_id", "INTEGER"))}
+
+_DIGITS = "<> '' AND {c} NOT GLOB '*[^0-9]*'"      # сырое целое ≥ 0 строкой: только цифры
+
+
+def _raw_check(col: str, null: bool = False) -> str:
+    body = f"{col} {_DIGITS.format(c=col)}"
+    return f"CHECK ({col} IS NULL OR ({body}))" if null else f"CHECK ({body})"
+
+
+SCHEMA_V2 = f"""
+CREATE TABLE IF NOT EXISTS schema_version(id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL,
+  min_reader INTEGER NOT NULL, updated REAL NOT NULL, note TEXT);
+-- одна незакрытая сделка владеет (площадка, сеть, счёт, dex, fullcoin): у HL одна net-позиция на рынок счёта
+CREATE UNIQUE INDEX IF NOT EXISTS deals_one_per_perp_scope ON deals(perp_scope)
+  WHERE perp_scope IS NOT NULL AND state NOT IN ('DRAFT', 'CLOSED', 'ABORTED');
+
+-- корневая операция (ТЗ §6): цель неизменна, исполнено — только по доказанным фактам, в полёте — не ноль
+CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, deal_id TEXT NOT NULL, profile_id TEXT NOT NULL,
+  inst_hash TEXT NOT NULL, mode TEXT NOT NULL, side TEXT NOT NULL, target_kind TEXT NOT NULL,
+  target_asset TEXT NOT NULL, target_decimals INTEGER NOT NULL, target_raw TEXT NOT NULL {_raw_check("target_raw")},
+  confirmed_raw TEXT NOT NULL {_raw_check("confirmed_raw")}, reserved_raw TEXT NOT NULL {_raw_check("reserved_raw")},
+  fee_cap_raw TEXT {_raw_check("fee_cap_raw", null=True)}, bounds_json TEXT, bounds_hash TEXT,
+  approval_version INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS operations_deal ON operations(deal_id);
+CREATE UNIQUE INDEX IF NOT EXISTS operations_one_active_per_deal ON operations(deal_id)
+  WHERE state IN ('APPROVED', 'RUNNING', 'PARTIAL', 'STOPPED', 'PAUSED_RISK', 'PAUSED_UNKNOWN');
+CREATE TRIGGER IF NOT EXISTS operations_target_immutable BEFORE UPDATE ON operations
+  WHEN NEW.id IS NOT OLD.id OR NEW.deal_id IS NOT OLD.deal_id OR NEW.profile_id IS NOT OLD.profile_id
+    OR NEW.inst_hash IS NOT OLD.inst_hash OR NEW.mode IS NOT OLD.mode OR NEW.side IS NOT OLD.side
+    OR NEW.target_kind IS NOT OLD.target_kind OR NEW.target_asset IS NOT OLD.target_asset
+    OR NEW.target_decimals IS NOT OLD.target_decimals OR NEW.target_raw IS NOT OLD.target_raw
+    OR NEW.fee_cap_raw IS NOT OLD.fee_cap_raw OR NEW.created IS NOT OLD.created
+  BEGIN SELECT RAISE(ABORT, 'operations: root target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS operations_no_settle_with_reserved BEFORE UPDATE OF state ON operations
+  WHEN NEW.state IN ('OPEN', 'CLOSED', 'ABANDONED') AND NEW.reserved_raw <> '0'
+  BEGIN SELECT RAISE(ABORT, 'operations: in-flight amount is not resolved'); END;
+CREATE TRIGGER IF NOT EXISTS operations_no_delete BEFORE DELETE ON operations
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TABLE IF NOT EXISTS operation_intents(intent_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL
+  REFERENCES operations(id), seq INTEGER NOT NULL, UNIQUE(operation_id, seq));
+CREATE TRIGGER IF NOT EXISTS operation_intents_no_update BEFORE UPDATE ON operation_intents
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS operation_intents_no_delete BEFORE DELETE ON operation_intents
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+-- сравнение маршрутов (ТЗ §12, spot_router.Decision.records): все кандидаты, причины исключения, выбранный
+CREATE TABLE IF NOT EXISTS route_candidates(id INTEGER PRIMARY KEY, ts REAL NOT NULL, operation_id TEXT NOT NULL,
+  clip_seq INTEGER NOT NULL, round_no INTEGER NOT NULL, candidate_id TEXT, provider TEXT NOT NULL, path TEXT NOT NULL,
+  provider_group TEXT, side TEXT, route_fingerprint TEXT, request_hash TEXT, amount_in_raw TEXT, expected_out_raw TEXT,
+  min_out_raw TEXT, onchain_min_out_raw TEXT, metric TEXT, conservative TEXT, external_cost TEXT, pair_edge TEXT,
+  pair_basis_bps TEXT, pair_margin TEXT, received_at REAL, provider_time REAL, latency_ms INTEGER, built INTEGER,
+  message_hash TEXT, request_id TEXT, rank_no INTEGER, eligible INTEGER NOT NULL, selected INTEGER NOT NULL,
+  preview_selected INTEGER NOT NULL, response_hash TEXT, metric_version TEXT, decision TEXT, fees_json TEXT,
+  reasons_json TEXT, notes_json TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS route_candidates_uniq ON route_candidates(operation_id, clip_seq, round_no, candidate_id)
+  WHERE candidate_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS route_candidates_unavailable ON route_candidates(operation_id, clip_seq, round_no,
+  provider, path) WHERE candidate_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS route_candidates_one_selected ON route_candidates(operation_id, clip_seq, round_no)
+  WHERE selected = 1;
+CREATE TRIGGER IF NOT EXISTS route_candidates_no_update BEFORE UPDATE ON route_candidates
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS route_candidates_no_delete BEFORE DELETE ON route_candidates
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+-- статьи расходов (ТЗ §12, §13): актив/decimals/сырая сумма (NULL — неизвестно, не 0), плательщик, включена ли в
+-- суммы свопа, возвратный депозит отдельно; оценка в валюте — со временем и источником
+CREATE TABLE IF NOT EXISTS fee_events(id INTEGER PRIMARY KEY, ts REAL NOT NULL, origin_kind TEXT NOT NULL,
+  origin_ref TEXT NOT NULL, idx INTEGER NOT NULL, deal_id TEXT, operation_id TEXT, clip_id INTEGER, kind TEXT NOT NULL,
+  asset TEXT NOT NULL, decimals INTEGER NOT NULL, amount_raw TEXT {_raw_check("amount_raw", null=True)}, payer TEXT,
+  recipient TEXT, included INTEGER NOT NULL, estimated INTEGER NOT NULL, refundable INTEGER NOT NULL,
+  superseded INTEGER NOT NULL, source TEXT, note TEXT, val_unit TEXT, val_amount TEXT, val_ts REAL, val_source TEXT,
+  UNIQUE(origin_kind, origin_ref, idx));
+CREATE INDEX IF NOT EXISTS fee_events_deal ON fee_events(deal_id);
+CREATE TRIGGER IF NOT EXISTS fee_events_no_update BEFORE UPDATE ON fee_events
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS fee_events_no_delete BEFORE DELETE ON fee_events
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+""" + SOL_JOURNAL_SCHEMA + HL_JOURNAL_SCHEMA + HL_ACCT_SCHEMA
 
 
 # --- состояния ------------------------------------------------------------------------------------
@@ -206,6 +424,10 @@ class StoreBusy(StoreError):
     """Сработал индекс параллельности: уже есть активная сделка на токен/символ или идущее намерение."""
 
 
+class SchemaTooNew(StoreError):
+    """БД требует читателя новее этого кода (откат кода поверх новой схемы): не запускаемся, БД не трогаем."""
+
+
 # --- соединение и транзакции ------------------------------------------------------------------
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
     p = Path(path) if path else tconfig.TRADE_DB_PATH
@@ -218,15 +440,113 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
         raise StoreError(f"trade.db не перешла в WAL (journal_mode={mode})")
     # запись-до: COMMIT должен пережить и сбой ОС, а не только процесса (записей мало — цена FULL ничтожна)
     con.execute("PRAGMA synchronous=FULL")
-    con.executescript(SCHEMA)
-    for t, c, d in _ADD_COLUMNS:
-        _ensure_column(con, t, c, d)
+    try:
+        _gate(con)                              # ворота версии — до любой записи в БД
+        con.executescript(SCHEMA)
+        for t, c, d in _ADD_COLUMNS:
+            _ensure_column(con, t, c, d)
+        _migrate(con)
+    except BaseException:
+        con.close()
+        raise
     return con
 
 
 # Миграции схемы — ТОЛЬКО добавление колонок, идемпотентно на каждом connect(): прежняя версия кода (откат на .prev)
 # новую колонку не видит (INSERT с явным списком колонок, SELECT * — лишний ключ).
-_ADD_COLUMNS = (("deals", "inst_json", "TEXT"),)      # ревью 13.09, С1/Н2: спецификация инструмента сделки
+_ADD_COLUMNS = (("deals", "inst_json", "TEXT"),       # ревью 13.09, С1/Н2: спецификация инструмента сделки
+                ("deals", "perp_scope", "TEXT"))      # SOL×HL §6: чья net-позиция перпа (schema 2; у BSC — NULL)
+
+
+def _schema_row(con) -> tuple[int, int] | None:
+    """(version, min_reader) или None — БД до схемы 2 (таблицы ещё нет)."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone() is None:
+        return None
+    r = con.execute("SELECT version, min_reader FROM schema_version WHERE id=1").fetchone()
+    return None if r is None else (int(r[0]), int(r[1]))
+
+
+def _gate(con) -> None:
+    row = _schema_row(con)
+    if row is not None and row[1] > SCHEMA_VERSION:
+        raise SchemaTooNew(f"trade.db схемы {row[0]} читает только код версии ≥ {row[1]}, а этот код — {SCHEMA_VERSION}: "
+                           "не запускаюсь (откат кода поверх новой БД запрещён)")
+
+
+def schema_info(con) -> dict | None:
+    return _row(con, "SELECT * FROM schema_version WHERE id=1") if _schema_row(con) is not None else None
+
+
+def _run_ddl(con, script: str) -> None:
+    """DDL по одному оператору: executescript сам делает COMMIT и вышел бы из транзакции миграции."""
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            con.execute(buf)
+            buf = ""
+    if any(ln.strip() and not ln.strip().startswith("--") for ln in buf.splitlines()):
+        raise StoreError("DDL: незавершённый оператор")
+
+
+def _ensure_acct(con) -> None:
+    """Таблицы учёта HL (HL_ACCT_SCHEMA) на БД, уже бывшей схемой 2 до их появления: только добавление, одной
+    транзакцией; прежний код их не читает и не видит."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_cursors'").fetchone() is not None:
+        return
+    with tx(con):
+        _run_ddl(con, HL_ACCT_SCHEMA)
+
+
+def _migrate(con, now: float | None = None) -> None:
+    """Схема 2 — одной транзакцией вместе со строкой schema_version: сбой посередине не оставит половины (M05).
+    Повтор безвреден; версия не понижается (БД новее, но совместимая, остаётся своей версии)."""
+    row = _schema_row(con)
+    if row is not None and row[0] >= SCHEMA_VERSION:
+        _ensure_acct(con)
+        return
+    ts = time.time() if now is None else now
+    with tx(con):
+        _gate(con)                              # под блокировкой записи: другой процесс мог успеть
+        row = _schema_row(con)
+        if row is not None and row[0] >= SCHEMA_VERSION:
+            return
+        _run_ddl(con, SCHEMA_V2)
+        for t, c, d in _JOURNAL_COLUMNS["hl"]:
+            _ensure_column(con, t, c, d)
+        con.execute("INSERT INTO schema_version(id, version, min_reader, updated, note) VALUES(1, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET version=excluded.version, "
+                    "min_reader=MAX(schema_version.min_reader, excluded.min_reader), updated=excluded.updated, "
+                    "note=excluded.note", (SCHEMA_VERSION, MIN_READER, ts, "SOL×HL: журналы, операции, маршруты, расходы"))
+
+
+def require_reader(con, version: int, now: float | None = None) -> None:
+    """Поднять min_reader: код ниже version на этой БД больше не стартует (например, появилась сделка, которую
+    прежний код не понимает). Никогда не понижает; требовать читателя новее себя нельзя."""
+    if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= SCHEMA_VERSION:
+        raise ValueError(f"min_reader {version!r}: от 1 до {SCHEMA_VERSION}")
+    ts = time.time() if now is None else now
+    with tx(con):
+        _gate(con)
+        if _schema_row(con) is None:
+            raise StoreError("schema_version нет — сначала connect()")
+        con.execute("UPDATE schema_version SET min_reader=MAX(min_reader, ?), updated=? WHERE id=1", (version, ts))
+
+
+def ensure_journal_tables(con, *groups: str) -> None:
+    """Таблицы журналов SOL/HL на любом соединении (trade.db после connect() их уже имеет; отдельная БД журнала
+    адаптера — создаются здесь). Идемпотентно; ворота версии — те же."""
+    unknown = [g for g in groups if g not in _JOURNALS]
+    if unknown or not groups:
+        raise ValueError(f"журналы: {unknown or 'не указаны'} (есть {sorted(_JOURNALS)})")
+    if con.row_factory is None:
+        con.row_factory = sqlite3.Row
+    with tx(con):
+        _gate(con)
+        for g in groups:
+            _run_ddl(con, _JOURNALS[g])
+            for t, c, d in _JOURNAL_COLUMNS.get(g, ()):
+                _ensure_column(con, t, c, d)
 
 
 def _ensure_column(con, table: str, col: str, decl: str) -> None:
@@ -443,6 +763,7 @@ def create_deal(con, *, coin: str, chain: str, token: str, token_dec: int, perp_
     """Сделка в DRAFT (план показан, ждёт кнопки). DRAFT не занимает токен/символ — это делает переход в ENTERING.
     inst — спецификация инструмента (ревью 13.09): замораживается в той же вставке."""
     ts = time.time() if now is None else now
+    tok, scope = _deal_token(chain, token, token_dec, perp_venue, symbol, inst)
     with tx(con):
         did = deal_id
         while did is None:
@@ -450,10 +771,28 @@ def create_deal(con, *, coin: str, chain: str, token: str, token_dec: int, perp_
             if con.execute("SELECT 1 FROM deals WHERE id=?", (cand,)).fetchone() is None:
                 did = cand
         con.execute("INSERT INTO deals(id, created, state, reason, coin, chain, token, token_dec, perp_venue, symbol, "
-                    "leg_usd, owner_json, sim, carry, dust, updated, inst_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (did, ts, str(DealState.DRAFT), None, coin, chain, token.lower(), int(token_dec), perp_venue, symbol,
-                     amt(leg_usd), owner_json, 1 if sim else 0, "0", "0", ts, inst.to_json() if inst else None))
+                    "leg_usd, owner_json, sim, carry, dust, updated, inst_json, perp_scope) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (did, ts, str(DealState.DRAFT), None, coin, chain, tok, int(token_dec), perp_venue, symbol,
+                     amt(leg_usd), owner_json, 1 if sim else 0, "0", "0", ts, inst.to_json() if inst else None, scope))
     return did
+
+
+_SOL_CHAINS = frozenset({"sol", "solana", "solana-mainnet"})
+
+
+def _deal_token(chain: str, token: str, token_dec: int, perp_venue: str, symbol: str,
+                inst: InstrumentSpec | None) -> tuple[str, str | None]:
+    """Ключ токена и scope перпа сделки. schema 1 (okx·bsc × Aster) — как раньше: адрес нижним регистром, scope нет.
+    schema 2 — mint base58 как есть, строка сделки обязана совпасть с замороженной спецификацией."""
+    if inst is not None and inst.schema >= 2:
+        if (chain, token, int(token_dec), perp_venue, symbol) != (inst.chain, inst.token, inst.token_dec,
+                                                                  inst.perp_venue, inst.perp_symbol):
+            raise StoreError("сделка и её спецификация инструмента расходятся (сеть/токен/decimals/площадка/символ)")
+        return token, inst.perp_scope
+    if str(chain).strip().lower() in _SOL_CHAINS:
+        raise StoreError("сделка Solana — только со спецификацией schema 2 (mint с регистром, scope перпа)")
+    return token.lower(), None
 
 
 def set_deal_inst(con, deal_id: str, inst_json: str) -> bool:
@@ -717,6 +1056,84 @@ def add_funding_income(con, venue: str, rows: list[dict]) -> int:
         return con.total_changes - before
 
 
+# --- учёт Hyperliquid: fills и фандинг счёта (ТЗ §12, §13; H15–H17) ------------------------------------------------
+def _fill_tuple(r: dict, ts: float) -> tuple:
+    return (str(r["network"]), str(r["account"]).lower(), str(r["coin"]), int(r["time"]), int(r["tid"]), int(r["oid"]),
+            r.get("cloid"), str(r["side"]), amt(r["px"]), amt(r["sz"]), amt(r["fee"]), r.get("fee_token"),
+            amt(r.get("builder_fee")), amt(r.get("closed_pnl")), r.get("hash"), ts)
+
+
+def add_hl_fills(con, rows: Iterable[dict], now: float | None = None) -> int:
+    """hl_rules.fill_row → hl_fills, один раз по (сеть, счёт, fullcoin, время, tid). Повтор страницы — 0 новых; тот же
+    ключ с другим oid/hash/объёмом — StoreError (коллизия, не молча вторая сделка). Возвращает число новых строк."""
+    ts = time.time() if now is None else now
+    rows = [_fill_tuple(r, ts) for r in rows]
+    n = 0
+    with tx(con):
+        for t in rows:
+            old = con.execute("SELECT oid, hash, sz, px FROM hl_fills WHERE network=? AND account=? AND coin=? AND "
+                              "time=? AND tid=?", t[:5]).fetchone()
+            if old is not None:
+                if (int(old[0]), old[1], old[2], old[3]) != (t[5], t[14], t[9], t[8]):
+                    raise StoreError(f"hl_fills: коллизия ключа {t[:5]} (oid/hash/объём другие)")
+                continue
+            con.execute("INSERT INTO hl_fills(network, account, coin, time, tid, oid, cloid, side, px, sz, fee, fee_token, "
+                        "builder_fee, closed_pnl, hash, ingested) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", t)
+            n += 1
+    return n
+
+
+def add_hl_funding(con, rows: Iterable[dict], now: float | None = None) -> int:
+    """hl_rules.funding_row → hl_funding, один раз по (сеть, счёт, fullcoin, время, hash). Перекрытие страниц — 0 новых;
+    тот же ключ с другой суммой — StoreError."""
+    ts = time.time() if now is None else now
+    n = 0
+    with tx(con):
+        for r in rows:
+            key = (str(r["network"]), str(r["account"]).lower(), str(r["coin"]), int(r["time"]), str(r.get("hash") or ""))
+            old = con.execute("SELECT usdc FROM hl_funding WHERE network=? AND account=? AND coin=? AND time=? AND hash=?",
+                              key).fetchone()
+            if old is not None:
+                if old[0] != amt(r["usdc"]):
+                    raise StoreError(f"hl_funding: коллизия ключа {key} (сумма другая)")
+                continue
+            con.execute("INSERT INTO hl_funding(network, account, coin, time, hash, usdc, szi, rate, ingested) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)", (*key, amt(r["usdc"]), amt(r.get("szi")), amt(r.get("rate")), ts))
+            n += 1
+    return n
+
+
+def get_cursor(con, scope: str) -> dict | None:
+    return _row(con, "SELECT * FROM ingest_cursors WHERE scope=?", (scope,))
+
+
+def set_cursor(con, scope: str, *, watermark_ms: int | None, complete: bool, gap: str | None = None,
+               now: float | None = None) -> None:
+    """Отметка добора по scope — вызывать ПОСЛЕ записи строк (падение между ними — повтор с перекрытием, а не пропуск).
+    Отметка не уходит назад: неполная страница оставляет прежнюю."""
+    ts = time.time() if now is None else now
+    with tx(con):
+        old = get_cursor(con, scope)
+        wm = watermark_ms
+        if old is not None and old["watermark_ms"] is not None and (wm is None or int(old["watermark_ms"]) > int(wm)):
+            wm = int(old["watermark_ms"])
+        con.execute("INSERT INTO ingest_cursors(scope, watermark_ms, complete, gap, updated) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(scope) DO UPDATE SET watermark_ms=excluded.watermark_ms, complete=excluded.complete, "
+                    "gap=excluded.gap, updated=excluded.updated",
+                    (scope, None if wm is None else int(wm), 1 if complete else 0, gap, ts))
+
+
+def supersede_intents(con, deal_id: str, keep: str) -> list[str]:
+    """Новый план сделки делает прежние её предложения неактуальными: proposed → expired (кнопки старого плана больше
+    не исполняются — одобрить можно только proposed). Возвращает id снятых (бот снимет с них кнопки)."""
+    with tx(con):
+        ids = [r[0] for r in con.execute("SELECT id FROM intents WHERE deal_id=? AND status=? AND id<>?",
+                                         (deal_id, str(IntentStatus.PROPOSED), keep))]
+        con.executemany("UPDATE intents SET status=?, err=COALESCE(err, 'superseded') WHERE id=? AND status=?",
+                        [(str(IntentStatus.EXPIRED), i, str(IntentStatus.PROPOSED)) for i in ids])
+    return ids
+
+
 # --- deal_marks: оценка сделок (trade/marks.py) -------------------------------------------------------------
 MARK_COLS = ("px_dex", "px_perp", "pnl_now", "pnl_exit", "exit_cost", "funding", "fees", "gas")
 
@@ -756,3 +1173,336 @@ def events(con, deal_id: str | None = None) -> list[dict]:
     if deal_id is None:
         return _rows(con, "SELECT * FROM exec_events ORDER BY ts, rowid")
     return _rows(con, "SELECT * FROM exec_events WHERE deal_id=? ORDER BY ts, rowid", (deal_id,))
+
+
+# --- operations: корневая цель операции (ТЗ §6) --------------------------------------------------------------------
+class OpState(StrEnum):
+    PROPOSED = "PROPOSED"
+    APPROVED = "APPROVED"
+    RUNNING = "RUNNING"
+    PARTIAL = "PARTIAL"                  # остановилась с остатком цели: продолжение — новым одобрением ТОЙ ЖЕ цели
+    STOPPED = "STOPPED"                  # «стоп»/рестарт: новых свопов нет, остаток цели сохранён
+    PAUSED_RISK = "PAUSED_RISK"
+    PAUSED_UNKNOWN = "PAUSED_UNKNOWN"    # исход отправки неизвестен: резерв держится, новых отправок нет
+    OPEN = "OPEN"                        # вход доведён — позиция открыта
+    CLOSED = "CLOSED"                    # выход доведён
+    ABANDONED = "ABANDONED"              # владелец отказался от остатка цели
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+
+OP_ACTIVE = (OpState.APPROVED, OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK,
+             OpState.PAUSED_UNKNOWN)             # = условие индекса operations_one_active_per_deal
+OP_DONE = frozenset({OpState.OPEN, OpState.CLOSED, OpState.ABANDONED, OpState.REJECTED, OpState.EXPIRED})
+_OP_SETTLED = frozenset({OpState.OPEN, OpState.CLOSED, OpState.ABANDONED})     # итог: в полёте обязано быть 0
+OP_NEXT: dict[str, frozenset] = {
+    OpState.PROPOSED: frozenset({OpState.APPROVED, OpState.REJECTED, OpState.EXPIRED}),
+    OpState.APPROVED: frozenset({OpState.RUNNING, OpState.STOPPED, OpState.PAUSED_RISK, OpState.PAUSED_UNKNOWN}),
+    OpState.RUNNING: frozenset({OpState.OPEN, OpState.PARTIAL, OpState.CLOSED, OpState.STOPPED, OpState.PAUSED_RISK,
+                                OpState.PAUSED_UNKNOWN}),
+    OpState.PARTIAL: frozenset({OpState.APPROVED, OpState.STOPPED, OpState.ABANDONED, OpState.PAUSED_RISK,
+                                OpState.PAUSED_UNKNOWN}),
+    OpState.STOPPED: frozenset({OpState.APPROVED, OpState.ABANDONED, OpState.PAUSED_RISK, OpState.PAUSED_UNKNOWN}),
+    OpState.PAUSED_RISK: frozenset({OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.ABANDONED,
+                                    OpState.PAUSED_UNKNOWN}),
+    OpState.PAUSED_UNKNOWN: frozenset({OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK}),
+}
+# вид цели по стороне: вход — бюджет котировки (USDC raw), выход — токены к продаже или снимок всей позиции сделки
+OP_TARGETS = {"entry": ("stable_raw_budget",), "exit": ("token_raw_to_sell", "full_position_snapshot")}
+OP_MODES = ("dry", "live")
+
+
+def _raw_int(v: Any, what: str, *, positive: bool = False) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0 or (positive and v == 0):
+        raise ValueError(f"{what}: нужно целое сырое {'> 0' if positive else '≥ 0'}, получено {v!r}")
+    return v
+
+
+def _json_hash(obj: Any) -> str | None:
+    return None if obj is None else "sha256:" + hashlib.sha256(jdump(obj).encode()).hexdigest()
+
+
+def create_operation(con, *, deal_id: str, profile_id: str, inst_hash: str, mode: str, side: str, target_kind: str,
+                     target_asset: str, target_decimals: int, target_raw: int, fee_cap_raw: int | None = None,
+                     bounds: Any = None, op_id: str | None = None, now: float | None = None) -> str:
+    """Корневая операция в PROPOSED. Цель (вид, актив, сырое количество) после записи не меняется — продолжение
+    частичного исполнения вычитает подтверждённое, а не пересчитывает цель по новой цене (U14/U15)."""
+    if mode not in OP_MODES:
+        raise ValueError(f"режим операции {mode!r}: {' | '.join(OP_MODES)}")
+    if target_kind not in OP_TARGETS.get(side, ()):
+        raise ValueError(f"цель {target_kind!r} не для стороны {side!r}")
+    _raw_int(target_raw, "target_raw", positive=True)
+    if fee_cap_raw is not None:
+        _raw_int(fee_cap_raw, "fee_cap_raw")
+    if isinstance(target_decimals, bool) or not isinstance(target_decimals, int) or not 0 <= target_decimals <= 255:
+        raise ValueError(f"target_decimals {target_decimals!r}")
+    for v, what in ((target_asset, "target_asset"), (inst_hash, "inst_hash"), (profile_id, "profile_id")):
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"{what}: пусто")
+    ts = time.time() if now is None else now
+    bj = None if bounds is None else jdump(bounds)
+    with tx(con):
+        if con.execute("SELECT 1 FROM deals WHERE id=?", (deal_id,)).fetchone() is None:
+            raise LookupError(f"deals: нет строки {deal_id}")
+        oid = op_id
+        while oid is None:
+            cand = new_id("O")
+            if con.execute("SELECT 1 FROM operations WHERE id=?", (cand,)).fetchone() is None:
+                oid = cand
+        con.execute("INSERT INTO operations(id, deal_id, profile_id, inst_hash, mode, side, target_kind, target_asset, "
+                    "target_decimals, target_raw, confirmed_raw, reserved_raw, fee_cap_raw, bounds_json, bounds_hash, "
+                    "approval_version, state, reason, created, updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (oid, deal_id, profile_id, inst_hash, mode, side, target_kind, target_asset, target_decimals,
+                     str(target_raw), "0", "0", None if fee_cap_raw is None else str(fee_cap_raw), bj,
+                     _json_hash(bounds), 0, str(OpState.PROPOSED), None, ts, ts))
+    return oid
+
+
+def get_operation(con, op_id: str) -> dict | None:
+    return _row(con, "SELECT * FROM operations WHERE id=?", (op_id,))
+
+
+def active_operation(con, deal_id: str) -> dict | None:
+    qs = ",".join("?" * len(OP_ACTIVE))
+    return _row(con, f"SELECT * FROM operations WHERE deal_id=? AND state IN ({qs})",
+                (deal_id, *(str(s) for s in OP_ACTIVE)))
+
+
+def operation_remaining(op: dict) -> int:
+    """Остаток корневой цели: цель − подтверждённо исполнено − в полёте (неизвестное — не ноль, пока не разрешено)."""
+    return int(op["target_raw"]) - int(op["confirmed_raw"]) - int(op["reserved_raw"])
+
+
+def set_operation_state(con, op_id: str, new: str, *, expect=None, reason: str | None = None, bounds: Any = None,
+                        now: float | None = None) -> bool:
+    """Переход операции. Итог (OPEN/CLOSED/ABANDONED) при ненулевом «в полёте» — StoreError: UNKNOWN не становится
+    нулём. Одобрение (APPROVED) поднимает approval_version; bounds — новые одобренные пределы (хеш в строке)."""
+    new = str(new)
+    with tx(con):
+        row = get_operation(con, op_id)
+        if row is None:
+            raise LookupError(f"operations: нет строки {op_id}")
+        if new in _OP_SETTLED and row["reserved_raw"] != "0":
+            raise StoreError(f"операция {op_id}: в полёте {row['reserved_raw']} — исход не доказан, итог не ставлю")
+        fields: dict[str, Any] = {}
+        if reason is not None:
+            fields["reason"] = reason
+        if new == OpState.APPROVED and row["state"] != OpState.APPROVED:
+            fields["approval_version"] = int(row["approval_version"]) + 1
+            if bounds is not None:
+                fields.update(bounds_json=jdump(bounds), bounds_hash=_json_hash(bounds))
+        return _transition(con, "operations", "id", op_id, "state", new, OP_NEXT, expect, fields, now)
+
+
+def operation_reserve(con, op_id: str, raw: int, *, now: float | None = None) -> int:
+    """Перед отправкой: raw уходит «в полёт» (запись-до). Больше остатка корневой цели — StoreError, отправлять
+    нельзя. Только в RUNNING. Возвращает остаток после резерва."""
+    _raw_int(raw, "резерв", positive=True)
+    ts = time.time() if now is None else now
+    with tx(con):
+        r = get_operation(con, op_id)
+        if r is None:
+            raise LookupError(f"operations: нет строки {op_id}")
+        if r["state"] != OpState.RUNNING:
+            raise StoreError(f"операция {op_id} в {r['state']}: резерв только в RUNNING")
+        left = operation_remaining(r)
+        if raw > left:
+            raise StoreError(f"операция {op_id}: резерв {raw} больше остатка цели {left}")
+        con.execute("UPDATE operations SET reserved_raw=?, updated=? WHERE id=? AND reserved_raw=?",
+                    (str(int(r["reserved_raw"]) + raw), ts, op_id, r["reserved_raw"]))
+    return left - raw
+
+
+def operation_settle(con, op_id: str, *, released_raw: int, executed_raw: int, now: float | None = None) -> int:
+    """Доказанный исход части «в полёте»: released снимается с резерва, executed (≤ released: фактически ушло
+    с учётом возврата) — в подтверждённое. Неизвестный исход сюда не приходит: он держит резерв. Возвращает остаток."""
+    _raw_int(released_raw, "снятие резерва", positive=True)
+    _raw_int(executed_raw, "исполнено")
+    if executed_raw > released_raw:
+        raise ValueError(f"исполнено {executed_raw} больше снятого резерва {released_raw}")
+    ts = time.time() if now is None else now
+    with tx(con):
+        r = get_operation(con, op_id)
+        if r is None:
+            raise LookupError(f"operations: нет строки {op_id}")
+        if r["state"] in OP_DONE:
+            raise StoreError(f"операция {op_id} уже {r['state']}")
+        res = int(r["reserved_raw"])
+        if released_raw > res:
+            raise StoreError(f"операция {op_id}: снимаю {released_raw}, а в полёте {res}")
+        con.execute("UPDATE operations SET reserved_raw=?, confirmed_raw=?, updated=? WHERE id=? AND reserved_raw=? "
+                    "AND confirmed_raw=?", (str(res - released_raw), str(int(r["confirmed_raw"]) + executed_raw), ts,
+                                            op_id, r["reserved_raw"], r["confirmed_raw"]))
+        return operation_remaining(get_operation(con, op_id))
+
+
+def link_intent(con, operation_id: str, intent_id: str) -> int:
+    """Намерение (кнопка входа/выхода/продолжения) — шаг корневой операции, seq по порядку. Повтор — тот же seq;
+    то же намерение в другой операции — StoreError."""
+    with tx(con):
+        r = con.execute("SELECT operation_id, seq FROM operation_intents WHERE intent_id=?", (intent_id,)).fetchone()
+        if r is not None:
+            if r[0] != operation_id:
+                raise StoreError(f"намерение {intent_id} уже в операции {r[0]}")
+            return int(r[1])
+        if get_operation(con, operation_id) is None:
+            raise LookupError(f"operations: нет строки {operation_id}")
+        seq = con.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM operation_intents WHERE operation_id=?",
+                          (operation_id,)).fetchone()[0]
+        con.execute("INSERT INTO operation_intents(intent_id, operation_id, seq) VALUES(?,?,?)",
+                    (intent_id, operation_id, int(seq)))
+    return int(seq)
+
+
+def operation_of_intent(con, intent_id: str) -> dict | None:
+    return _row(con, "SELECT o.* FROM operations o JOIN operation_intents i ON i.operation_id = o.id "
+                     "WHERE i.intent_id=?", (intent_id,))
+
+
+# --- route_candidates: сравнение маршрутов (ТЗ §12) -------------------------------------------------------------
+_RC_MONEY = ("amount_in_raw", "expected_out_raw", "min_out_raw", "onchain_min_out_raw", "metric", "conservative",
+             "external_cost", "pair_edge", "pair_basis_bps", "pair_margin")
+_RC_TEXT = ("candidate_id", "provider", "path", "side", "route_fingerprint", "request_hash", "message_hash",
+            "request_id", "response_hash", "metric_version", "decision")
+_RC_FLAGS = ("built", "eligible", "selected", "preview_selected")
+_RC_KEYS = frozenset({"operation_id", "clip_seq", "round_no", "group", "received_at", "provider_time", "latency_ms",
+                      "rank", "fees", "reasons", "notes", *_RC_MONEY, *_RC_TEXT, *_RC_FLAGS})
+_RC_COLS = ("ts", "operation_id", "clip_seq", "round_no", "provider_group", *_RC_TEXT, *_RC_MONEY, "received_at",
+            "provider_time", "latency_ms", *_RC_FLAGS, "rank_no", "fees_json", "reasons_json", "notes_json")
+
+
+def _opt_int(v: Any, what: str) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise StoreError(f"{what}: нужно целое, получено {v!r}")
+    return v
+
+
+def _opt_real(v: Any, what: str) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise StoreError(f"{what}: нужно время числом, получено {v!r}")
+    return float(v)
+
+
+def add_route_candidates(con, rows: Iterable[dict], *, now: float | None = None) -> int:
+    """spot_router.Decision.records() → route_candidates (только вставка): все кандидаты, причины исключения, времена,
+    выбранный. Суммы — строкой (float — TypeError), тексты причин проходят redact_secrets. Повтор той же записи
+    безвреден (первая побеждает); второй «выбранный» того же клипа и раунда — StoreError. Возвращает число новых."""
+    ts = time.time() if now is None else now
+    n = 0
+    with tx(con):
+        for r in rows:
+            bad = sorted(set(r) - _RC_KEYS)
+            if bad:
+                raise StoreError(f"route_candidates: неизвестные поля {bad}")
+            if not r.get("operation_id") or not r.get("provider") or not r.get("path"):
+                raise StoreError("route_candidates: нет операции, провайдера или пути")
+            v: dict[str, Any] = {"ts": ts, "operation_id": r["operation_id"],
+                                 "clip_seq": _opt_int(r.get("clip_seq"), "clip_seq"),
+                                 "round_no": _opt_int(r.get("round_no"), "round_no"), "provider_group": r.get("group")}
+            if v["clip_seq"] is None or v["round_no"] is None:
+                raise StoreError("route_candidates: нет clip_seq или round_no")
+            v.update({k: r.get(k) for k in _RC_TEXT})
+            v.update({k: amt(r.get(k)) for k in _RC_MONEY})
+            v.update(received_at=_opt_real(r.get("received_at"), "received_at"),
+                     provider_time=_opt_real(r.get("provider_time"), "provider_time"),
+                     latency_ms=_opt_int(r.get("latency_ms"), "latency_ms"), rank_no=_opt_int(r.get("rank"), "rank"))
+            v.update({k: 1 if r.get(k) else 0 for k in _RC_FLAGS})
+            v["fees_json"] = jdump(list(r.get("fees") or []))
+            v["reasons_json"] = jdump([redact_secrets(str(x)) for x in r.get("reasons") or []])
+            v["notes_json"] = jdump([redact_secrets(str(x)) for x in r.get("notes") or []])
+            conflict = ("ON CONFLICT(operation_id, clip_seq, round_no, candidate_id) WHERE candidate_id IS NOT NULL "
+                        "DO NOTHING" if v["candidate_id"] is not None else
+                        "ON CONFLICT(operation_id, clip_seq, round_no, provider, path) WHERE candidate_id IS NULL "
+                        "DO NOTHING")
+            try:
+                cur = con.execute(f"INSERT INTO route_candidates({', '.join(_RC_COLS)}) "
+                                  f"VALUES({', '.join('?' * len(_RC_COLS))}) {conflict}", tuple(v[c] for c in _RC_COLS))
+            except sqlite3.IntegrityError as e:
+                raise StoreError(f"route_candidates {r['operation_id']}/{v['clip_seq']}: {e}") from None
+            n += cur.rowcount
+    return n
+
+
+def route_candidates(con, operation_id: str) -> list[dict]:
+    return _rows(con, "SELECT * FROM route_candidates WHERE operation_id=? ORDER BY clip_seq, round_no, id",
+                 (operation_id,))
+
+
+# --- fee_events: статьи расходов (ТЗ §12, §13) ------------------------------------------------------------------
+_ORIGIN_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_FEE_CORE = ("kind", "asset", "decimals", "amount_raw", "payer", "recipient", "included", "estimated", "refundable",
+             "superseded")
+_FEE_COLS = ("ts", "origin_kind", "origin_ref", "idx", "deal_id", "operation_id", "clip_id", *_FEE_CORE, "source",
+             "note", "val_unit", "val_amount", "val_ts", "val_source")
+
+
+def _fee_row(r: dict) -> dict:
+    extra = sorted(set(r) - {*_FEE_CORE, "source", "note", "valuation"})
+    if extra:
+        raise StoreError(f"fee_events: неизвестные поля {extra}")
+    for k in ("kind", "asset"):
+        if not isinstance(r.get(k), str) or not r[k]:
+            raise StoreError(f"fee_events: {k} пусто")
+    dec_ = r.get("decimals")
+    if isinstance(dec_, bool) or not isinstance(dec_, int) or not 0 <= dec_ <= 255:
+        raise StoreError(f"fee_events: decimals {dec_!r}")
+    a = r.get("amount_raw")
+    if a is not None:
+        if isinstance(a, str) and a.isascii() and a.isdigit():
+            a = int(a)
+        a = str(_raw_int(a, f"fee_events {r['kind']}: amount_raw"))     # float/знак — ошибка; None — неизвестно
+    for k in ("included", "estimated"):
+        if not isinstance(r.get(k), bool):
+            raise StoreError(f"fee_events: {k} — нужно true/false")
+    val = r.get("valuation") or {}
+    if set(val) - {"unit", "amount", "ts", "source"}:
+        raise StoreError(f"fee_events: неизвестные поля оценки {sorted(set(val) - {'unit', 'amount', 'ts', 'source'})}")
+    return {"kind": r["kind"], "asset": r["asset"], "decimals": dec_, "amount_raw": a, "payer": r.get("payer"),
+            "recipient": r.get("recipient"), "included": int(r["included"]), "estimated": int(r["estimated"]),
+            "refundable": int(bool(r.get("refundable"))), "superseded": int(bool(r.get("superseded"))),
+            "source": r.get("source") or None, "note": redact_secrets(r["note"])[:500] if r.get("note") else None,
+            "val_unit": val.get("unit"), "val_amount": amt(val.get("amount")),
+            "val_ts": _opt_real(val.get("ts"), "valuation.ts"), "val_source": val.get("source")}
+
+
+def add_fee_events(con, *, origin_kind: str, origin_ref: str, components: Iterable[Any], deal_id: str | None = None,
+                   operation_id: str | None = None, clip_id: int | None = None, now: float | None = None) -> int:
+    """Статьи расходов одного факта (fees.FeeComponent или его as_record()): запись один раз на источник
+    (origin_kind, origin_ref). Повтор того же состава — 0 новых; другой состав у того же источника — StoreError
+    (факт не переписывается: откат/форк — отдельным событием). Возвращает число новых строк."""
+    if not isinstance(origin_kind, str) or not _ORIGIN_RE.match(origin_kind):
+        raise ValueError(f"origin_kind {origin_kind!r}")
+    if not isinstance(origin_ref, str) or not origin_ref or len(origin_ref) > 300:
+        raise ValueError("origin_ref: пусто или слишком длинно")
+    rows = [_fee_row(c.as_record() if hasattr(c, "as_record") else dict(c)) for c in components]
+    ts = time.time() if now is None else now
+    with tx(con):
+        old = _rows(con, "SELECT * FROM fee_events WHERE origin_kind=? AND origin_ref=? ORDER BY idx",
+                    (origin_kind, origin_ref))
+        if old:
+            same = len(old) == len(rows) and all(
+                all(o[k] == r[k] for k in _FEE_CORE) for o, r in zip(old, rows))
+            if not same:
+                raise StoreError(f"fee_events {origin_kind}/{origin_ref}: у источника уже другой состав статей")
+            return 0
+        for i, r in enumerate(rows):
+            v = {"ts": ts, "origin_kind": origin_kind, "origin_ref": origin_ref, "idx": i, "deal_id": deal_id,
+                 "operation_id": operation_id, "clip_id": clip_id, **r}
+            con.execute(f"INSERT INTO fee_events({', '.join(_FEE_COLS)}) VALUES({', '.join('?' * len(_FEE_COLS))})",
+                        tuple(v[c] for c in _FEE_COLS))
+    return len(rows)
+
+
+def fee_events(con, *, deal_id: str | None = None, origin_kind: str | None = None,
+               origin_ref: str | None = None) -> list[dict]:
+    where, args = [], []
+    for col, val in (("deal_id", deal_id), ("origin_kind", origin_kind), ("origin_ref", origin_ref)):
+        if val is not None:
+            where.append(f"{col}=?")
+            args.append(val)
+    return _rows(con, "SELECT * FROM fee_events" + (" WHERE " + " AND ".join(where) if where else "") +
+                 " ORDER BY id", tuple(args))

@@ -1079,7 +1079,7 @@ def test_trader_unit_file():
     lines = (ROOT / "deploy" / "funding_bot-trader.service").read_text().splitlines()
     kv = dict(ln.split("=", 1) for ln in lines if "=" in ln and not ln.startswith("#"))
     assert kv["EnvironmentFile"] == "/home/admin/hyper/funding_bot/.env", "без «-»: без .env трейдер не стартует"
-    assert kv["Restart"] == "always" and kv["TimeoutStopSec"] == "180" and kv["KillSignal"] == "SIGTERM"
+    assert kv["Restart"] == "always" and kv["TimeoutStopSec"] == "280" and kv["KillSignal"] == "SIGTERM"
     assert kv["ExecStart"].endswith("funding_bot trader") and kv["RestartPreventExitStatus"] == "78"
 
 

@@ -11,8 +11,14 @@ funding_bot = "funding_bot.cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 # фаза 2 (исполнение): подпись EIP-712 для Aster v3 и транзакций BSC. Та же версия, что у соседних проектов
-# (polypin3, polypin-f); на сервере ставится один раз вручную — ensure_installed в деплое идёт с --no-deps.
+# (polypin3, polypin-f).
 trade = ["eth-account==0.13.7"]
+# связка SOL×HL (ТЗ 13.09): solders — ключи, сообщения и подпись Solana; base58 — адреса с регистром; официальный SDK
+# Hyperliquid — подпись действий (msgpack, websocket-client, eth-utils — его зависимости; eth-utils 5.3.1 совместим с
+# подписью Aster); pycryptodome — keccak ключей. Выкат ставит не extra, а полное замыкание deploy/requirements.lock
+# (с --no-deps и pip check); версии здесь и там сверяет tests/test_sol_c4_release.py.
+sol = ["solders==0.29.0", "base58==2.1.1", "hyperliquid-python-sdk==0.24.0", "msgpack==1.2.2",
+       "websocket-client==1.9.2", "eth-utils==5.3.1", "pycryptodome==3.23.0", "eth-account==0.13.7"]
 
 [build-system]
 requires = ["setuptools>=68"]

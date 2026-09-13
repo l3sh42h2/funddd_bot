@@ -49,6 +49,19 @@ EOF
         elif [ "$ta" = "active" ]; then echo "трейдер: active, рестартов $r2"
         else echo "!! трейдер: $ta (код $tc; 78 = настройка, без перезапуска): $tl"; fi
       fi
+      # >>> doctor
+      # связка SOL×HL (M09): readonly doctor поднятой версии — справка, не ворота (сеть HL/RPC может лежать, связка может
+      # быть выключена). Без .env: публичная часть — сеть и genesis, реестр, рынок HL, счёт по адресам owner.toml; без
+      # котировок (квота OKX общая с коллектором). Не отработал (нет строки live_ready) — громко.
+      if grep -q '"sol-hl"' "$DEST/src/funding_bot/cli.py" 2>/dev/null; then
+        dr=$(cd "$DEST" && timeout 120 .venv/bin/funding_bot sol-hl doctor --no-quotes 2>&1) && dc=0 || dc=$?
+        if echo "$dr" | grep -q "live_ready="; then
+          echo "doctor sol-hl: $(echo "$dr" | head -n 1 | head -c 200) · $(echo "$dr" | grep "live_ready=" | tail -n 1 | head -c 160)"
+        else
+          echo "!! doctor sol-hl не отработал (код $dc): $(echo "$dr" | tail -n 3 | tr '\n' ' ' | head -c 300)"
+        fi
+      fi
+      # <<< doctor
       exit 0
     fi
   else

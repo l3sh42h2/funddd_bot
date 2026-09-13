@@ -32,6 +32,7 @@ from . import owner as owner_mod, planner, report, store, tconfig
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
 from .planner import PlanRefused
+from .runtime import is_sol_deal
 from .store import ClipState, DealState, IntentStatus, PerpOrderState
 from .types import ClipPlan, InstrumentSpec, Plan, PerpFill
 
@@ -445,6 +446,9 @@ def intent_txs(con, intent_id: str) -> list[dict]:
 def sigma_1s(perp, symbol: str) -> D | None:
     """σ доходности марка за 1 с по минутным свечам (σ₁ₘ/√60). Нет данных — None: план тогда не оценит риск голой
     ноги и в live откажет (unhedged_usd_max обязателен), в dry — строит без этого ограничения."""
+    if getattr(perp, "venue", None) not in (None, "aster"):
+        return None                            # свечи /fapi/v1/klines — только у Aster: у другой площадки модель σ не
+        #                                        подключена (SOL×HL §3.2 п.4) — честное «неизвестно», а не 0
     http = getattr(perp, "http", None)
     if http is None:
         return None
@@ -554,6 +558,7 @@ class Proposal:
     kind: str
     html: str
     plan: Plan | None = None
+    superseded: tuple = ()                      # прежние предложения той же сделки, снятые этим (бот снимет кнопки)
 
 
 @dataclass
@@ -612,7 +617,7 @@ class Desk:
     def __init__(self, conns: Conns, legs: Callable[[bool], Legs | None], *,
                  owner_loader: Callable[[], OwnerCfg] = owner_mod.load, table_loader: Callable[[], dict] | None = None,
                  keys_mode: str | None = None, busy: Callable[[], bool] = lambda: False,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, registry_loader: Callable[[OwnerCfg], Any] | None = None):
         self.conns, self.legs = conns, legs
         self.owner_loader = owner_loader
         if table_loader is None:
@@ -622,6 +627,40 @@ class Desk:
         self.keys_mode = keys_mode
         self.busy = busy
         self.clock = clock
+        # связка SOL × HL (trade/sol_flow.py): реестр инструментов (runtime/instruments.json) и её предложения. legs —
+        # runtime.RuntimeRegistry (или прежний legs(sim): тогда связка «не подключена» — честный отказ)
+        self.registry_loader = registry_loader
+        self._sol_desk = None
+
+    def sol(self):
+        if self._sol_desk is None:
+            from .sol_flow import SolDesk
+            self._sol_desk = SolDesk(self)
+        return self._sol_desk
+
+    def propose_profile_entry(self, cmd, chat: int | None) -> Proposal:
+        """Вход связки (tg.parse.ProfileEntry): инструмент — из реестра, не из таблицы коллектора."""
+        return self.sol().propose_entry(cmd, chat)
+
+    def propose_profile_exit(self, cmd, chat: int | None) -> Proposal:
+        """Выход с именем связки или количеством (tg.parse.ProfileExit). Сделка связки — её план выхода (частичный в
+        пилоте — честный отказ); сделка BSC — прежний выход только без количества и с именем «bsc», иначе отказ
+        с форматом (сумма в токенах у BSC не разбирается)."""
+        from ..tg.parse import EXIT_FMT
+        from .owner import SOL_HL
+        deal = self.resolve_deal(cmd.target)
+        v = _views()
+        if not is_sol_deal(deal):
+            if cmd.profile not in (None, owner_mod.LEGACY_PROFILE) or cmd.tokens is not None or cmd.usdc is not None:
+                raise Refused(v.refused(f"сделка {deal['id']} — связки BSC/Aster, формат: {EXIT_FMT}"))
+            return self.propose_exit(deal["id"], None, False, chat)
+        if cmd.profile not in (None, SOL_HL):
+            raise Refused(v.refused(f"сделка {deal['id']} — связки Solana × Hyperliquid, а не {cmd.profile}"))
+        if cmd.perp_dex and str(deal["symbol"]).split(":", 1)[0] != cmd.perp_dex:
+            raise Refused(v.refused(f"сделка {deal['id']} на {deal['symbol']}, а не на dex {cmd.perp_dex}"))
+        if cmd.tokens is not None or cmd.usdc is not None:
+            raise Refused(v.refused(f"частичный выход в пилоте выключен — только «выход {deal['id']}» целиком"))
+        return self.sol().propose_exit(deal, None, False, chat)
 
     # --- общее ---
     def cfg(self) -> OwnerCfg:
@@ -1139,6 +1178,8 @@ class Desk:
 
     def propose_exit(self, target: str, usd: D | None, perp_only: bool, chat: int | None) -> Proposal:
         deal = self.resolve_deal(target)
+        if is_sol_deal(deal):                  # связка SOL × HL: свои ноги и правила (sol_flow)
+            return self.sol().propose_exit(deal, usd, perp_only, chat)
         plan, ctx = self.plan_exit(deal, usd, perp_only)
         cfg = ctx["cfg"]
         inst = ctx["inst"]
@@ -1170,6 +1211,8 @@ class Desk:
         v = _views()
         cfg = self.cfg()
         deal = self.resolve_deal(target)
+        if is_sol_deal(deal):
+            return self.sol().propose_fix(kind, deal, chat)
         self._common_checks(cfg, bool(deal["sim"]), "дохедж" if kind == "rehedge" else "откат")
         if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
             raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
@@ -1236,6 +1279,8 @@ class Desk:
         прерванного входа или выхода. Сам исполнитель ничего не продолжает."""
         v = _views()
         deal = self.resolve_deal(target)
+        if is_sol_deal(deal):
+            return self.sol().propose_resume(deal, chat)
         con = self.conns.get()
         if deal["state"] == DealState.HALTED_MISMATCH:
             from . import reconcile
@@ -1525,6 +1570,20 @@ class Engine:
         self._thread: threading.Thread | None = None
         self.current: tuple[str, int, int] | None = None      # (намерение, клип, клипов) — для ответа на «стоп»
         self._unwind_due: dict[str, float] = {}
+        self._sol_engine = None
+
+    def _sol(self):
+        """Шаги связки SOL × HL (trade/sol_flow.py): тот же поток, те же ворота «стоп»/SIGTERM, свои ноги."""
+        if self._sol_engine is None:
+            from .sol_flow import SolEngine
+            self._sol_engine = SolEngine(self)
+        return self._sol_engine
+
+    def recover_sol(self, deal: Mapping) -> list[str]:
+        """Исход прошлых отправок сделки связки (старт, «позиции»): только чтения и те же подписанные байты."""
+        from .runtime import legs_of
+        from .sol_flow import recover_deal
+        return recover_deal(self.conns.get(), deal, legs_of(self.legs, deal))
 
     # --- поток ---
     def submit(self, iid: str) -> None:
@@ -1606,6 +1665,8 @@ class Engine:
             return self._fail(iid, "служба останавливается — план не начат, пришлите команду после рестарта")
         deal = store.get_deal(con, it["deal_id"])
         spec = json.loads(it["spec_json"])
+        if is_sol_deal(deal):                  # связка SOL × HL: ноги — по сделке, не legs(sim); BSC ниже не меняется
+            return self._sol().execute(it, deal, spec)
         # инструмент намерения = инструмент сделки (ревью 13.09, Н2) — до ног, записи RUNNING и любых чтений сети
         inst = deal_instrument(con, deal)
         bad = self._inst_mismatch(deal, spec, inst)

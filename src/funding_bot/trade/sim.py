@@ -276,3 +276,111 @@ class SimPerp:
 
     def funding_income(self, symbol: str, start_ms: int) -> list[dict]:
         return []                                  # в симуляции фандинг не начисляется
+
+
+# --- связка SOL × HL (ТЗ SOL×HL §15 этап 5: dry/readonly тем же кодом движка) -----------------------------------
+class SimSolSpot:
+    """Спот Solana симуляции. Котировки и сборку делает настоящий роутер (только чтение); «исполнение» — по
+    ожидаемому выходу выбранного кандидата, без подписи и журнала попыток (в сеть ничего не уходит). Балансы —
+    настоящие чтения ноги inner (SolanaExecutor без ключа) плюс виртуальные изменения; не прочитано — None."""
+    chain_name = "solana"
+
+    def __init__(self, inner=None, *, wallet: str | None = None):
+        self.inner = inner
+        self.wallet = wallet or getattr(inner, "wallet", None)
+        self._lock = threading.Lock()
+        self.ledger: dict[str, int] = {}           # mint (base58 как есть) → виртуальное изменение, сырые
+        self.swaps = 0
+
+    def __repr__(self) -> str:
+        return f"SimSolSpot({self.wallet})"
+
+    def token_balance(self, mint: str, program: str) -> int | None:
+        fn = getattr(self.inner, "token_balance", None)
+        real = fn(mint, program) if fn is not None else None
+        with self._lock:
+            return None if real is None else int(real) + self.ledger.get(mint, 0)
+
+    def native_balance(self) -> int | None:
+        fn = getattr(self.inner, "native_balance", None)
+        return fn() if fn is not None else None
+
+    def account_rent(self, mint: str, program: str, exts=()) -> int | None:
+        fn = getattr(self.inner, "account_rent", None)
+        return fn(mint, program, exts) if fn is not None else None
+
+    def mint_value(self, mint: str):
+        fn = getattr(self.inner, "mint_value", None)
+        if fn is None:
+            raise RuntimeError("чтение mint не подключено")
+        return fn(mint)
+
+    def seed(self, mint: str, units: int) -> None:
+        with self._lock:
+            self.ledger[mint] = int(units)
+
+    def touched(self, con, logical_action_id: str) -> bool:
+        return False
+
+    def pending(self, con) -> list[dict]:
+        return []
+
+    def swap(self, con, cand, req, *, logical_action_id: str, clip_ref: str | None, meta, min_validity_heights,
+             apply):
+        from . import store
+        from .sol_exec import PresendRefused, SwapOutcome
+        out_raw = cand.expected_out_raw
+        if not out_raw or out_raw <= 0:
+            raise PresendRefused("котировка без выхода: маршрута нет")
+        with self._lock:
+            self.swaps += 1
+            n = self.swaps
+            self.ledger[req.input.mint] = self.ledger.get(req.input.mint, 0) - int(cand.amount_in_raw)
+            self.ledger[req.output.mint] = self.ledger.get(req.output.mint, 0) + int(out_raw)
+        out = SwapOutcome("ok", None, f"sim-{clip_ref or 'x'}-{n}", int(cand.amount_in_raw), int(out_raw), "finalized",
+                          "симуляция", tuple(cand.fees), "new", None, cand.provider, cand.path)
+        with store.tx(con):
+            apply(out)
+        return out
+
+    def resolve(self, con, attempt_id: str, *, apply, **kw):
+        from .sol_exec import SwapOutcome
+        return SwapOutcome("unknown", attempt_id, None, reason="симуляция: попыток в сети нет")
+
+
+class SimHlPerp(SimPerp):
+    """SimPerp поверх HyperliquidTrade только для чтения: те же правила цены/размера и привязка рынка адаптера; IOC
+    исполняется по свежей книге. Маржа в симуляции — заметка плана, не отказ."""
+
+    def __init__(self, inner, *, fee_taker: D | None = None, clock: Callable[[], float] = time.time):
+        super().__init__(inner, fee_taker=fee_taker, clock=clock)
+        self.fullcoin = inner.fullcoin
+
+    def quantize_px(self, symbol: str, px: D, side: str) -> D:
+        return self.inner.quantize_px(symbol, px, side)
+
+    def floor_qty(self, symbol: str, qty: D) -> D:
+        return self.inner.floor_qty(symbol, qty)
+
+    def identity(self, **kw):
+        return self.inner.identity(**kw)
+
+    def margin(self):
+        try:
+            return self.inner.margin()
+        except Exception as e:                     # noqa
+            from .hl_rules import MarginView
+            return MarginView("unknown", None, "—", False, f"не прочитано: {type(e).__name__}")
+
+    def entry_margin_refusals(self, need_usd: D, reserve_usd: D | None) -> list[str]:
+        return []
+
+    def pending(self) -> list[dict]:
+        return []
+
+    def setup(self, symbol: str, leverage: int, margin_type: str, **kw) -> None:
+        super().setup(symbol, leverage, margin_type)
+
+    def ioc(self, symbol: str, side: str, qty: D, px_cap: D, client_id: str, reduce_only: bool,
+            *, hedge: bool = False, on_signed: Callable[[int], None] | None = None, links=None) -> PerpFill:
+        return super().ioc(symbol, side, qty, px_cap, client_id, reduce_only, hedge=hedge, on_signed=on_signed)

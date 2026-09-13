@@ -8,6 +8,9 @@
 # выкат останавливается с «идёт исполнение», пока в trade.db есть намерение approved/running (trade_spec §10).
 # Проверка — ДО замены кода (после снимка .prev: откат deploy.sh вернёт ту же версию) и ещё раз прямо перед
 # рестартом трейдера (кнопку могли нажать, пока шёл rsync).
+# Связка SOL×HL (M10): «тихо» — это ещё и ни одной неразрешённой попытки Solana/HL (trader_idle); версию без связки
+# при сделке или попытке SOL/HL не ставим (sol_gate). Зависимости lock-файла — в боевой venv после ворот и до замены
+# кода, из колёс шага тестов, без сети; после замены — импорт связки боевым venv (не прошёл — deploy.sh откатывает).
 set -euo pipefail
 source "$(dirname "$0")/remote_lib.sh"
 need_lock "${1:-}"
@@ -32,10 +35,14 @@ EOF
 }
 
 trader_gate() {
-  local busy
+  local busy why
   busy=$(trader_busy) || { echo "!! trade.db не прочитана — трейдер не трогаю, выкат остановлен"; exit 1; }
   if [ "$busy" != "0" ]; then
     echo "!! идёт исполнение (намерений approved/running: $busy) — выкат остановлен, трейдер не перезапущен"
+    exit 1
+  fi
+  if ! why=$(trader_idle); then
+    echo "!! $why — выкат остановлен, трейдер не перезапущен"
     exit 1
   fi
 }
@@ -48,6 +55,9 @@ else
   echo "боевая версия не подтверждена проверками — .prev (последняя проверенная) не трогаю"
 fi
 mult_gate "$NEXT"          # версия до фазы 1 и открытая сделка с множителем контракта — стоп (ревью 13.09, F1)
+sol_gate "$NEXT"           # версия без связки SOL×HL при сделке или попытке SOL/HL — стоп (M06, M10)
+trader_gate
+install_lock "$DEST/.venv" "$NEXT/$LOCKFILE"      # те же колёса, что прошли тесты в .next; без сети
 trader_gate
 rsync -a --delete "${EXCL[@]}" "$NEXT/" "$DEST/"
 cd "$DEST"
@@ -57,6 +67,8 @@ mkdir -p runtime logs
 for f in logs/collector.log logs/web.log logs/trader.log; do [ -e "$f" ] || install -m 644 /dev/null "$f"; done
 sudo chown admin:admin logs/collector.log logs/web.log logs/trader.log
 ensure_installed
+.venv/bin/python -c 'import solders.keypair, base58, hyperliquid.utils.signing, funding_bot.trade.solana.sign, funding_bot.trade.hyperliquid_trade, funding_bot.trade.sol_flow' \
+  || { echo "!! боевой venv не импортирует связку SOL×HL — переключение упало"; exit 1; }
 sudo cp deploy/funding_bot-collector.service deploy/funding_bot-web.service deploy/funding_bot-trader.service \
   /etc/systemd/system/
 sudo install -m 644 deploy/logrotate.conf /etc/logrotate.d/funding_bot

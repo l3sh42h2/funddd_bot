@@ -1,0 +1,103 @@
+{
+ "_about": "hyperliquid-python-sdk 0.24.0 + msgpack 1.2.1 (mempool-venv); cloid = 0x+sha256('mainnet|account|client_id')[:32]; nonce = \u0447\u0430\u0441\u044b \u0442\u0435\u0441\u0442\u0430 1789305063.5 \u0441 \u2192 1789305063500 \u043c\u0441, expiresAfter = +30000",
+ "cases": [
+  {
+   "name": "sub_sell",
+   "account": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+   "master": "0x9a6f1bd2f1b7c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+   "client_id": "fb-D7K2-e03-c1-a1",
+   "cloid": "0x62c21eb67b05cb787a12a41cfb224c15",
+   "side": "SELL",
+   "px": "0.16608",
+   "sz": "600",
+   "reduce_only": false,
+   "payload": {
+    "action": {
+     "type": "order",
+     "orders": [
+      {
+       "a": 180025,
+       "b": false,
+       "p": "0.16608",
+       "s": "600",
+       "r": false,
+       "t": {
+        "limit": {
+         "tif": "Ioc"
+        }
+       },
+       "c": "0x62c21eb67b05cb787a12a41cfb224c15"
+      }
+     ],
+     "grouping": "na"
+    },
+    "nonce": 1789305063500,
+    "signature": {
+     "r": "0xd74426f0447061958c9c179cba730af21ee02b1e3b40e16e1c1230627351ce24",
+     "s": "0x7857d74a6735548f1c1341e0f022e669f18b47f47562f4223dbcfc1b95b8e718",
+     "v": 27
+    },
+    "vaultAddress": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+    "expiresAfter": 1789305093500
+   }
+  },
+  {
+   "name": "master_buy_ro",
+   "account": "0x9a6f1bd2f1b7c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+   "master": "0x9a6f1bd2f1b7c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+   "client_id": "fb-D7K2-x01-c2-a1",
+   "cloid": "0x4474c15d018a123c32fdd071f28c79dd",
+   "side": "BUY",
+   "px": "0.1583",
+   "sz": "1000",
+   "reduce_only": true,
+   "payload": {
+    "action": {
+     "type": "order",
+     "orders": [
+      {
+       "a": 180025,
+       "b": true,
+       "p": "0.1583",
+       "s": "1000",
+       "r": true,
+       "t": {
+        "limit": {
+         "tif": "Ioc"
+        }
+       },
+       "c": "0x4474c15d018a123c32fdd071f28c79dd"
+      }
+     ],
+     "grouping": "na"
+    },
+    "nonce": 1789305063500,
+    "signature": {
+     "r": "0xf4ee1f56fb0288c84edff5426ed0651c4172fe837f87b8a82f80841d36c77978",
+     "s": "0x7fc5565ececc77ab03e969875bfda1816d6582926d7a7e28df87337202d2f358",
+     "v": 28
+    },
+    "vaultAddress": null,
+    "expiresAfter": 1789305093500
+   }
+  }
+ ],
+ "update_leverage_sub": {
+  "payload": {
+   "action": {
+    "type": "updateLeverage",
+    "asset": 180025,
+    "isCross": false,
+    "leverage": 1
+   },
+   "nonce": 1789305063500,
+   "signature": {
+    "r": "0x9ab5afb32752f153afb8c753b29ff8940fc20af4fc0d92ffe520822408975314",
+    "s": "0x7019ac0dc4cdde880acb7391a6954fd03f689844e57cf6583279fcfb18c1ea02",
+    "v": 27
+   },
+   "vaultAddress": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+   "expiresAfter": 1789305093500
+  }
+ }
+}

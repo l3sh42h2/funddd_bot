@@ -1,0 +1,133 @@
+# PROPOSED SCHEMA. Текущий owner.py сначала необходимо доработать по ТЗ.
+# Шаблон намеренно disabled/readonly, с незаполненными live limits и адресами.
+schema_version = 2
+
+[profiles.sol_best_hyperliquid]
+enabled = false
+mode = "readonly"
+spot_chain = "solana-mainnet"
+spot_policy = "auto"
+perp_venue = "hyperliquid"
+perp_network = "mainnet"
+perp_dex = "para"
+instrument_registry = "instruments.json"
+allowed_instruments = ["ansem_sol_para_v1"]
+max_active_execution_clips = 1
+
+[wallets.sol_hl]
+solana_address = ""
+hl_user_address = ""
+hl_account_address = ""
+hl_agent_address = ""
+hl_vault_address = ""
+# Только выделенная/однозначно атрибутируемая стратегия ANSEM на account.
+position_ownership_policy = "exclusive_market"
+
+[spot.solana]
+rpc_primary_env = "SOLANA_RPC_URL"
+rpc_secondary_env = "SOLANA_RPC_SECONDARY_URL"
+rpc_ws_env = "SOLANA_WS_URL"
+keypair_file_env = "SOLANA_KEYPAIR_FILE"
+expected_genesis_hash = "" # Получить/сверить с выбранной mainnet сетью; live требует заполнения.
+transaction_versions = ["legacy", "v0"]
+allowed_mint_extensions = ["metadataPointer", "tokenMetadata"]
+allowed_token_account_extensions = ["immutableOwner"] # Enum нормализовать по actual RPC schema.
+confirmation_trigger = "confirmed"
+require_finalized_before_next_clip = true
+rollback_handler_required = true
+direct_landing = "rpc"
+allow_tx_jup_landing = false
+allow_separate_tip_transaction = false
+
+[routing.solana]
+paths = ["jupiter_order_v2", "jupiter_build_v2", "okx_solana_v6"]
+entry_metric = "min_effective_spot_buy_cost"
+exit_metric = "max_net_quote_proceeds"
+require_both_providers_for_entry = true
+allow_degraded_entry = false
+# Предлагаемая exit policy: один проверенный путь допустим для уменьшения риска.
+# Денежные и emergency caps всё равно обязательны; ни один unvalidated путь не допускается.
+allow_single_provider_risk_reducing_exit = true
+allow_external_signer_managed_routes = false
+require_persisted_recovery_identity = true
+max_collection_rounds = 2
+max_inflight_logical_swaps = 1
+
+[providers.jupiter]
+api_base = "https://api.jup.ag/swap/v2"
+api_key_env = "JUPITER_API_KEY"
+integrator_fee_enabled = false
+# main_rps, execute_rps: задать по фактическому project tier, shared budget.
+
+[providers.okx]
+api_base = "https://web3.okx.com/api/v6/dex/aggregator"
+chain_index = "501"
+api_key_env = "OKX_DEX_API_KEY"
+api_secret_env = "OKX_DEX_API_SECRET"
+api_passphrase_env = "OKX_DEX_API_PASSPHRASE"
+swap_mode = "exactIn"
+referral_fee_enabled = false
+# rps, fee_policy_version: заполнить по действующим условиям проекта.
+
+[perp.hyperliquid]
+api_base = "https://api.hyperliquid.xyz"
+ws_url = "wss://api.hyperliquid.xyz/ws"
+agent_key_env = "HL_AGENT_PRIVATE_KEY"
+supported_account_modes = ["manual", "standard"] # Внутренние enum; wire mapping проверить.
+margin_mode = "isolated"
+builder_fee_enabled = false
+# leverage = ... # Целое, задать явно; текущий max ANSEM 3, проверять refresh.
+
+[limits.sol_best_hyperliquid]
+# ВСЕ обязательны перед live. Пропуск -> live_ready=false, без default денежных значений.
+# max_clip_usdc = "..."
+# max_operation_usdc = "..."
+# max_total_position_usdc = "..."
+# max_surplus_tokens = "..."
+# max_surplus_usdc = "..."
+# max_delta_tokens = "..."
+# max_delta_usdc = "..."
+# max_unhedged_ms = ...
+# max_spot_slippage_bps = ...
+# max_price_impact_bps = ...
+# max_hedge_slippage_bps = ...
+# min_entry_basis_all_in_bps = "..."
+# normal_exit_policy / normal_exit_basis_bps / min_exit_pnl_usdc = ...
+# max_network_fee_lamports_per_tx = ...
+# max_tip_lamports_per_tx = ...
+# max_external_fees_usdc_per_operation = "..."
+# min_sol_reserve_lamports = ...
+# max_rent_locked_lamports = ...
+# min_hl_margin_reserve_usdc = "..."
+# min_liquidation_distance_bps = ...
+# max_dust_tokens = "..."
+# max_dust_usdc = "..."
+# max_quote_age_ms = ...
+# max_book_age_ms = ...
+# max_source_skew_ms = ...
+# max_native_price_age_ms = ...
+# max_metadata_age_ms = ...
+# collection_deadline_ms = ...
+# min_blockhash_validity_heights = ...
+# max_hedge_attempts = ...
+# hedge_deadline_ms = ...
+# hl_action_expires_after_ms = ...
+# min_route_improvement_usdc = "..." # Если hysteresis включён: явно обозначить scope метрики.
+
+[emergency.sol_best_hyperliquid]
+auto_unwind_spot_after_proven_zero_hedge = false
+auto_rebuy_spot_after_proven_zero_close = false
+auto_sell_surplus_after_resolved_hedge = false
+auto_correct_known_delta = false
+# Разрешения и loss/slippage/time caps заполняются владельцем до включения автоматических действий.
+# max_loss_usdc = "..."
+# max_hedge_slippage_bps = ...
+# max_unwind_slippage_bps = ...
+# deadline_ms = ...
+
+[observability.sol_best_hyperliquid]
+record_candidate_rejections = true
+record_source_times = true
+record_sanitized_payload_hashes = true
+expose_signed_payloads = false
+emit_state_transition_events = true

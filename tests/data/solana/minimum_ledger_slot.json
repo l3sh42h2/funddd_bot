@@ -1,0 +1,11 @@
+{
+ "captured_utc": "2026-09-13T13:34:00.043733+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "minimumLedgerSlot",
+ "params": [],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": 446641608,
+  "id": 214
+ }
+}

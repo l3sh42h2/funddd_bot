@@ -15,7 +15,7 @@ CAS в store.approve_intent даёт ровно один submit.
 
 Рестарт: прерванное (approved/running) → interrupted, сверка (reconcile.startup) и сообщение «♻️ … сам не
 продолжаю». Автоматического продолжения нет никогда — только «продолжить <id>» со свежим планом и кнопками.
-SIGTERM (TimeoutStopSec=180): новое не начинается (engine.term), текущая пара ног доводится, «⏹ служба
+SIGTERM (TimeoutStopSec=280): новое не начинается (engine.term), текущая пара ног доводится, «⏹ служба
 останавливается», отправитель досылает очередь.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ EXIT_WATCHDOG = 3           # сторож: Telegram не оживает — sys
 EXIT_TRANSIENT = 1          # сеть на старте (Aster/RPC не ответили) — systemd перезапустит через RestartSec
 HOUSEKEEP_S = 2.0           # истёкший план теряет кнопки не позже чем через 2 с после срока
 JOBS_MAX = 20               # больше — владелец шлёт команды быстрее, чем они считаются: лишнее отклоняется
-STOP_WAIT_S = 170           # SIGTERM: довести пару ног (TimeoutStopSec=180 минус запас на отправку)
+STOP_WAIT_S = 250           # SIGTERM: довести пару ног; своп Solana + разбор HL ≈243 с (расчёт — юнит трейдера)
 REQUOTE_IDLE_S = 15.0       # перекотировка: подождать, пока исполнитель закроет отказанное намерение
 
 
@@ -243,7 +243,7 @@ class Bot:
         if name == "stop":
             self.stop_cmd(chat)
         elif name in ("help", "start"):
-            self.sender.send(chat, views.help_text(sim=self.mode == "dry"))
+            self.sender.send(chat, views.help_text(sim=self.mode == "dry", sol=self._sol_on()))
         elif name == "unknown":
             self.sender.send(chat, views.unknown(cmd))
         elif name == "resume":
@@ -261,10 +261,16 @@ class Bot:
             self.sender.send(chat, views.planning(cmd.target, "exit"))
             self._job(chat, name, lambda: self.propose(
                 chat, lambda: self.desk.propose_exit(cmd.target, cmd.usd, cmd.perp_only, chat)))
+        elif name == "profile_entry":             # связка Solana × Hyperliquid: инструмент — из реестра профиля
+            self.sender.send(chat, views.planning(cmd.coin, "entry"))
+            self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_profile_entry(cmd, chat)))
+        elif name == "profile_exit":
+            self.sender.send(chat, views.planning(cmd.target, "exit"))
+            self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_profile_exit(cmd, chat)))
         elif name in ("rehedge", "undo"):
             self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_fix(name, cmd.target, chat)))
         elif name == "positions":
-            self._job(chat, name, lambda: self.positions_cmd(chat))
+            self._job(chat, name, lambda: self.positions_cmd(chat, getattr(cmd, "profile", None)))
         elif name == "status":
             self._job(chat, name, lambda: self.status_cmd(chat))
 
@@ -317,7 +323,16 @@ class Bot:
             return None
         self.sender.send(chat, p.html, reply_markup=views.plan_keyboard(p.intent_id, p.nonce, self._head(p.intent_id).ok),
                          on_done=lambda m, iid=p.intent_id: self._plan_sent(iid, chat, m))
+        for old in getattr(p, "superseded", ()) or ():     # новый план сделки — у прежних снимаются кнопки
+            self._close_plan(old, "expired")
         return p
+
+    def _sol_on(self) -> bool:
+        """Связка Solana × Hyperliquid включена в owner.toml (строка команд в «помощь», проверки в «статус»)."""
+        try:
+            return self.owner_loader().profile_enabled(owner_mod.SOL_HL)
+        except Exception:                      # noqa — битый файл: прежний текст
+            return False
 
     def _plan_sent(self, iid: str, chat: int, m: dict | None) -> None:
         """В потоке отправителя (своё соединение): message_id плана — чтобы по истечении снять кнопки."""
@@ -370,6 +385,14 @@ class Bot:
         self.sender.send(chat, views.requote(reason, sim=bool(deal["sim"])))
         if spec.get("resume"):
             fn = lambda: self.desk.propose_resume(deal["id"], chat)
+        elif it["kind"] == "entry" and spec.get("profile") == owner_mod.SOL_HL:
+            try:                               # связка Solana × Hyperliquid: тот же вход заново — из реестра профиля
+                usd = Decimal(str(spec["usd"]))
+            except (KeyError, InvalidOperation):
+                return
+            dex = str(spec.get("perp") or "").split("·")[-1] or None
+            cmd = parse.ProfileEntry(str(spec["coin"]), "auto", "solana", "hyperliquid", dex, usd)
+            fn = lambda: self.desk.propose_profile_entry(cmd, chat)
         elif it["kind"] == "entry":
             try:
                 usd = Decimal(str(spec["usd"]))
@@ -421,12 +444,13 @@ class Bot:
         r = con.execute("SELECT id, deal_id FROM intents WHERE status IN ('approved','running') LIMIT 1").fetchone()
         return (r[0], r[1]) if r else (None, None)
 
-    def positions_cmd(self, chat: int) -> None:
+    def positions_cmd(self, chat: int, profile: str | None = None) -> None:
         con = self.conns.get()
         now = self.clock()
         _iid, busy_deal = self._running(con)
+        kw = {} if profile is None else {"profile": profile}      # «позиции sol» — сделки одной связки
         rows, matched, mism = reconcile.positions(con, self.legs, now=now, busy_deal=busy_deal,
-                                                  resolve=not self.engine.busy())
+                                                  resolve=not self.engine.busy(), **kw)
         items = [views.PositionView(**r) for r in rows]
         sim = bool(items) and all(i.sim for i in items)
         self.sender.send(chat, views.positions(items, ts=now, matched=matched, mismatch=mism, sim=sim))
@@ -477,6 +501,8 @@ class Bot:
                 checks = reconcile.health_checks(self.rt, cfg, deals[0]["symbol"] if deals else None)
             except Exception as e:             # noqa
                 checks = [("проверки", None, redact(e)[:160])]
+        if cfg is not None:
+            checks = list(checks) + self._sol_checks(cfg)
         used = None
         if cfg is not None and isinstance(cfg.get("limits.daily_loss_stop_usd"), Decimal):
             day0 = int(now // 86400) * 86400
@@ -497,6 +523,23 @@ class Bot:
             daily_stop=cfg.get("limits.daily_loss_stop_usd") if cfg else None, daily_used_usd=used,
             checks=tuple(checks), missing_owner_keys=tuple(cfg.live_missing("aster", "bsc")) if cfg else ())
 
+    def _sol_checks(self, cfg) -> list[tuple[str, bool | None, str]]:
+        """«статус» связки Solana × Hyperliquid — только если она включена (иначе текст прежний): ноги не собрались
+        (причина сборки), владелец просит live, а live не готов (что именно мешает)."""
+        try:
+            if not cfg.profile_enabled(owner_mod.SOL_HL):
+                return []
+        except Exception:                      # noqa
+            return []
+        out: list[tuple[str, bool | None, str]] = []
+        down = (getattr(self.legs, "last_error", None) or {}).get(owner_mod.SOL_HL)
+        if down:
+            out.append(("связка Solana × Hyperliquid не собрана", False, str(down)[:160]))
+        if cfg.values.get(f"profiles.{owner_mod.SOL_HL}.mode") == "live":
+            bl = cfg.profile_live_blockers(owner_mod.SOL_HL)
+            out.append(("Solana × Hyperliquid: live", not bl, "; ".join(bl)[:240]))
+        return out
+
     def status_cmd(self, chat: int) -> None:
         self.sender.send(chat, views.status(self.status_view()))
 
@@ -509,11 +552,12 @@ class Bot:
             self._close_plan(iid, "expired")
         for dr in rep.deals:
             sim = bool(dr.deal["sim"])
+            tv = self._texts_of(dr.deal)       # связка Solana × Hyperliquid — свои тексты голой ноги (без «откат»)
             for it in dr.intents:
                 clip, clips = reconcile.restart_clip(con, it)
                 ok = dr.check.matched is True and dr.new != DealState.HALTED_MISMATCH
                 matched = True if ok else (False if dr.check.matched is False else None)
-                self.say(views.restart(views.RestartView(
+                self.say(tv.restart(views.RestartView(
                     intent_id=it["id"], kind="entry" if it["kind"] == "entry" else "exit", deal_id=dr.deal["id"],
                     clip=clip, clips=clips, matched=matched, details=self._restart_details(dr), sim=sim,
                     coin=dr.deal["coin"], hedged=dr.check.hedged, delta=dr.check.delta, state=str(dr.new),
@@ -533,10 +577,19 @@ class Bot:
         return "; ".join(x for x in (dr.check.detail, tail) if x)
 
     @staticmethod
+    def _texts_of(deal):
+        from ..trade.runtime import is_sol_deal
+        if is_sol_deal(deal):
+            from . import sol_views
+            return sol_views
+        return views
+
+    @staticmethod
     def _check_line(dr: reconcile.DealRestart) -> str:
         d, chk = dr.deal, dr.check
-        return views.restart_check(d["coin"], d["id"], chk.matched, chk.detail, str(dr.new), bool(d["sim"]),
-                                   hedged=chk.hedged, delta=chk.delta, usd=chk.delta_usd, step=chk.step, m=chk.m)
+        return Bot._texts_of(d).restart_check(d["coin"], d["id"], chk.matched, chk.detail, str(dr.new),
+                                              bool(d["sim"]), hedged=chk.hedged, delta=chk.delta, usd=chk.delta_usd,
+                                              step=chk.step, m=chk.m)
 
     def start_poller(self) -> None:
         self._poll_thread = threading.Thread(target=self.poller.run, name="tg-poller", daemon=True)
@@ -571,6 +624,29 @@ class Bot:
         return code
 
 
+def build_trader_legs(cfg, conns: Conns, holder: CfgHolder, env, *, build=None, factory=None):
+    """Ноги трейдера по связкам (ТЗ SOL×HL §3.2, M01/M02): старая связка — прежний build_runtime (при включённой — тот же
+    вызов, те же ключи Aster/EVM); связка Solana × Hyperliquid — ленивая фабрика в RuntimeRegistry (её ключи — при
+    первой сборке, её сбой — ProfileDown этой связки). Старая связка выключена (enabled = false) — её ноги только
+    симуляция без ключей: Aster/EVM не обязательны для одной SOL-связки.
+    Возвращает (rt, реестр ног, keys_mode, режим бота, старая связка включена)."""
+    from ..trade.runtime import RuntimeRegistry, SolFactory
+    build = build or build_runtime
+    legacy_on = cfg.profile_enabled(owner_mod.LEGACY_PROFILE)
+    sol_on = cfg.profile_enabled(owner_mod.SOL_HL)
+    if legacy_on:
+        rt = build(cfg, conns, holder=holder, environ=env)
+    else:
+        rt = build(cfg, conns, holder=holder, mode="dry", environ=env)
+    keys_mode = rt.mode if rt.keys is not None else (cfg.mode if (sol_on and not legacy_on) else None)
+    factories = {}
+    if sol_on:
+        factories[owner_mod.SOL_HL] = (factory or SolFactory)(owner_mod.load, conns, keys_mode=keys_mode, environ=env)
+    reg = RuntimeRegistry(lambda sim: rt.sim if sim else rt.live, factories)
+    mode = rt.mode if legacy_on else (keys_mode or "dry")
+    return rt, reg, keys_mode, mode, legacy_on
+
+
 def _notify(api, chat: int | None, html: str) -> None:
     """Одно сообщение мимо очереди — когда процесс не стартует (владелец иначе не узнает почему)."""
     if api is None or not chat:
@@ -603,7 +679,7 @@ def run_trader(environ=None) -> int:
         return EXIT_CONFIG
     conns, holder = Conns(), CfgHolder()
     try:
-        rt = build_runtime(cfg, conns, holder=holder, environ=env)
+        rt, legs, keys_mode, mode, legacy_on = build_trader_legs(cfg, conns, holder, env)
     except KeysError as e:
         log.error("ключи: %s — трейдер не запускаю", redact(e))
         _notify(send_api, cfg.owner_id, views.refused(f"трейдер не запущен: {redact(e)}"))
@@ -616,7 +692,7 @@ def run_trader(environ=None) -> int:
     except Exception as e:                     # noqa — сеть/узел при сборке ног
         log.error("сборка ног: %s", redact(e))
         return EXIT_TRANSIENT
-    if rt.mode == "live":
+    if legacy_on and rt.mode == "live":
         from ..trade.aster_trade import AsterError
         try:
             rt.live.perp.check_clock()         # nonce Aster живёт в ±10 с: при расхождении > 2 с live не стартует
@@ -627,15 +703,13 @@ def run_trader(environ=None) -> int:
         except Exception as e:                 # noqa
             log.error("часы Aster не проверены: %s", redact(e))
             return EXIT_TRANSIENT
-    legs = lambda sim: rt.sim if sim else rt.live
-    keys_mode = rt.mode if rt.keys is not None else None
     ref: dict[str, Engine] = {}
     desk = Desk(conns, legs, keys_mode=keys_mode, busy=lambda: ref["e"].busy())
     engine = Engine(conns, legs, desk, keys_mode=keys_mode, holder=holder, busy_path=tconfig.TRADING_BUSY)
     ref["e"] = engine
     from ..serve import load_table
     sender = Sender(send_api).start()
-    bot = Bot(conns=conns, desk=desk, engine=engine, sender=sender, legs=legs, poll_api=poll_api, mode=rt.mode, rt=rt,
+    bot = Bot(conns=conns, desk=desk, engine=engine, sender=sender, legs=legs, poll_api=poll_api, mode=mode, rt=rt,
               table_loader=load_table)
     try:
         info = startup_check(poll_api, bot.alarm)
@@ -652,7 +726,7 @@ def run_trader(environ=None) -> int:
         bot.say(views.error("сверка после перезапуска упала — сам ничего не продолжаю; «позиции» перед командами"))
     engine.start()
     bot.start(poll_api)
-    bot.say(views.bot_started(rt.mode, info.get("username")))
+    bot.say(views.bot_started(mode, info.get("username")))
     stop, code = threading.Event(), [0]
 
     def on_exit() -> None:

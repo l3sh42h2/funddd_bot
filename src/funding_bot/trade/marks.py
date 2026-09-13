@@ -514,11 +514,12 @@ def run_pass(con, legs_fn: Callable[[bool], Any], *, now: float,
     на сделку), чистка старше MARK_KEEP_S. Возвращает (оценки, проход завершён). Исполнение началось посреди прохода —
     остаток пропускается (False): во время исполнения не оцениваем."""
     out: list[Mark] = []
+    from .runtime import is_sol_deal
     for d in store.active_deals(con):
         if busy():
             return out, False
-        try:
-            m = _safe_mark(con, d, legs_fn, now, busy)
+        try:                                   # связка SOL × HL — своя оценка (sol_ledger) на ногах своей связки
+            m = _safe_sol_mark(con, d, legs_fn, now, busy) if is_sol_deal(d) else _safe_mark(con, d, legs_fn, now, busy)
         except Preempted:                      # исполнение началось посреди сделки: остаток сети не читаем
             return out, False
         if busy():                             # журнал мог меняться между чтениями — такую строку не пишем
@@ -529,15 +530,75 @@ def run_pass(con, legs_fn: Callable[[bool], Any], *, now: float,
             "SELECT * FROM deals WHERE state='CLOSED' AND updated>=? AND id NOT IN (SELECT deal_id FROM deal_marks "
             "WHERE json_extract(flags_json, '$.final') = 1)", (now - tconfig.MARK_KEEP_S,))]:
         try:
-            legs = legs_fn(bool(d["sim"]))
-            m = final_mark(con, d, legs, now=now)
+            if is_sol_deal(d):
+                m = _sol_final(con, d, legs_fn, now)
+            else:
+                legs = legs_fn(bool(d["sim"]))
+                m = final_mark(con, d, legs, now=now)
         except Exception as e:                 # noqa
             log.warning("итог сделки %s: %s", d["id"], redact(e))
             continue
         if m.pnl_now is not None:              # без цены BNB — в следующий проход, а не итог без газа навсегда
             save(con, m)
+    # связка SOL × HL: итог, посчитанный при неполной истории HL, пересчитывается (новая ревизия), пока учёт не полон
+    for d in [dict(r) for r in con.execute(
+            "SELECT * FROM deals WHERE state='CLOSED' AND updated>=? AND id IN (SELECT deal_id FROM deal_marks WHERE "
+            "json_extract(flags_json, '$.final') = 1) AND id NOT IN (SELECT deal_id FROM deal_marks WHERE "
+            "json_extract(flags_json, '$.final') = 1 AND json_extract(flags_json, '$.accounting_complete') = 1)",
+            (now - tconfig.MARK_KEEP_S,))]:
+        if not is_sol_deal(d) or busy():
+            continue
+        try:
+            m = _sol_final(con, d, legs_fn, now)
+        except Exception as e:                 # noqa
+            log.warning("итог сделки %s: %s", d["id"], redact(e))
+            continue
+        if m.pnl_now is not None:
+            save(con, m)
     store.prune_marks(con, now)
     return out, True
+
+
+def sol_cfg(deal: Mapping):
+    """Замороженный owner.toml сделки (допуск котировки выхода) — не свежий файл: оценка по условиям сделки."""
+    from .owner import OwnerCfg
+    try:
+        return OwnerCfg.from_frozen(deal["owner_json"])
+    except Exception:                          # noqa — битая копия: котировка выхода не запрашивается (ошибка в flags)
+        return None
+
+
+def _sol_legs(legs_fn, d: Mapping):
+    from .runtime import legs_of
+    return legs_of(legs_fn, d)
+
+
+def _safe_sol_mark(con, d: Mapping, legs_fn, now: float, busy: Callable[[], bool] | None = None) -> Mark:
+    from . import sol_ledger
+    try:
+        try:
+            legs = _sol_legs(legs_fn, d)
+        except Exception as e:                 # noqa — ProfileDown и прочее: сделка видна, оценки нет
+            m = Mark(d["id"], float(now), flags={"sim": True} if d["sim"] else {})
+            m.err(f"ноги связки не собраны: {redact(e)[:160]}")
+            return m
+        return sol_ledger.mark(con, d, legs, now=now, cfg=sol_cfg(d), busy=busy)
+    except Preempted:
+        raise
+    except Exception as e:                     # noqa
+        log.exception("оценка сделки %s", d["id"])
+        m = Mark(d["id"], float(now), flags={"sim": True} if d["sim"] else {})
+        m.err(f"расчёт упал: {type(e).__name__}: {redact(e)[:120]}")
+        return m
+
+
+def _sol_final(con, d: Mapping, legs_fn, now: float) -> Mark:
+    from . import sol_ledger
+    try:
+        legs = _sol_legs(legs_fn, d)
+    except Exception:                          # noqa — без ног: по журналу, без добора истории HL
+        legs = None
+    return sol_ledger.final_mark(con, d, legs, now=now)
 
 
 def for_positions(con, deal: Mapping, legs, *, now: float, fresh: bool, px_ask: D | None = None,

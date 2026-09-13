@@ -1,0 +1,33 @@
+{
+ "captured_utc": "2026-09-13T13:11:54.472831+00:00",
+ "endpoint": "https://api.mainnet-beta.solana.com",
+ "method": "getAccountInfo",
+ "params": [
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  {
+   "encoding": "base64",
+   "commitment": "finalized"
+  }
+ ],
+ "response": {
+  "jsonrpc": "2.0",
+  "result": {
+   "context": {
+    "apiVersion": "4.3.0-rc.0",
+    "slot": 446711181
+   },
+   "value": {
+    "data": [
+     "AQAAAJj+huiNm+Lqi8HMpIeLKYjCQPUrhCS/tA7Rot3LXhmbolVelAtDHQAGAQEAAABicKqKWcWUBbRShshncubNEm6bil06OFNtN/e0FOi2Zw==",
+     "base64"
+    ],
+    "executable": false,
+    "lamports": 534154177739,
+    "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "rentEpoch": 18446744073709551615,
+    "space": 82
+   }
+  },
+  "id": 5
+ }
+}

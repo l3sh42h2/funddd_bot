@@ -10,6 +10,9 @@
 # Заполнено то, что владелец задал 12.09; остальное пусто до его решения.
 
 mode = ""                     # "dry" | "readonly" | "live"; пусто = dry. Повышение режима — через перезапуск сервиса
+# >>> ПРЕДЛОЖЕНИЕ sol_best_hyperliquid (шапка): раскомментировать вместе с блоком в конце файла
+# schema_version = 2          # схема 2: разделы связки «спот Solana × шорт Hyperliquid»; ключ — только в начале файла
+# <<< ПРЕДЛОЖЕНИЕ
 
 [telegram]
 owner_id = ""                 # ваш числовой id в Telegram; пусто — командовать не может никто
@@ -62,3 +65,101 @@ exec_time_max_s = "auto"      # владелец 12.09 (auto): 3 × ожидае
 refill_wait_max_s = 30        # владелец 12.09: «ждать восстановления стакана 30 сек»
 plan_cost_drift_pct = 0.5     # владелец 12.09: издержки у кнопки выросли больше 0.5 п.п. — не исполнять, новый план
 auto_unwind_naked_after_s = ""   # владелец 12.09: голую ногу решает сам — авто-отката нет (пусто = никогда)
+
+# >>> ПРЕДЛОЖЕНИЕ sol_best_hyperliquid: ждёт утверждения владельца. Пока закомментировано — связка выключена.
+## Лонг ANSEM в Solana за USDC (Jupiter Build / OKX; Jupiter Order — только показ) × шорт Hyperliquid para:ANSEM.
+## Числа лимитов — предложение пилота 13.09 ($150), не значения кода. Не заданные ключи = live закрыт (live_ready=false).
+## Включение: раскомментировать шапку (schema_version) и этот блок, адреса — в [wallets.sol_hl], затем enabled/mode.
+# [profiles.sol_best_hyperliquid]
+# enabled = false
+# mode = "readonly"
+# spot_chain = "solana-mainnet"
+# spot_policy = "auto"
+# perp_venue = "hyperliquid"
+# perp_network = "mainnet"
+# perp_dex = "para"
+# instrument_registry = "instruments.json"     # runtime/instruments.json (образец — deploy/instruments.json.example)
+# allowed_instruments = ["ansem_sol_para_v1"]
+# max_active_execution_clips = 1
+#
+# [wallets.sol_hl]
+# solana_address = ""                          # публичный адрес кошелька бота (base58 как есть)
+# hl_user_address = ""                         # мастер HL
+# hl_account_address = ""                      # счёт позиции (мастер или субаккаунт); режим счёта — Standard
+# hl_agent_address = ""                        # API-агент (только подпись)
+# hl_vault_address = ""                        # субаккаунт при торговле за него; пусто — мастер
+# position_ownership_policy = "exclusive_market"
+#
+# [spot.solana]
+# rpc_primary_env = "SOLANA_RPC_URL"
+# rpc_secondary_env = "SOLANA_RPC_SECONDARY_URL"
+# secret_b58_env = "SOLANA_SECRET_B58"
+# expected_genesis_hash = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+# transaction_versions = ["legacy", "v0"]
+# allowed_mint_extensions = ["metadataPointer", "tokenMetadata"]
+# allowed_token_account_extensions = ["immutableOwner"]
+# confirmation_trigger = "finalized"           # пилот: хедж на HL только после finalized чека Solana
+# require_finalized_before_next_clip = true
+# rollback_handler_required = true
+# direct_landing = "rpc"
+# allow_tx_jup_landing = false
+# allow_separate_tip_transaction = false
+#
+# [routing.solana]
+# paths = ["jupiter_order_v2", "jupiter_build_v2", "okx_solana_v6"]
+# entry_metric = "min_effective_spot_buy_cost"
+# exit_metric = "max_net_quote_proceeds"
+# require_both_providers_for_entry = true
+# allow_degraded_entry = false
+# allow_single_provider_risk_reducing_exit = true
+# allow_external_signer_managed_routes = false  # Jupiter Order — только показ
+# require_persisted_recovery_identity = true
+# max_collection_rounds = 2
+# max_inflight_logical_swaps = 1
+#
+# [providers.jupiter]
+# api_base = "https://api.jup.ag/swap/v2"
+# api_key_env = "JUPITER_API_KEY"
+# integrator_fee_enabled = false
+#
+# [providers.okx]
+# api_base = "https://web3.okx.com/api/v6/dex/aggregator"
+# chain_index = "501"
+# api_key_env = "OKX_DEX_API_KEY"
+# api_secret_env = "OKX_DEX_SECRET"
+# api_passphrase_env = "OKX_DEX_PASSPHRASE"
+# swap_mode = "exactIn"
+# referral_fee_enabled = false
+#
+# [perp.hyperliquid]
+# leverage = 1                                 # плечо 1x
+# margin_type = "ISOLATED"
+# margin_mode = "isolated"
+# api_base = "https://api.hyperliquid.xyz"
+# ws_url = "wss://api.hyperliquid.xyz/ws"
+# agent_key_env = "HL_AGENT_PRIVATE_KEY"
+# supported_account_modes = ["manual", "standard"]
+# builder_fee_enabled = false
+#
+# [limits.sol_best_hyperliquid]
+# max_clip_usdc = "150"
+# max_operation_usdc = "150"
+# max_total_position_usdc = "150"
+# max_spot_slippage_bps = 100
+# max_price_impact_bps = 150
+# max_hedge_slippage_bps = 60
+# max_delta_usdc = "25"                        # голая дельта ≤ 25 USDC …
+# max_unhedged_ms = 60000                      # … и ≤ 60 с
+# min_entry_basis_all_in_bps = "-150"
+# max_network_fee_lamports_per_tx = 200000
+# max_tip_lamports_per_tx = 0
+# max_external_fees_usdc_per_operation = "0.50"
+# min_sol_reserve_lamports = 20000000          # резерв 0.02 SOL
+## остальные ключи лимитов владелец не задавал — пусто, live по ним закрыт
+#
+# [emergency.sol_best_hyperliquid]
+# auto_unwind_spot_after_proven_zero_hedge = false
+# auto_rebuy_spot_after_proven_zero_close = false
+# auto_sell_surplus_after_resolved_hedge = false
+# auto_correct_known_delta = false
+# <<< ПРЕДЛОЖЕНИЕ
