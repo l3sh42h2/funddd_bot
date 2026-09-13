@@ -266,7 +266,7 @@ def test_restart_marks_positions_never_touch_bsc_legs(tmp_path):
 
 
 # ==== 3. фабрика ног, регистрация в боте, σ Gate =====================================================================
-def _factory(tmp_path, toml: str, *, keys=True, evm=True, rt_mode="live"):
+def _factory(tmp_path, toml: str, *, keys=True, evm=True, rt_mode="live", gate=None):
     p = tmp_path / "owner.toml"
     p.write_text(toml)
     loader = lambda: owner.load(p)                                    # noqa: E731
@@ -276,7 +276,7 @@ def _factory(tmp_path, toml: str, *, keys=True, evm=True, rt_mode="live"):
                         gate=lambda *a, **kw: gates.append((a, kw))) if keys else None
     rt = SimpleNamespace(mode=rt_mode, keys=k)
     f = EvmGateFactory(loader, Conns(tmp_path / "trade.db"), eng.CfgHolder(loader), rt, okx=SimpleNamespace(),
-                       rpc=SimpleNamespace(), gate=SimpleNamespace(venue="gate"))
+                       rpc=SimpleNamespace(), gate=gate or SimpleNamespace(venue="gate"))
     return f, gates
 
 
@@ -331,3 +331,29 @@ def test_gate_sigma_1s_from_candles():
     assert s is not None and D(0) < s < D("0.001")
     g._public = lambda path, params=None, retries=None: [{"t": 1, "c": "0.16"}] * 5
     assert g.sigma_1s(SYM) is None                                       # мало свечей — неизвестно, а не 0
+
+
+def test_evm_gate_factory_readonly_without_evm_key_and_clock(tmp_path):
+    for d in "ab":
+        (tmp_path / d).mkdir()
+    f, _ = _factory(tmp_path / "a", rh_toml(profile_mode="readonly"), evm=False, rt_mode="readonly")
+    ro = f(False)
+    assert ro.spot.sender is None and ro.can_send is False and ro.spot.chain == "robinhood"   # только чтение
+    def bad_clock():
+        raise RuntimeError("часы расходятся с Gate")
+    f, _ = _factory(tmp_path / "b", rh_toml(), gate=SimpleNamespace(venue="gate", check_clock=bad_clock))
+    with pytest.raises(RuntimeError, match="часы"):
+        f(False)
+
+
+def test_guard_uses_profile_mode_not_general_mode(tmp_path):
+    """Связку перевели в readonly посреди сделки — отправки останавливает guard («режим readonly»), общий mode = live."""
+    e = rh_env(tmp_path)
+    p = _open(e)
+    x = e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER)
+    e.path.write_text(rh_toml(profile_mode="readonly"))
+    n = fx.sends(e)
+    fx.run_approved(e, x)
+    assert fx.sends(e) == n, "после перевода связки в readonly ни свопа, ни заявки"
+    assert store.get_deal(e.con, p.deal_id)["state"] != DealState.CLOSED
+    assert any("readonly" in h for h in [*e.hooks.reports, *(h for _i, h in e.hooks.progresses)]), e.hooks.reports

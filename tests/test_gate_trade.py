@@ -65,6 +65,7 @@ class FakeGate(requests.Session):
         self.lose_reply = None
         self.hide_queries = 0
         self.leverage_reply = None
+        self.list_reply = None                 # (статус, тело) вместо списка завершённых заявок
 
     def n(self, method: str, path: str) -> int:
         return sum(1 for m, p, _, _ in self.log if m == method and p == path)
@@ -140,6 +141,14 @@ class FakeGate(requests.Session):
             return 200, self.leverage_reply or {"leverage": lev, "contract": SYM}
         if (method, path) == ("POST", f"/futures/{gt.SETTLE}/orders"):
             return self._order(json.loads(body or b"{}"))
+        if (method, path) == ("GET", f"/futures/{gt.SETTLE}/orders"):
+            # список заявок (status=finished): новые первыми, offset/limit — text в нём остаётся после окна text-id
+            if self.list_reply is not None:
+                return self.list_reply
+            rows = sorted((o for o in self.orders.values() if o["contract"] == p.get("contract")
+                           and p.get("status") == "finished"), key=lambda o: o["id"], reverse=True)
+            off = int(p.get("offset", 0))
+            return 200, rows[off: off + int(p.get("limit", 100))]
         if method == "GET" and path.startswith(orders_prefix):
             from urllib.parse import unquote
             text = unquote(path[len(orders_prefix):])
@@ -174,7 +183,7 @@ class FakeGate(requests.Session):
         self.next_oid += 1
         o = {"id": self.next_oid, "contract": p["contract"], "size": size, "price": p["price"], "text": text,
             "tif": p["tif"], "left": left_mag if size >= 0 else -left_mag,
-            "fill_price": format(px if ex else D(0), "f"), "status": "finished",
+            "fill_price": format(px if ex else D(0), "f"), "status": "finished", "create_time": self.clock_s,
             "finish_as": "filled" if left_mag == 0 else "ioc", "reduce_only": bool(p.get("reduce_only"))}
         self.orders[text] = o
         if ex:
@@ -750,3 +759,64 @@ def test_write_ahead_with_store_rows(fake, tmp_path):
                           "contract": SYM}]
     t2 = mk(fake, now=lambda: fake.clock_s + 1000)
     assert store.add_funding_income(con, "gate", t2.funding_income(SYM, fake.clock_s * 1000 - 1000)) == 1
+
+
+# ================================ ревью Fable 14.09: исход после окна text-id и пауза после 429 ================================
+def test_late_lost_reply_resolved_by_finished_orders_list(fake):
+    """P1-1: ответ на заявку потерян, выясняем через 10 мин — по text биржа уже не ищет (404), а список завершённых
+    заявок её знает: итог FILLED, повторной отправки нет."""
+    t = mk(fake, now=lambda: fake.clock_s)
+    fake.lose_reply = (503, {"label": "SERVER_ERROR", "message": "internal"})
+    cid, since = "e01-c1-a1", fake.clock_s * 1000
+    assert t.ioc(SYM, "SELL", D(100), D("0.00171"), cid, False, hedge=True).status == "UNKNOWN"
+    fake.clock_s += 600
+    fake.hide_queries = 99
+    g = t.settle_unknown(SYM, cid, pos_before=D(0), since_ms=since)
+    assert (g.status, g.qty, g.order_id) == ("FILLED", D(100), fake.orders["t-" + cid]["id"])
+    assert fake.n("POST", f"/futures/{gt.SETTLE}/orders") == 1
+
+
+def test_late_never_placed_is_not_found_with_or_without_position(fake):
+    t = mk(fake, now=lambda: fake.clock_s)
+    t.ioc(SYM, "SELL", D(10), D("0.00171"), "e01-c0-a1", False)          # своя учтённая дочерняя до потерянной
+    known = {fake.orders["t-e01-c0-a1"]["id"]}
+    fake.script[("POST", f"/futures/{gt.SETTLE}/orders")] = [requests.ConnectTimeout("no route")]
+    cid, since = "e01-c1-a1", fake.clock_s * 1000
+    assert t.ioc(SYM, "SELL", D(50), D("0.002"), cid, False).status == "UNKNOWN"
+    fake.clock_s += 600
+    pos = D(int(fake.position_row["size"]))
+    assert t.settle_unknown(SYM, cid, pos_before=pos, since_ms=since, known_order_ids=known).status == "NOT_FOUND"
+    assert t.settle_unknown(SYM, cid, pos_before=None, since_ms=since, known_order_ids=known).status == "NOT_FOUND"
+    # чужая сделка в окне или список не прочитан — исход неизвестен
+    fake.trades.append({"id": 99999, "create_time": fake.clock_s, "contract": SYM, "order_id": "4242", "size": -5,
+                        "price": "0.002", "role": "taker", "text": "t-other", "fee": "0.01"})
+    assert t.settle_unknown(SYM, cid, pos_before=None, since_ms=since, known_order_ids=known).status == "UNKNOWN"
+    fake.trades.pop()
+    fake.list_reply = (503, {"label": "SERVER_ERROR", "message": "x"})
+    assert t.settle_unknown(SYM, cid, pos_before=pos, since_ms=since, known_order_ids=known).status == "UNKNOWN"
+    assert fake.n("POST", f"/futures/{gt.SETTLE}/orders") == 2
+
+
+def test_finished_list_pages_back_until_send_time(fake, monkeypatch):
+    monkeypatch.setattr(gt, "ORDERS_PAGE", 2)
+    t = mk(fake, now=lambda: fake.clock_s)
+    since = fake.clock_s * 1000
+    for i in range(5):
+        t.ioc(SYM, "SELL", D(1), D("0.00171"), f"e01-c{i}-a1", False)
+    row, cov = t._finished_by_text(SYM, "t-e01-c0-a1", since - gt.TRADES_SLACK_MS)   # самая старая — 3-я страница
+    assert row is not None and cov
+    assert t._finished_by_text(SYM, "t-none", since - gt.TRADES_SLACK_MS) == (None, True)
+    monkeypatch.setattr(gt, "MAX_PAGES", 1)
+    assert t._finished_by_text(SYM, "t-none", since - gt.TRADES_SLACK_MS) == (None, False)   # не дошли — не доказано
+
+
+@pytest.mark.parametrize("hdr", [str(int(time.time() * 1000) + 3000), str(int(time.time()) + 3), "garbage",
+                                 str(10 ** 15), "nan"])
+def test_429_pause_is_bounded_whatever_header_units(hdr):
+    """P1-2: заголовок сброса в мс (или мусор) не запрещает Gate до перезапуска: пауза в [1, 60] с."""
+    t2 = mk(FakeGate())
+    t2._s.script[("POST", f"/futures/{gt.SETTLE}/orders")] = [
+        (429, {"label": "TOO_BUSY", "message": "slow"}, {"x-gate-ratelimit-reset-timestamp": hdr})]
+    assert t2.ioc(SYM, "SELL", D(100), D("0.002"), "e01-c1-a1", False).status == "UNKNOWN"
+    left = t2.backoff_until - time.time()
+    assert 0 < left <= gt.RATE_MAX_PAUSE_S + 1

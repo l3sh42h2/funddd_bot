@@ -302,6 +302,11 @@ def _venue(v: str | None) -> str:
     return escape(VENUE_LABEL.get(str(v or ""), str(v or "") or DASH))
 
 
+def _stable(c: str | None) -> str:
+    """Стейбл спота сети в текстах: Robinhood — USDG, прочие — USDT (как было)."""
+    return "USDG" if str(c or "").lower() in ("rh", "robinhood") else "USDT"
+
+
 def _native(c: str | None) -> str:
     return escape(NATIVE.get(str(c or ""), "газ"))
 
@@ -400,7 +405,7 @@ def _warn_leverage(ws: list[str], lev: Any, mt: str | None) -> None:
 
 def _warn_unread(ws: list[str], venue: str, stable: Any, native: Any, margin: Any, chain: str | None = "bsc") -> None:
     if stable is None:
-        _add(ws, "Баланс USDT не прочитан")
+        _add(ws, f"Баланс {_stable(chain)} не прочитан")
     if native is None:
         _add(ws, f"Баланс {_native(chain)} не прочитан")
     if margin is None:

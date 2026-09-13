@@ -252,7 +252,10 @@ def _allow_multiplier(cfg, venue: str = VENUE) -> bool:
 
 # --- EVM-связки прежнего движка (спот OKX DEX × перп): сеть и площадка — пары/сделки, а не константы модуля --------
 # (FATCOIN 13.09: okx·robinhood × gate рядом с okx·bsc × aster; путь BSC × Aster — ровно прежний)
-REDUCE_ONLY_CODES = frozenset({"reduce_only", "position_closed", "reduce_out", "REDUCE_ONLY", "REDUCE_ONLY_FAIL"})
+# finish_as Gate (reduce_only/position_closed/reduce_out) и label отказа reduce-only (по докам Gate, живыми не
+# подтверждены — пересмотреть по первым отказам); чужое — perp_rejected, пауза та же
+REDUCE_ONLY_CODES = frozenset({"reduce_only", "position_closed", "reduce_out", "REDUCE_ONLY", "REDUCE_ONLY_FAIL",
+                               "POSITION_EMPTY", "REDUCE_EXCEEDED", "INCREASE_POSITION"})
 
 
 def _chain_tag(chain: str) -> str:
@@ -1921,10 +1924,13 @@ class Engine:
         except OwnerConfigError as e:
             raise Pause("owner", f"owner.toml не прочитан: {e}") from None
         if not run.legs.sim:
-            m = effective_mode(cfg.mode, self.keys_mode or "dry")
+            ch, vn = _deal_cv(run.deal)
+            prof = owner_mod.EVM_PROFILE_OF.get((ch, vn), owner_mod.LEGACY_PROFILE)
+            # режим связки сделки: у старой — общий mode (как было), у другой — её profile_mode (не выше общего)
+            m = effective_mode(cfg.mode if prof == owner_mod.LEGACY_PROFILE else cfg.profile_mode(prof),
+                               self.keys_mode or "dry")
             if m != "live":
                 raise Pause("mode", f"режим {m}: отправки запрещены")
-            ch, vn = _deal_cv(run.deal)
             try:
                 cfg.require_live(vn, ch)
             except OwnerMissing as e:

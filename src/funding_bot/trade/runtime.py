@@ -196,26 +196,47 @@ class EvmGateFactory:
             return loader().profile_mode(RH_GATE), store.is_paused(conns.get())
 
         if sim:
-            perp_pub = self.gate if self.gate is not None else GateTrade(mode_state=mode_state)
+            perp_ro = self.gate if self.gate is not None else self._gate_reader(mode, mode_state)
             spot_ro = OkxEvmSpot(okx, rpc, self.holder, chain=chain, wallet=wallet or "0x" + "0" * 40,
                                  native_usd=native_px)
-            return Legs(SimSpot(spot_ro, native_px=native_px, wallet_known=bool(wallet)), SimPerp(perp_pub), True,
+            return Legs(SimSpot(spot_ro, native_px=native_px, wallet_known=bool(wallet)), SimPerp(perp_ro), True,
                         native_px)
         k = getattr(self.rt, "keys", None)
-        if k is None or getattr(k, "evm", None) is None:
+        evm = getattr(k, "evm", None) if k is not None else None
+        addr = getattr(k, "evm_address", None) if k is not None else None
+        if mode == "live" and evm is None:
             raise RuntimeError("EVM-ключ старой связки не загружен — спот Robinhood подписать нечем")
-        if not wallet or str(k.evm_address).lower() != str(wallet).lower():
+        if not wallet:
+            raise RuntimeError("wallets.rh_gate.evm_address не задан — не собираю")
+        if (evm is not None or addr) and str(addr or "").lower() != str(wallet).lower():
             raise RuntimeError("wallets.rh_gate.evm_address не совпадает с адресом EVM-ключа (DEX_EVM_KEY) — не собираю")
         perp = self.gate if self.gate is not None else GateTrade.from_env(mode_state, self.environ)
+        clock = getattr(perp, "check_clock", None)
+        if callable(clock):
+            clock()                              # часы расходятся с Gate — связка не собирается (как у Aster на старте)
+        sender = None
+        if evm is not None:                      # readonly без EVM-ключа — ноги только для чтения (как build_runtime)
 
-        def gate(in_flight: bool) -> None:
-            k.gate(loader().profile_mode(RH_GATE), "send", paused=store.is_paused(conns.get()), hedge=in_flight)
+            def gate(in_flight: bool) -> None:
+                k.gate(loader().profile_mode(RH_GATE), "send", paused=store.is_paused(conns.get()), hedge=in_flight)
 
-        sender = EvmWallet(rpc, tconfig.CHAIN_IDS[chain], k.evm, lambda row: store.dex_tx_signed(conns.get(), **row),
-                           gate=gate, on_sent=lambda h: store.dex_tx_sent(conns.get(), h),
-                           on_resolved=lambda h, st, info: store.dex_tx_resolve(conns.get(), h, st, **info), chain=chain)
+            sender = EvmWallet(rpc, tconfig.CHAIN_IDS[chain], evm, lambda row: store.dex_tx_signed(conns.get(), **row),
+                               gate=gate, on_sent=lambda h: store.dex_tx_sent(conns.get(), h),
+                               on_resolved=lambda h, st, info: store.dex_tx_resolve(conns.get(), h, st, **info),
+                               chain=chain)
         spot = OkxEvmSpot(okx, rpc, self.holder, chain=chain, wallet=wallet, sender=sender, native_usd=native_px)
-        return Legs(spot, perp, False, native_px, can_send=mode == "live")
+        return Legs(spot, perp, False, native_px, can_send=mode == "live" and sender is not None)
+
+    def _gate_reader(self, mode: str, mode_state):
+        """Нога Gate под симуляцию: в readonly/live — с ключами (подписанные чтения: маржа, позиция), как у BSC
+        AsterTrade.from_keys; ключей нет или dry — только публичное."""
+        from .gate_trade import GateTrade
+        if mode != "dry":
+            try:
+                return GateTrade.from_env(mode_state, self.environ)
+            except Exception as e:             # noqa — без ключей симуляция всё равно строится, маржа «не прочитана»
+                log.warning("Gate без ключей для симуляции: %s", redact(e))
+        return GateTrade(mode_state=mode_state)
 
 
 class SolFactory:

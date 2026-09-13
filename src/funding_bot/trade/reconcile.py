@@ -268,7 +268,9 @@ def resolve_orders(con, deal: dict, legs: Legs) -> list[str]:
             store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=getattr(perp, "last_error", None))
         if f.status == "NOT_FOUND" and fn is not None:
             store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED,
-                                    err="-2013 трижды, позиция и сделки неизменны — не выставлена (сверка)")
+                                    err=("-2013 трижды, позиция и сделки неизменны — не выставлена (сверка)"
+                                         if getattr(perp, "venue", "aster") == "aster" else
+                                         "нет ни в заявках, ни в сделках, позиция неизменна — не выставлена (сверка)"))
             store.event(con, "reconcile_order", deal_id=deal["id"], cid=cid, status="NOT_PLACED")
             continue
         out.append(f"заявка {cid}: исход неизвестен")

@@ -67,7 +67,7 @@ keys.SignerKey у Aster); при загрузке регистрируется �
 Оценка модуля Gate (12.09, тестировщик funding_bot): рейтинг C.
 """
 from __future__ import annotations
-import hashlib, hmac, json, logging, os, re, time
+import math, hashlib, hmac, json, logging, os, re, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Callable
 from urllib.parse import quote as _urlquote
@@ -95,6 +95,7 @@ CLOCK_SKEW_MAX_S = 5.0               # наш запас; сервер по до
 RATE_SOFT_READ = 0.70                # как config.WEIGHT_SOFT_LIMIT — общий порог проекта
 RATE_SOFT_ORDER = 0.95               # путь заявки (ioc/query/position/settle) — до 95 %
 RATE_MIN_PAUSE_S = 1.0
+RATE_MAX_PAUSE_S = 60.0              # потолок паузы после 429 при любых единицах заголовка (ревью Fable 14.09, P1-2)
 FILTERS_TTL_S = 3600
 CID_RE = re.compile(r"^[0-9A-Za-z_.\-]{1,28}$")      # доки: text — "t-" + ≤28 байт, 0-9A-Za-z_-.
 TEXT_PREFIX = "t-"
@@ -104,7 +105,7 @@ UNKNOWN_QUERIES = 3
 UNKNOWN_SPAN_S = 5.0
 TEXT_ID_WINDOW_S = 60                # доки: text-id ищется в стакане/≤60 с после финиша [D]
 TEXT_ID_SAFE_MS = 45_000             # наш запас под RTT/дрейф — меньше документированных 60 с
-RECENT_TRADES_CHECK = 50             # my_trades не умеет startTime — берём последнюю страницу и фильтруем по create_time
+ORDERS_PAGE = 100                    # страница списка завершённых заявок (settle_unknown: поиск по text)
 TRADES_SLACK_MS = 5_000              # окно settle_unknown вокруг since_ms — как TRADES_SLACK_MS у Aster
 
 # доки/поиск 13.09: полный список finish_as — filled/cancelled/liquidated/ioc/auto_deleveraged/reduce_only/
@@ -173,6 +174,21 @@ def _d(x: Any) -> Decimal:
         return Decimal(str(x))
     except (InvalidOperation, ValueError):
         raise GateError(f"не число: {x!r}") from None
+
+
+def _reset_pause(header: Any, now_s: float) -> float:
+    """Пауза после 429 по X-Gate-RateLimit-Reset-Timestamp. Единицам не доверяем (секунды или мс: больше 10¹¹ —
+    мс) и пауза всегда в [RATE_MIN_PAUSE_S, RATE_MAX_PAUSE_S]: иначе один 429 с заголовком в мс запрещал бы все
+    вызовы Gate — и хедж уже купленной ноги — до перезапуска службы (ревью Fable 14.09, P1-2)."""
+    try:
+        v = float(header)
+    except (TypeError, ValueError):
+        return RATE_MIN_PAUSE_S
+    if not math.isfinite(v):
+        return RATE_MIN_PAUSE_S
+    if v > 1e11:
+        v /= 1000.0
+    return min(max(v - now_s + 1.0, RATE_MIN_PAUSE_S), RATE_MAX_PAUSE_S)
 
 
 def _ms(x: Any) -> int:
@@ -351,11 +367,8 @@ class GateTrade:
         status = int(r.status_code)
         if status == 429:
             self.n_429 += 1
-            try:
-                reset = float(r.headers.get("x-gate-ratelimit-reset-timestamp")) - self._now() + 1.0
-            except (TypeError, ValueError):
-                reset = 0.0
-            self.backoff_until = self._now() + max(reset, RATE_MIN_PAUSE_S)
+            now = self._now()
+            self.backoff_until = now + _reset_pause(r.headers.get("x-gate-ratelimit-reset-timestamp"), now)
         try:
             body = json.loads(r.content, parse_float=Decimal) if r.content else {}
         except ValueError:
@@ -760,44 +773,113 @@ class GateTrade:
                 last = g
         if not_found < n:
             return last or _pf(client_id, "UNKNOWN")
-        if self._now() * 1000 - since_ms > TEXT_ID_SAFE_MS:
-            log.warning("gate %s: 404 ×%d, но с отправки прошло больше безопасного окна text-id (%d мс, доки — "
-                        "%d с) — исход неизвестен, а не «не выставлена»", client_id, n, TEXT_ID_SAFE_MS, TEXT_ID_WINDOW_S)
-            return _pf(client_id, "UNKNOWN", code=NOT_FOUND_LABEL)
+        # 404 ×n. По text Gate ищет заявку только в стакане и ≤60 с после финиша (доки) — позже 404 ничего не
+        # доказывает, и прежняя проверка оставляла заявку UNKNOWN навсегда: голая нога, которую бот не дохеджирует
+        # (ревью Fable 14.09, P1-1). Исход — по спискам, где text остаётся: завершённые заявки контракта (нашли —
+        # это и есть итог) и my_trades окна (исполнения без строки сделки не бывает). «Не выставлена» — только если
+        # оба списка покрыли окно с отправки, заявки в них нет, чужих сделок в окне нет и позиция (если известна)
+        # не сдвинулась. Иначе UNKNOWN; повторной отправки нет никогда.
         unknown = _pf(client_id, "UNKNOWN", code=NOT_FOUND_LABEL)
-        if pos_before is None:
-            return unknown
-        pos = self.position(symbol)
-        if pos is None or pos != pos_before:
-            log.warning("gate %s: 404 ×%d, но позиция %s ≠ %s — исход неизвестен", client_id, n, pos, pos_before)
-            return unknown
+        text = f"{TEXT_PREFIX}{client_id}"
+        cutoff = since_ms - TRADES_SLACK_MS
         try:
-            st, body, _ = self.call("GET", f"/futures/{self.SETTLE}/my_trades",
-                                    params={"contract": symbol, "limit": RECENT_TRADES_CHECK}, critical=True)
+            row, covered = self._finished_by_text(symbol, text, cutoff)
+            if row is not None:
+                return order_to_fill(client_id, row, 0, self._m(symbol))
+            if not covered:
+                log.warning("gate %s: 404 ×%d, список завершённых заявок не дошёл до отправки — исход неизвестен",
+                            client_id, n)
+                return unknown
+            if pos_before is not None:
+                pos = self.position(symbol)
+                if pos is None or pos != pos_before:
+                    log.warning("gate %s: 404 ×%d, но позиция %s ≠ %s — исход неизвестен", client_id, n, pos, pos_before)
+                    return unknown
+            trades, t_covered = self._trades_since(symbol, cutoff)
         except ModeForbidden:
             raise
-        except Exception:
+        except Exception as e:                 # noqa — список не прочитан: исход неизвестен, ничего не меняем
+            self.last_error = f"{type(e).__name__}: {e}"[:200]
             return unknown
-        if _is_error(st) or not isinstance(body, list):
+        if not t_covered:
+            log.warning("gate %s: 404 ×%d, my_trades не дошли до отправки — исход неизвестен", client_id, n)
             return unknown
         known = {int(x) for x in known_order_ids}
-        cutoff = since_ms - TRADES_SLACK_MS
         foreign = []
-        for t in body:
-            if not isinstance(t, dict):
-                continue
+        for t in trades:
             try:
                 oid = int(t["order_id"]) if t.get("order_id") is not None else None
-                ts_ms = _ms(t.get("create_time", 0))
-            except (GateError, TypeError, ValueError):
-                foreign.append(t); continue        # мусорная строка — не доказано, считаем «есть чужая»
-            if ts_ms >= cutoff and (oid is None or oid not in known):
+            except (TypeError, ValueError):
+                oid = None
+            if oid is None or oid not in known or str(t.get("text") or "") == text:
                 foreign.append(t)
         if foreign:
             log.warning("gate %s: 404 ×%d, но в my_trades %d новых сделок в окне — исход неизвестен",
                         client_id, n, len(foreign))
             return unknown
         return _pf(client_id, "NOT_FOUND", code=NOT_FOUND_LABEL)
+
+    def _finished_by_text(self, symbol: str, text: str, cutoff_ms: int) -> tuple[dict | None, bool]:
+        """(заявка с этим text или None, покрыт ли список до cutoff_ms). Список завершённых заявок контракта — новые
+        первыми, страницами по offset; text в нём остаётся и после окна text-id. Не покрыт (упёрлись в MAX_PAGES) —
+        отсутствие ничего не доказывает."""
+        offset = 0
+        for _ in range(MAX_PAGES):
+            body = self._signed_ok("GET", f"/futures/{self.SETTLE}/orders",
+                                   {"contract": symbol, "status": "finished", "limit": ORDERS_PAGE, "offset": offset},
+                                   "orders finished", critical=True)
+            if not isinstance(body, list):
+                raise GateError("orders: не список")
+            oldest = None
+            for o in body:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("text") or "") == text:
+                    return o, True
+                try:
+                    ts = _ms(o.get("create_time", 0))
+                except (GateError, TypeError, ValueError):
+                    continue
+                oldest = ts if oldest is None else min(oldest, ts)
+            if len(body) < ORDERS_PAGE or (oldest is not None and oldest < cutoff_ms):
+                return None, True
+            offset += len(body)
+        return None, False
+
+    def _trades_since(self, symbol: str, cutoff_ms: int) -> tuple[list[dict], bool]:
+        """(строки my_trades не старше cutoff_ms, покрыто ли окно). Листание назад по last_id (как fills());
+        строка с нечитаемым временем — в окне (считается «чужой», а не пропускается)."""
+        out: list[dict] = []
+        lid: int | None = None
+        for _ in range(MAX_PAGES):
+            params = {"contract": symbol, "limit": PAGE_LIMIT}
+            if lid is not None:
+                params["last_id"] = str(lid)
+            body = self._signed_ok("GET", f"/futures/{self.SETTLE}/my_trades", params, "my_trades", critical=True)
+            if not isinstance(body, list):
+                raise GateError("my_trades: не список")
+            oldest, ids = None, []
+            for t in body:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    ts = _ms(t.get("create_time", 0))
+                except (GateError, TypeError, ValueError):
+                    out.append(t)
+                    continue
+                oldest = ts if oldest is None else min(oldest, ts)
+                if ts >= cutoff_ms:
+                    out.append(t)
+                try:
+                    ids.append(int(t["id"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if len(body) < PAGE_LIMIT or (oldest is not None and oldest < cutoff_ms):
+                return out, True
+            if not ids:
+                return out, False
+            lid = min(ids)
+        return out, False
 
     # --- учёт ------------------------------------------------------------------------------------
     def _trade_row(self, symbol: str, t: dict, m: Decimal) -> dict:
