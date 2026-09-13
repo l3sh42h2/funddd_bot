@@ -4,7 +4,8 @@
 Task: сделка владельца FATCOIN 13.09 («gate+robinhood», «делай»; владелец назначил Claude)
 Исходная база: claude/fatcoin 1f2579b = cb00a77 (выкачено 13.09) + модули Gate/Robinhood (0dadaa1)
 Исполнитель: Claude (Opus xhigh). Ревьюер: Fable max (агент, уровень 5 по vps/CLAUDE.md). Ветка: claude/fatcoin.
-Статус: review — правки по проверке Fable на перепроверке; выкат после неё (связка выключена). Обновлено: 14.09.2026.
+Статус: deployed — установлен 288dea1 (13.09 21:57:50 UTC, deploy.sh exit 0, strict), связка выключена.
+Перепроверка Fable правок: P0/P1 нет. Обновлено: 14.09.2026.
 Совместимость с выкатом Codex: в ветку влит codex/hl-account-case 5952247 (установлен на VPS 13.09 21:10 UTC).
 
 ## Проблема и результат
@@ -73,3 +74,11 @@ FATCOIN_USDT, контракт = 100 токенов (quanto_multiplier), фан�
 - До первого живого входа (вердикт Fable): readonly-репетиция на VPS (часы, счёт Gate и in_dual_mode, позиция
   FATCOIN_USDT, my_trades/account_book, балансы USDG и ETH); стакан Gate тонкий (лучший бид ≈ $52, 5 уровней ≈ $250) —
   небольшой exec.clip_max_usd (≤ $100) и refill_wait_max_s; план показывает число дочерних и удар до кнопки.
+
+## Выкат (факт)
+Установлен 288dea1 = 177af51 + влитые codex/hl-account-case 5952247 и origin/main (документы) из чистой выгрузки
+коммита. Mac: полный набор зелёный; VPS: 2131 passed, 9 skipped; переключение 13.09 21:57:50 UTC; strict: трейдер
+active, рестартов 0. md5 engine/gate_trade/instruments/runtime на VPS = 288dea1. DQA9Q OPEN, намерений в работе нет.
+Readonly-репетиция RH × Gate (VPS, только чтение): часы +0.45 с; Gate available 2563 USDT, in_dual_mode false;
+m = 100, тик 0.001, шаг 1; биды 5 уровней ≈ $485; список завершённых заявок — 100 строк на limit=100, новые
+первыми, text есть; account_book.id есть; кошелёк 4663: USDG 451.95, ETH 0.0052.
