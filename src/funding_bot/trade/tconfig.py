@@ -66,6 +66,7 @@ CHAIN_IDS = {"bsc": 56, "robinhood": 4663}
 # Нативный газ сети — только для текста гардов и отчёта (расчёты везде в wei, от сети не зависят): BSC — BNB,
 # Robinhood Chain — ETH (docs.robinhood.com/chain: L1 — Ethereum, газ в ETH; eth_getBalance ноги той же цепи).
 NATIVE_SYMBOL = {"bsc": "BNB", "robinhood": "ETH"}
+STABLE_SYMBOL = {"bsc": "USDT", "robinhood": "USDG"}   # стейбл сети из config.OKX_DEX_STABLES (4663 — USDG, 6 знаков)
 ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 SEL_BALANCE_OF = "0x70a08231"
 SEL_ALLOWANCE = "0xdd62ed3e"
@@ -116,41 +117,37 @@ def robinhood_rpc_urls(environ=None) -> tuple[str, ...]:
 # Адреса берутся из каждого ответа API, а НЕ отсюда; здесь — только список допустимых. Роутер OKX менялся 30.03 и
 # 04.08.2026 («update whitelist»): незнакомый роутер или spender = стоп и отчёт владельцу, а не молчаливое «принять».
 # Ключ — chainIndex OKX (как config.OKX_DEX_STABLES); адреса в нижнем регистре.
-# Robinhood Chain (4663) здесь НЕТ ЗАПИСИ — оставлено пустым намеренно, не забыто: web3.okx.com и www.okx.com
-# 13.09.2026 не отвечают с этой машины (TLS-хендшейк рвётся ещё до ответа — тот же периметр, что и раньше пускал
-# живые запросы только с VPS, см. шапку okxdex.py, здесь — не VPS), а публичный репозиторий OKX
-# github.com/okxlabs/DEX-Router-EVM-V1 (DEPLOYMENT.md) сеть 4663 не перечисляет вовсе и даже для BSC называет
-# ДРУГИЕ роутер/spender, чем увиденные вживую 12.09 здесь (0x3156…54a0 / 0xd99c…eE98 против 0x5994…4dec /
-# 0x2c34…7cDD6) — то есть другой продукт/версия контракта, как источник для 4663 не годится. Пустой allowlist
-# делает router_allowed/spender_allowed False для ЛЮБОГО адреса на этой сети; evm_swap.check_swap/check_approve
-# отличают это отдельным текстом «не подтверждён» (см. tconfig.router_confirmed/spender_confirmed) от «OKX сменила
-# роутер», и отказывают в отправке. Снять адреса — живым /swap и /approve-transaction с ключом (doctor на VPS),
-# затем владелец подтверждает и они добавляются сюда — так же, как были добавлены для BSC.
-OKX_ROUTERS = {"56": frozenset({"0x5994814f2c4040b863a0125a45de152a8c2a4dec"})}
-OKX_SPENDERS = {"56": frozenset({"0x2c34a2fb1d0b4f55de51e1d0bdefaddce6b7cdd6"})}   # TokenApprove; старый 0x6015…ffaba8 — 0 событий
+# Robinhood Chain (4663) — сняты 13.09.2026 живыми /swap (покупка и продажа FATCOIN за USDG) и /approve-transaction
+# с ключом OKX на VPS (только чтение: ответ — неподписанные данные транзакции, ничего не подписано и не отправлено):
+# роутер 0x6e2a…6919 в обе стороны, метод тот же dagSwapByOrderId (decode_dag_swap разбирает), spender 0x4217…f53d
+# у обоих токенов; у обоих адресов в сети есть код (eth_getCode: 13322 и 1605 байт). У 4663 роутер и spender свои
+# (другой деплой, чем у BSC). Незнакомый адрес на 4663 теперь — «OKX сменила», как у BSC: стоп и отчёт владельцу.
+OKX_ROUTERS = {"56": frozenset({"0x5994814f2c4040b863a0125a45de152a8c2a4dec"}),
+               "4663": frozenset({"0x6e2a35a7ad683cf634d91492d73bb7ff774c6919"})}
+OKX_SPENDERS = {"56": frozenset({"0x2c34a2fb1d0b4f55de51e1d0bdefaddce6b7cdd6"}),   # TokenApprove; старый 0x6015…ffaba8 — 0 событий
+                "4663": frozenset({"0x42170295f1173c9e5874ea9d00c6d137e1a4f53d"})}
 # calldata роутера: dagSwapByOrderId(uint256 orderId, BaseRequest, RouterPath[]) — единственный метод во всех живых
 # ответах /swap 12.09 (8 монет BSC; покупка и продажа; 0.5 % и 3 %; сверено по 4byte и разбором). Получатель у
 # него — msg.sender. Другой метод — стоп и отчёт, а не «принять».
 SEL_DAG_SWAP = "0xf2c42696"
 DAG_SWAP_TYPES = ("uint256", "(uint256,address,uint256,uint256,uint256)",
                   "(address[],address[],uint256[],bytes[],uint256)[]")
-# Селектор/ABI — общий на все сети (не per-chain словарь): для 4663 НЕ подтверждён тем же способом, что и роутер
-# (доки OKX недоступны — см. выше), но отдельно это неопасно — decode_dag_swap уже отказывает («selector») на любой
-# незнакомый метод, а до calldata дело и не дойдёт: router_allowed откажет раньше (allowlist 4663 пуст).
+# Селектор/ABI — общий на все сети (не per-chain словарь): для 4663 подтверждён 13.09 теми же живыми /swap (покупка
+# и продажа FATCOIN): метод 0xf2c42696, decode_dag_swap разбирает calldata.
 # Хвост calldata после ABI (роутер читает его с конца) — «trim» OKX, 64 байта во всех живых ответах: слово 1 = флаг +
 # 0x80 + ожидаемый выход (= toTokenAmount), слово 2 = флаг + доля + получатель. Доля берётся только с выхода СВЕРХ
 # ожидаемого. Иное в хвосте (например, флаги комиссии 0x3ca20afc2aaa/…2bbb на чужой адрес) — стоп.
 OKX_TRIM_FLAG = "777777771111"
 OKX_TRIM_RATE_MAX = 100                 # увиденная вживую доля; больше — стоп
-# 4663 здесь тоже нет записи — та же причина, что у OKX_ROUTERS/OKX_SPENDERS выше; на практике до этой проверки
-# своп 4663 не доходит (router_allowed отказывает раньше), запись — для полноты и будущего doctor-скрипта.
-OKX_TRIM_RECEIVERS = {"56": frozenset({"0xfa00a9ed787f3793db668bff3e6e6e7db0f92a1b"})}
+# 4663 — тот же получатель и та же доля (100), что у BSC: хвост обоих живых ответов /swap 13.09.
+OKX_TRIM_RECEIVERS = {"56": frozenset({"0xfa00a9ed787f3793db668bff3e6e6e7db0f92a1b"}),
+                      "4663": frozenset({"0xfa00a9ed787f3793db668bff3e6e6e7db0f92a1b"})}
 
 
 # Имена сетей (ТЗ SOL×HL 13.09): разбор команд и строка таблицы пишут «sol» (dexleg.TAG), коллектор и OKX —
 # «solana». Синоним нормализует только ИМЯ сети, адресов не касается (base58 Solana регистрозависим). chainIndex
 # 501 — id сети у OKX, а не наш: сама сеть сверяется по getGenesisHash (trade/instruments.py).
-CHAIN_ALIASES = {"sol": "solana"}
+CHAIN_ALIASES = {"sol": "solana", "rh": "robinhood"}   # «okx·rh» из команды/таблицы (dexleg.TAG) → robinhood
 
 
 def canonical_chain(chain: str) -> str:

@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Callable, Mapping
 from .keys import redact
-from .owner import LEGACY_PROFILE, SOL_HL
+from .owner import EVM_PROFILE_OF, LEGACY_PROFILE, RH_GATE, SOL_HL
 
 log = logging.getLogger(__name__)
 D = Decimal
@@ -43,7 +43,9 @@ def profile_of_deal(deal: Mapping) -> str:
         return p
     if str(d.get("chain") or "").strip().lower() in SOL_CHAINS:
         return SOL_HL
-    return LEGACY_PROFILE
+    # EVM-связки (спот OKX DEX × перп): связка — по (сеть, площадка перпа) сделки; прочее — bsc_okx_aster, как раньше
+    return EVM_PROFILE_OF.get((str(d.get("chain") or "").strip().lower(), str(d.get("perp_venue") or "").strip().lower()),
+                              LEGACY_PROFILE)
 
 
 def is_sol_deal(deal: Mapping) -> bool:
@@ -134,15 +136,88 @@ class RuntimeRegistry:
 def legs_of(legs_fn: Any, deal: Mapping):
     """Ноги сделки для вызывающих со старым legs(sim): BSC-сделка — ровно legs_fn(sim), как раньше; сделка другой
     связки — только через реестр (без него — None: «не сверена», а не ноги BSC для чужой сделки)."""
-    if not is_sol_deal(deal):
+    prof = profile_of_deal(deal)
+    if prof == LEGACY_PROFILE:
         return legs_fn(bool(dict(deal)["sim"]))
-    fn = getattr(legs_fn, "for_deal", None)
+    fn = getattr(legs_fn, "for_deal", None)   # сделка другой связки (SOL/HL, Robinhood × Gate) — ноги BSC ей не даём
     if fn is None:
-        raise ProfileDown(SOL_HL, "связка не подключена в этом процессе")
+        raise ProfileDown(prof, "связка не подключена в этом процессе")
     return fn(deal)
 
 
 # --- боевая сборка ног SOL × HL ---------------------------------------------------------------------------------
+class EvmGateFactory:
+    """Ноги связки rh_okx_gate (спот OKX DEX в сети Robinhood × перп Gate, FATCOIN 13.09) для RuntimeRegistry, лениво.
+    Спот подписывает тот же EVM-ключ, что BSC (адрес = wallets.rh_gate.evm_address): ключ берётся у уже собранной старой
+    связки — keys.load второй раз не вызывается (он стирает секреты из окружения); без него боевых ног нет. Перп —
+    Gate (GATE_API_KEY/GATE_API_SECRET). Режим — меньший из режима связки и режима, в котором загружены ключи."""
+
+    def __init__(self, owner_loader: Callable[[], Any], conns, holder, legacy_rt, *, environ=None, okx=None, rpc=None,
+                 gate=None):
+        self.owner_loader, self.conns, self.holder, self.rt = owner_loader, conns, holder, legacy_rt
+        self.environ, self.okx, self.rpc, self.gate = environ, okx, rpc, gate
+        self._lock = threading.Lock()
+        self._built: dict[bool, Any] = {}
+
+    def _mode(self, cfg) -> str:
+        from .keys import effective_mode
+        rt_mode = self.rt.mode if (self.rt is not None and getattr(self.rt, "keys", None) is not None) else "dry"
+        return effective_mode(cfg.profile_mode(RH_GATE), rt_mode)
+
+    def __call__(self, sim: bool):
+        cfg = self.owner_loader()
+        mode = self._mode(cfg)
+        if not sim and mode == "dry":
+            return None                  # боевых ног в dry нет (как legs(False) у BSC)
+        with self._lock:
+            if sim in self._built:
+                return self._built[sim]
+        legs = self._build(cfg, sim, mode)
+        with self._lock:
+            self._built[sim] = legs
+        return legs
+
+    def _build(self, cfg, sim: bool, mode: str):
+        from ..okxdex import OkxDex
+        from . import store, tconfig
+        from .engine import Legs, NativePrice
+        from .evm import EvmRpc, EvmWallet
+        from .evm_swap import OkxEvmSpot
+        from .gate_trade import GateTrade
+        from .sim import SimPerp, SimSpot
+        chain = "robinhood"
+        okx = self.okx if self.okx is not None else OkxDex()
+        rpc = self.rpc if self.rpc is not None else EvmRpc(tconfig.rpc_urls(chain, self.environ))
+        native_px = NativePrice(okx, tconfig.chain_index(chain))
+        wallet = cfg.get("wallets.rh_gate.evm_address")
+        loader, conns = self.owner_loader, self.conns
+
+        def mode_state():
+            return loader().profile_mode(RH_GATE), store.is_paused(conns.get())
+
+        if sim:
+            perp_pub = self.gate if self.gate is not None else GateTrade(mode_state=mode_state)
+            spot_ro = OkxEvmSpot(okx, rpc, self.holder, chain=chain, wallet=wallet or "0x" + "0" * 40,
+                                 native_usd=native_px)
+            return Legs(SimSpot(spot_ro, native_px=native_px, wallet_known=bool(wallet)), SimPerp(perp_pub), True,
+                        native_px)
+        k = getattr(self.rt, "keys", None)
+        if k is None or getattr(k, "evm", None) is None:
+            raise RuntimeError("EVM-ключ старой связки не загружен — спот Robinhood подписать нечем")
+        if not wallet or str(k.evm_address).lower() != str(wallet).lower():
+            raise RuntimeError("wallets.rh_gate.evm_address не совпадает с адресом EVM-ключа (DEX_EVM_KEY) — не собираю")
+        perp = self.gate if self.gate is not None else GateTrade.from_env(mode_state, self.environ)
+
+        def gate(in_flight: bool) -> None:
+            k.gate(loader().profile_mode(RH_GATE), "send", paused=store.is_paused(conns.get()), hedge=in_flight)
+
+        sender = EvmWallet(rpc, tconfig.CHAIN_IDS[chain], k.evm, lambda row: store.dex_tx_signed(conns.get(), **row),
+                           gate=gate, on_sent=lambda h: store.dex_tx_sent(conns.get(), h),
+                           on_resolved=lambda h, st, info: store.dex_tx_resolve(conns.get(), h, st, **info), chain=chain)
+        spot = OkxEvmSpot(okx, rpc, self.holder, chain=chain, wallet=wallet, sender=sender, native_usd=native_px)
+        return Legs(spot, perp, False, native_px, can_send=mode == "live")
+
+
 class SolFactory:
     """Ленивая сборка ног связки для RuntimeRegistry. Ключи (readonly/live) грузятся один раз на процесс."""
 

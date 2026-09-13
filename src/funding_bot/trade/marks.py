@@ -498,7 +498,8 @@ def final_mark(con, deal: Mapping, legs, *, now: float) -> Mark:
 def _safe_mark(con, d: Mapping, legs_fn: Callable[[bool], Any], now: float,
                busy: Callable[[], bool] | None = None) -> Mark:
     try:
-        return mark_deal(con, d, legs_fn(bool(d["sim"])), now=now, busy=busy)
+        from .runtime import legs_of          # BSC — ровно legs_fn(sim); иная EVM-связка — её ноги из реестра
+        return mark_deal(con, d, legs_of(legs_fn, d), now=now, busy=busy)
     except Preempted:
         raise
     except Exception as e:                     # noqa — одна сделка не останавливает проход
@@ -533,8 +534,8 @@ def run_pass(con, legs_fn: Callable[[bool], Any], *, now: float,
             if is_sol_deal(d):
                 m = _sol_final(con, d, legs_fn, now)
             else:
-                legs = legs_fn(bool(d["sim"]))
-                m = final_mark(con, d, legs, now=now)
+                from .runtime import legs_of
+                m = final_mark(con, d, legs_of(legs_fn, d), now=now)
         except Exception as e:                 # noqa
             log.warning("итог сделки %s: %s", d["id"], redact(e))
             continue

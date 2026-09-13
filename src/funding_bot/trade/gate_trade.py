@@ -552,6 +552,20 @@ class GateTrade:
         next_ms = int(_d(c.get("funding_next_apply", 0)) * 1000)
         return mark, rate_per_interval, next_ms
 
+    def sigma_1s(self, symbol: str) -> Decimal | None:
+        """σ доходности цены за 1 с по минутным свечам Gate (σ₁ₘ/√60) — та же мера, что engine.sigma_1s у Aster (план
+        оценивает риск голой ноги). Мало свечей — None (неизвестно, а не 0); цена токена или контракта — доходности
+        одинаковы."""
+        rows = self._public(f"/futures/{self.SETTLE}/candlesticks", {"contract": symbol, "interval": "1m", "limit": 61})
+        closes = [_d(r["c"]) for r in rows if isinstance(r, dict) and r.get("c") is not None] \
+            if isinstance(rows, list) else []
+        rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes)) if closes[i - 1] > 0]
+        if len(rets) < 10:
+            return None
+        mean = sum(rets, _D0) / len(rets)
+        var = sum(((x - mean) ** 2 for x in rets), _D0) / (len(rets) - 1)
+        return var.sqrt() / Decimal(60).sqrt()
+
     # --- подписанные чтения ------------------------------------------------------------------------
     def account(self) -> dict:
         body = self._signed_ok("GET", f"/futures/{self.SETTLE}/accounts", None, "accounts")

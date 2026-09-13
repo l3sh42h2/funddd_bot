@@ -43,16 +43,20 @@ def test_chain_index_robinhood():
     assert tconfig.chain_index("ROBINHOOD") == "4663"                   # регистр не важен, как у bsc
 
 
-def test_router_spender_allowlist_empty_for_robinhood_not_forgotten():
-    """4663 — не «забыли добавить», а «нет источника»: router_confirmed/spender_confirmed различают это от
-    обычного случая «нет такого адреса», чтобы evm_swap мог дать другое сообщение (test_rh_swap.py)."""
+def test_router_spender_allowlist_robinhood_captured_live():
+    """4663 — адреса сняты живыми /swap и /approve-transaction 13.09 (VPS, только чтение): свои роутер и spender, не
+    BSC-шные; незнакомый адрес не пропускается ни там, ни там."""
     some_addr = "0x" + "ab" * 20
     assert not tconfig.router_allowed("robinhood", some_addr)
     assert not tconfig.spender_allowed("robinhood", some_addr)
-    assert not tconfig.router_confirmed("robinhood") and not tconfig.spender_confirmed("robinhood")
-    # BSC не задет: allowlist там по-прежнему непуст
+    assert tconfig.router_confirmed("robinhood") and tconfig.spender_confirmed("robinhood")
+    assert tconfig.router_allowed("robinhood", "0x6E2A35A7AD683CF634D91492D73BB7FF774C6919")      # регистр не важен
+    assert tconfig.spender_allowed("robinhood", "0x42170295f1173c9e5874ea9d00c6d137e1a4f53d")
+    assert not tconfig.router_allowed("robinhood", "0x5994814f2c4040b863a0125a45de152a8c2a4dec")  # роутер BSC — не тут
+    # BSC не задет: прежние адреса, роутер 4663 там не пропускается
     assert tconfig.router_confirmed("bsc") and tconfig.spender_confirmed("bsc")
     assert tconfig.router_allowed("bsc", "0x5994814f2c4040b863a0125a45de152a8c2a4dec")
+    assert not tconfig.router_allowed("bsc", "0x6e2a35a7ad683cf634d91492d73bb7ff774c6919")
 
 
 def test_okx_dex_stable_for_robinhood_already_in_config():

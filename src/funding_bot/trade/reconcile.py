@@ -160,8 +160,9 @@ def resolve_wallet_txs(con, spot) -> list[str]:
     if spot is None:
         return []
     wallet = str(getattr(spot, "wallet", "") or "").lower()
+    chain = str(getattr(spot, "chain", "") or "")   # адрес общий у BSC и Robinhood: чек ищем только в сети этой ноги
     groups = con.execute("SELECT DISTINCT chain, wallet, nonce FROM dex_txs WHERE clip_id IS NULL AND wallet=? AND "
-                         "state IN (?,?,?) ORDER BY nonce", (wallet, *UNRESOLVED_TX)).fetchall()
+                         "chain=? AND state IN (?,?,?) ORDER BY nonce", (wallet, chain, *UNRESOLVED_TX)).fetchall()
     return [p for p in (_resolve_nonce(con, spot, g["chain"], g["wallet"], int(g["nonce"]), {}) for g in groups) if p]
 
 
@@ -442,6 +443,7 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
     bf = backfill_instruments(con, now=ts)
     live = legs_fn(False)
     wallet_problems = resolve_wallet_txs(con, live.spot) if live is not None else []
+    wallet_problems += _other_evm_wallet_txs(con, legs_fn)
     ints: dict[str, list[dict]] = {}
     for iid in interrupted:
         it = store.get_intent(con, iid)
@@ -452,7 +454,7 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
         if is_sol_deal(d):                     # связка SOL × HL: свои ноги и сверка (X12); BSC-путь ниже прежний
             out.append(_sol_restart(con, d, legs_fn, ints, ts))
             continue
-        legs = legs_fn(bool(d["sim"]))
+        legs = _evm_legs(legs_fn, d)
         try:
             chk = check_deal(con, d, legs, resolve=True, seed=True)
         except Exception as e:                 # noqa — сверка не удалась — это «не прочитано», а не «совпало»
@@ -470,6 +472,33 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
                     detail=chk.detail, now=ts)
         out.append(DealRestart(deal=d, check=chk, old=d["state"], new=str(new), intents=ints.get(d["id"], [])))
     return StartupReport(interrupted, expired, drafts, out, wallet_problems, bf)
+
+
+def _evm_legs(legs_fn, d: dict):
+    """Ноги EVM-сделки: BSC × Aster — ровно legs_fn(sim), как раньше; иная EVM-связка (Robinhood × Gate) — ноги своей
+    связки через реестр, не собраны — None («не сверена»), но никогда не ноги BSC."""
+    from .owner import LEGACY_PROFILE
+    from .runtime import profile_of_deal
+    if profile_of_deal(d) == LEGACY_PROFILE:
+        return legs_fn(bool(d["sim"]))
+    return _sol_legs(legs_fn, d)[0]
+
+
+def _other_evm_wallet_txs(con, legs_fn) -> list[str]:
+    """Висящие транзакции кошелька (approve) EVM-связок, кроме старой: каждая — боевыми ногами своей сети."""
+    from .owner import EVM_PROFILES, LEGACY_PROFILE
+    out: list[str] = []
+    for prof in EVM_PROFILES:
+        if prof == LEGACY_PROFILE or prof not in (getattr(legs_fn, "factories", None) or {}):
+            continue
+        try:
+            lv = legs_fn.for_profile(prof, False)
+        except ProfileDown as e:
+            log.warning("висящие транзакции связки %s не сверены: %s", prof, redact(e))
+            continue
+        if lv is not None:
+            out += resolve_wallet_txs(con, lv.spot)
+    return out
 
 
 def _sol_legs(legs_fn, d: dict) -> tuple[Any, str | None]:
@@ -534,7 +563,7 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
         if sol:
             legs, down = _sol_legs(legs_fn, d)
         else:
-            legs = legs_fn(bool(d["sim"]))
+            legs = _evm_legs(legs_fn, d)
         if d["id"] == busy_deal:
             chk = DealCheck(d["id"], None, "идёт исполнение — сверю после", deal_book(con, d["id"]))
         else:

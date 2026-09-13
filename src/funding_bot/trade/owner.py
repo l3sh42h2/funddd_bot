@@ -147,7 +147,14 @@ PERP_VENUES = tuple(config.PERP_VENUES)
 # --- схема 2: связка «спот Solana × перп Hyperliquid» (ТЗ SOL×HL 13.09) ---------------------------------------------
 SOL_HL = "sol_best_hyperliquid"
 LEGACY_PROFILE = "bsc_okx_aster"
-PROFILE_IDS = (LEGACY_PROFILE, SOL_HL)
+RH_GATE = "rh_okx_gate"            # спот OKX DEX в сети Robinhood × перп Gate (сделка FATCOIN, владелец 13.09)
+PROFILE_IDS = (LEGACY_PROFILE, SOL_HL, RH_GATE)
+# EVM-связки прежнего движка (спот OKX DEX × перп): профиль ↔ (сеть спота, площадка перпа)
+EVM_PROFILES = {LEGACY_PROFILE: ("bsc", "aster"), RH_GATE: ("robinhood", "gate")}
+EVM_PROFILE_OF = {v: k for k, v in EVM_PROFILES.items()}
+# кошелёк EVM связки: старая — [wallets] bsc (как было); новые — подсекция схемы 2, чтобы замороженная копия
+# настроек сделок BSC не изменилась ни на ключ
+EVM_WALLET_KEY = {"bsc": "wallets.bsc", "robinhood": "wallets.rh_gate.evm_address"}
 SOL_PATHS = ("jupiter_order_v2", "jupiter_build_v2", "okx_solana_v6")
 # ключ OKX общий с коллектором и BSC-трейдером: okxdex.py читает ровно эти имена — второй набор секретов не заводим
 OKX_ENV = {"api_key_env": "OKX_DEX_API_KEY", "api_secret_env": "OKX_DEX_SECRET", "api_passphrase_env": "OKX_DEX_PASSPHRASE"}
@@ -306,8 +313,9 @@ _OBS_SOL = {k: _Spec("bool") for k in ("record_candidate_rejections", "record_so
                                       "emit_state_transition_events")}
 # [группа.имя] — подсекции схемы 2; группа может совпадать со старой секцией ([wallets] и [wallets.sol_hl])
 _GROUPS: dict[str, dict[str, dict[str, _Spec]]] = {
-    "profiles": {SOL_HL: _PROFILE_SOL, LEGACY_PROFILE: {"enabled": _Spec("bool")}},
-    "wallets": {"sol_hl": _WALLETS_SOL_HL},
+    "profiles": {SOL_HL: _PROFILE_SOL, LEGACY_PROFILE: {"enabled": _Spec("bool")},
+                 RH_GATE: {"enabled": _Spec("bool"), "mode": _Spec("enum", words=MODES)}},
+    "wallets": {"sol_hl": _WALLETS_SOL_HL, "rh_gate": {"evm_address": _Spec("addr")}},
     "spot": {"solana": _SPOT_SOLANA},
     "routing": {"solana": _ROUTING_SOLANA},
     "providers": _PROVIDERS,
@@ -648,7 +656,7 @@ class OwnerCfg:
         """Ключи, без которых live-вход/выход отказывает. dry-run показывает live_missing() в плане."""
         if perp_venue not in PERP_VENUES:
             raise KeyError(f"неизвестная площадка перпа: {perp_venue}")
-        wallet = f"wallets.{chain}"
+        wallet = EVM_WALLET_KEY.get(chain, f"wallets.{chain}")
         self._known(wallet)
         keys = ["telegram.owner_id", wallet, *_VENUE_WALLETS.get(perp_venue, ()),
                 "limits.deal_max_usd_per_leg", "limits.daily_loss_stop_usd",   # max_open_deals — не обязателен
@@ -741,14 +749,15 @@ class OwnerCfg:
     def profile_live_missing(self, profile_id: str) -> list[str]:
         """Пустые ключи, без которых связка не идёт в live (порядок — как в схеме)."""
         self._profile(profile_id)
-        if profile_id == LEGACY_PROFILE:
-            return self.live_missing("aster", "bsc")
+        if profile_id in EVM_PROFILES:             # EVM-связки: прежний список ключей по (площадка, сеть)
+            chain, venue = EVM_PROFILES[profile_id]
+            return self.live_missing(venue, chain)
         return self.missing(*self._sol_required())
 
     def profile_unsupported(self, profile_id: str) -> list[str]:
         """Заданное, но не поддержанное первым выпуском — live запрещён с этой причиной (не «поддерживается»)."""
         self._profile(profile_id)
-        if profile_id == LEGACY_PROFILE:
+        if profile_id in EVM_PROFILES:
             return []
         v, out = self.values, []
 

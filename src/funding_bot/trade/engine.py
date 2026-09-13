@@ -188,11 +188,14 @@ def _dn(x: D) -> str:
 
 
 def _symbol_parts(symbol: str) -> tuple[str, str | None]:
-    """«1000BONKUSDT» → («1000BONK», «USDT»); квоты нет — (символ, None)."""
+    """«1000BONKUSDT» → («1000BONK», «USDT»); Gate «FATCOIN_USDT» → («FATCOIN», «USDT»); квоты нет — (символ, None)."""
     s = str(symbol).upper()
     for q in ("USDT", "USDC", "USD"):
         if s.endswith(q) and len(s) > len(q):
-            return s[:-len(q)], q
+            base = s[:-len(q)]
+            if base.endswith("_") and len(base) > 1:    # Gate пишет базу и квоту через «_»; у Aster «_» перед квотой нет
+                base = base[:-1]
+            return base, q
     return s, None
 
 
@@ -206,7 +209,8 @@ def _name_units(coin: str, symbol: str) -> tuple[str, D]:
     return norm, D(int(fac))
 
 
-def unit_refusal(coin: str, symbol: str, *, m: D | None = None, allow_multiplier: bool = False) -> D:
+def unit_refusal(coin: str, symbol: str, *, m: D | None = None, allow_multiplier: bool = False,
+                 venue: str = VENUE) -> D:
     """Ревью 13.09, С1: единицы контракта. Возвращает m — токенов в одном контракте (по бирже, если m передан, иначе по
     имени символа). База символа — другой актив — отказ всегда (разрешение владельца его не снимает); имя символа и
     биржа расходятся — отказ; m ≠ 1 без разрешения владельца (owner.toml [perp.aster] allow_contract_multiplier =
@@ -215,14 +219,16 @@ def unit_refusal(coin: str, symbol: str, *, m: D | None = None, allow_multiplier
     norm, fac = _name_units(coin, symbol)
     if norm != coin.upper():
         raise Refused(v.refused(f"контракт {symbol} — это {norm}, а не {coin}: другой актив, не торгую"))
-    if m is not None and fac != m:
+    # Gate: имя множителя не несёт (FATCOIN_USDT), m — quanto_multiplier биржи (GateTrade.instrument, авторитетно);
+    # множитель, записанный в имени Gate и не равный бирже, — по-прежнему отказ (единицы неоднозначны)
+    if m is not None and fac != m and not (venue == "gate" and fac == 1):
         raise Refused(v.refused(f"контракт {symbol}: имя символа (×{_dn(fac)}) и биржа (×{_dn(m)} {norm} в контракте) "
                                 "расходятся — не торгую"))
     m_eff = fac if m is None else D(m)
     if m_eff != 1 and not allow_multiplier:
         raise Refused(v.refused(f"контракт {symbol} — {_dn(m_eff)} {norm} в одном контракте, а без разрешения "
                                 f"владельца исполнитель торгует только 1 контракт = 1 токен {coin}: не торгую. "
-                                f"Разрешение — owner.toml [perp.{VENUE}] {MULT_KEY} = true"))
+                                f"Разрешение — owner.toml [perp.{venue}] {MULT_KEY} = true"))
     return m_eff
 
 
@@ -238,9 +244,80 @@ def m_known(inst: InstrumentSpec) -> bool:
     return inst.source not in M_UNKNOWN_SOURCES
 
 
-def _allow_multiplier(cfg) -> bool:
-    """Разрешение владельца на контракты с множителем (m ≠ 1): только явное true; пусто или false — нельзя."""
-    return cfg.get(f"perp.{VENUE}.{MULT_KEY}") is True
+def _allow_multiplier(cfg, venue: str = VENUE) -> bool:
+    """Разрешение владельца на контракты с множителем (m ≠ 1): только явное true в [perp.<площадка сделки>]; пусто
+    или false — нельзя."""
+    return cfg.get(f"perp.{venue}.{MULT_KEY}") is True
+
+
+# --- EVM-связки прежнего движка (спот OKX DEX × перп): сеть и площадка — пары/сделки, а не константы модуля --------
+# (FATCOIN 13.09: okx·robinhood × gate рядом с okx·bsc × aster; путь BSC × Aster — ровно прежний)
+REDUCE_ONLY_CODES = frozenset({"reduce_only", "position_closed", "reduce_out", "REDUCE_ONLY", "REDUCE_ONLY_FAIL"})
+
+
+def _chain_tag(chain: str) -> str:
+    """Короткое имя сети в подписях и строках таблицы: robinhood → rh (dexleg.TAG), прочие — как есть."""
+    return {"robinhood": "rh", "solana": "sol"}.get(chain, chain)
+
+
+def _cv(chain: str | None, venue: str | None) -> tuple[str, str]:
+    """(сеть, площадка) канонически; не заданы — прежняя связка BSC × Aster (CHAIN, VENUE)."""
+    c = tconfig.canonical_chain(chain) if chain else CHAIN
+    return c, (str(venue).strip().lower() if venue else VENUE)
+
+
+def _deal_cv(deal: Mapping) -> tuple[str, str]:
+    """(сеть, площадка) EVM-сделки. Пара не из EVM_PROFILES (колонку сделки подменили, сеть неизвестна) — прежняя
+    BSC × Aster, как до связок: такую сделку остановит сверка с замороженным инструментом («расходятся»), а не
+    чужие ключи владельца; ноги другой связки ей не достаются."""
+    d = dict(deal)
+    try:
+        cv = _cv(d.get("chain"), d.get("perp_venue"))
+    except KeyError:
+        return CHAIN, VENUE
+    return cv if cv in owner_mod.EVM_PROFILE_OF else (CHAIN, VENUE)
+
+
+def _cmd_cv(spot_s: str, perp_s: str) -> tuple[str, str]:
+    """(сеть, площадка) команды входа до выбора строки: сеть из «okx·<сеть>»; без сети — сеть связок этого перпа
+    (aster → bsc, gate → robinhood); неизвестная — прежняя BSC (find_pair откажет честно)."""
+    venue = str(perp_s or "").strip().lower() or VENUE
+    chain = str(spot_s or "").partition("·")[2]
+    try:
+        chain = tconfig.canonical_chain(chain) if chain else ""
+    except KeyError:
+        chain = ""
+    if not chain:
+        chains = sorted(c for (c, vn) in owner_mod.EVM_PROFILE_OF if vn == venue)
+        chain = chains[0] if chains else CHAIN
+    return chain, venue
+
+
+def _lim(cfg, deal: Mapping):
+    """Лимиты владельца для площадки и сети сделки (planner.limits_from_owner)."""
+    chain, venue = _deal_cv(deal)
+    return planner.limits_from_owner(cfg, venue, chain)
+
+
+def _live_miss(cfg, deal: Mapping) -> list:
+    chain, venue = _deal_cv(deal)
+    return list(cfg.live_missing(venue, chain))
+
+
+def _profile_legs(legs_fn, profile: str, sim: bool) -> tuple[Any, str | None]:
+    """Ноги НЕ старой EVM-связки — только из реестра (RuntimeRegistry.for_profile). Нет реестра, связка не собрана или
+    в этом режиме боевых ног нет — (None, причина): такой сделке ноги BSC/Aster не достаются никогда."""
+    from .runtime import ProfileDown
+    fn = getattr(legs_fn, "for_profile", None)
+    if fn is None:
+        return None, f"связка {profile} не подключена в этом процессе"
+    try:
+        lg = fn(profile, bool(sim))
+    except ProfileDown as e:
+        return None, f"связка {profile} не собрана: {e.reason}"
+    if lg is None:
+        return None, "ключи live не загружены (mode в owner.toml и перезапуск службы)"
+    return lg, None
 
 
 def _period_of(con, deal_id: str) -> D:
@@ -446,6 +523,13 @@ def intent_txs(con, intent_id: str) -> list[dict]:
 def sigma_1s(perp, symbol: str) -> D | None:
     """σ доходности марка за 1 с по минутным свечам (σ₁ₘ/√60). Нет данных — None: план тогда не оценит риск голой
     ноги и в live откажет (unhedged_usd_max обязателен), в dry — строит без этого ограничения."""
+    own = getattr(perp, "sigma_1s", None) or getattr(getattr(perp, "inner", None), "sigma_1s", None)
+    if callable(own):                          # своя модель σ площадки (Gate: /futures/usdt/candlesticks)
+        try:
+            return own(symbol)
+        except Exception as e:                 # noqa
+            log.warning("σ %s не получена: %s", symbol, redact(e))
+            return None
     if getattr(perp, "venue", None) not in (None, "aster"):
         return None                            # свечи /fapi/v1/klines — только у Aster: у другой площадки модель σ не
         #                                        подключена (SOL×HL §3.2 п.4) — честное «неизвестно», а не 0
@@ -572,6 +656,7 @@ class PairInfo:
     spot_label: str
     ident_ev: str | None = None                 # доказательство identity строки таблицы (в спецификацию инструмента)
     spec: InstrumentSpec | None = None          # спецификация инструмента входа (Desk._instrument, ревью 13.09)
+    venue: str = VENUE                          # площадка перпа пары (EVM-связки: aster | gate)
 
 
 def _views():
@@ -673,6 +758,15 @@ class Desk:
         """Меньший из режима файла и режима загрузки ключей (повышение — только перезапуском)."""
         return effective_mode(cfg.mode, self.keys_mode) if self.keys_mode else "dry"
 
+    def _pair_mode(self, cfg: OwnerCfg, chain: str, venue: str) -> str:
+        """Режим связки пары: BSC × Aster — ровно mode(cfg); иная EVM-связка — меньший из её profile_mode (выключена —
+        не выше readonly) и режима загрузки ключей: общий mode = live не делает живой связку, которую владелец не
+        перевёл в live."""
+        prof = owner_mod.EVM_PROFILE_OF.get((chain, venue), owner_mod.LEGACY_PROFILE)
+        if prof == owner_mod.LEGACY_PROFILE:
+            return self.mode(cfg)
+        return effective_mode(cfg.profile_mode(prof), self.keys_mode) if self.keys_mode else "dry"
+
     def _legs(self, sim: bool) -> Legs:
         lg = self.legs(sim)
         if lg is None:
@@ -680,7 +774,21 @@ class Desk:
                                            "(mode в owner.toml и перезапуск службы)"))
         return lg
 
-    def _common_checks(self, cfg: OwnerCfg, sim: bool, action: str) -> None:
+    def _legs_for(self, chain: str, venue: str, sim: bool) -> Legs:
+        """Ноги EVM-связки пары: BSC × Aster — ровно прежние legs(sim); иные — ноги своей связки из реестра."""
+        prof = owner_mod.EVM_PROFILE_OF.get((chain, venue), owner_mod.LEGACY_PROFILE)
+        if prof == owner_mod.LEGACY_PROFILE:
+            return self._legs(sim)
+        lg, why = _profile_legs(self.legs, prof, sim)
+        if lg is None:
+            raise Refused(_views().refused(f"живую сделку в этом режиме не трогаю: {why}"))
+        return lg
+
+    def _deal_legs(self, deal: Mapping) -> Legs:
+        chain, venue = _deal_cv(deal)
+        return self._legs_for(chain, venue, bool(dict(deal)["sim"]))
+
+    def _common_checks(self, cfg: OwnerCfg, sim: bool, action: str, chain: str = CHAIN, venue: str = VENUE) -> None:
         v = _views()
         con = self.conns.get()
         if store.is_paused(con):
@@ -690,55 +798,64 @@ class Desk:
             raise Refused(v.busy(row[0] if row else None))
         if not sim:
             try:
-                cfg.require_live(VENUE, CHAIN)
+                cfg.require_live(venue, chain)
             except OwnerMissing as e:
                 raise Refused(v.owner_missing(e.keys, action)) from None
 
     def find_pair(self, coin: str, spot: str, perp: str, *, allow_multiplier: bool = False) -> PairInfo:
         v = _views()
         dex, _, chain = spot.partition("·")
+        venue = str(perp).strip().lower()
+        chains = sorted(c for (c, vn) in owner_mod.EVM_PROFILE_OF if vn == venue)   # сети спота связок этого перпа
         if dex == "okx" and not chain:          # «okx dex» без сети (владелец 12.09): сеть — из таблицы, план её назовёт
             names = {ix: name for name, ix in config.OKX_DEX_CHAINS.items()}
             have = sorted({names.get(str(r.get("spot") or "").split(":", 1)[0], "?")
                            for r in (self.table_loader() or {}).get("sf_rows") or []
                            if str(r.get("base") or "").upper() == coin and r.get("spot_ex") == "okxdex"
                            and r.get("perp_ex") == perp})
-            if have and CHAIN not in have:
+            ok = [c for c in have if c in chains]
+            if have and not ok:
                 raise Refused(v.refused(f"{coin} на OKX DEX есть только в сетях: {', '.join(have)} — в фазе 2 "
-                                        f"торгую только okx·{CHAIN}"))
-            chain = CHAIN                       # строк нет вовсе — ниже честный отказ «пары нет в таблице»
-            spot = f"okx·{chain}"
-        if dex != "okx" or chain != CHAIN:
-            raise Refused(v.refused(f"спот {spot}: в фазе 2 пока только okx·{CHAIN}"))
-        if perp != VENUE:
-            raise Refused(v.refused(f"перп {perp}: в фазе 2 пока только {VENUE}"))
-        ci = tconfig.chain_index(CHAIN)
+                                        f"торгую только okx·{_chain_tag(chains[0]) if chains else CHAIN}"))
+            chain = ok[0] if ok else (chains[0] if chains else CHAIN)   # строк нет — ниже честный «пары нет»
+            spot = f"okx·{_chain_tag(chain)}"
+        try:
+            chain = tconfig.canonical_chain(chain) if chain else chain
+        except KeyError:
+            pass                                # неизвестная сеть — отказ ниже
+        if not chains:
+            raise Refused(v.refused(f"перп {perp}: в фазе 2 пока только "
+                                    f"{', '.join(sorted({vn for _c, vn in owner_mod.EVM_PROFILE_OF}))}"))
+        if dex != "okx" or chain not in chains:
+            raise Refused(v.refused(f"спот {spot}: в фазе 2 пока только "
+                                    f"{', '.join('okx·' + _chain_tag(c) for c in chains)}"))
+        ci = tconfig.chain_index(chain)
         tbl = self.table_loader() or {}
         rows = [r for r in tbl.get("sf_rows") or [] if str(r.get("base") or "").upper() == coin
                 and r.get("spot_ex") == "okxdex" and r.get("perp_ex") == perp
                 and str(r.get("spot") or "").startswith(ci + ":")]
         if not rows:
-            raise Refused(v.refused(f"пары {coin} okx·{CHAIN} / {perp} нет в таблице коллектора (table.json)"))
+            raise Refused(v.refused(f"пары {coin} okx·{_chain_tag(chain)} / {perp} нет в таблице коллектора (table.json)"))
         # торгуем только токен, доказанный контрактом для САМОГО перпа: строка, связанная через другую площадку
         # (ident_ev «dex_link:…», 12.09), остаётся на дашборде для просмотра, но не для денег
         proven = [r for r in rows if not r.get("mismatch") and r.get("ident") == "same"
                   and not str(r.get("ident_ev") or "").startswith("dex_link:")]
         if not proven and any(str(r.get("ident_ev") or "").startswith("dex_link:") for r in rows):
-            raise Refused(v.refused(f"токен {coin} на {CHAIN} связан с перпом {perp} только через другую площадку — "
+            raise Refused(v.refused(f"токен {coin} на {chain} связан с перпом {perp} только через другую площадку — "
                                     "для торговли нужно прямое доказательство (контракт в индексе самого перпа)"))
         if not proven:
-            raise Refused(v.refused(f"токен {coin} на {CHAIN} не доказан identity (состав индекса и контракты) — "
+            raise Refused(v.refused(f"токен {coin} на {chain} не доказан identity (состав индекса и контракты) — "
                                     "не торгую"))
-        plain = [r for r in proven if r.get("spot_label") == f"okx·{CHAIN}"] or proven
+        plain = [r for r in proven if r.get("spot_label") == f"okx·{_chain_tag(chain)}"] or proven
         if len({r["spot"] for r in plain}) > 1:
-            raise Refused(v.refused(f"у {coin} несколько токенов на {CHAIN} — какой торговать, решает владелец"))
+            raise Refused(v.refused(f"у {coin} несколько токенов на {chain} — какой торговать, решает владелец"))
         r = plain[0]
         token = str(r["spot"]).split(":", 1)[1].lower()
-        unit_refusal(coin, str(r["perp"]), allow_multiplier=allow_multiplier)   # ранний отказ по имени; m с биржи —
+        unit_refusal(coin, str(r["perp"]), allow_multiplier=allow_multiplier, venue=venue)  # ранний отказ; m с биржи —
         #                                                                         в _instrument
-        return PairInfo(coin=coin, chain=CHAIN, token=token, token_dec=-1, symbol=str(r["perp"]),
+        return PairInfo(coin=coin, chain=chain, token=token, token_dec=-1, symbol=str(r["perp"]),
                         period_h=D(str(r.get("period") or 1)), spot_label=str(r.get("spot_label") or spot),
-                        ident_ev=str(r.get("ident_ev") or "") or None)
+                        ident_ev=str(r.get("ident_ev") or "") or None, venue=venue)
 
     def pair_from(self, inst: InstrumentSpec, deal: Mapping, *, verify_table: bool, spot_s: str | None = None,
                   perp_s: str | None = None, cfg: OwnerCfg | None = None) -> PairInfo:
@@ -752,13 +869,13 @@ class Desk:
         period = inst.period_h or self._period(dict(deal))
         if verify_table:
             tp = self.find_pair(str(deal["coin"]), str(spot_s), str(perp_s),
-                                allow_multiplier=cfg is not None and _allow_multiplier(cfg))
+                                allow_multiplier=cfg is not None and _allow_multiplier(cfg, inst.perp_venue or VENUE))
             _same_identity(str(deal["coin"]), (inst.chain, inst.token.lower(), inst.perp_symbol),
                            (tp.chain, tp.token.lower(), tp.symbol))
             period = tp.period_h              # период фандинга — справка (не идентичность): свежий, как до фазы 1
         return PairInfo(coin=str(deal["coin"]), chain=inst.chain, token=inst.token, token_dec=int(inst.token_dec),
                         symbol=inst.perp_symbol, period_h=period, spot_label=f"okx·{inst.chain}", ident_ev=inst.ident_ev,
-                        spec=inst)
+                        spec=inst, venue=inst.perp_venue or VENUE)
 
     def _token_dec(self, spot, token: str, quotes=()) -> int:
         fn = getattr(spot, "decimals", None)
@@ -805,9 +922,9 @@ class Desk:
         считаются с переносом, как у исполнителя (ревью 13.09, M1)."""
         v = _views()
         cfg = cfg or self.cfg()
-        sim = (self.mode(cfg) != "live") if sim is None else sim
+        sim = (self._pair_mode(cfg, *_cmd_cv(spot_s, perp_s)) != "live") if sim is None else sim
         if write_checks:
-            self._common_checks(cfg, sim, "вход")
+            self._common_checks(cfg, sim, "вход", *_cmd_cv(spot_s, perp_s))
             con = self.conns.get()
             mx = cfg.get("limits.max_open_deals")
             n_open = len(store.active_deals(con))
@@ -819,15 +936,15 @@ class Desk:
             raise Refused(v.refused(f"{v.leg(usd)} больше лимита сделки на ногу {v.leg(cap)} (deal_max_usd_per_leg)"))
         # множитель контракта — только с разрешения владельца (cfg: свежий у предложения, замороженный у перекотировки;
         # исполнитель ещё раз читает свежий в _entry_limits)
-        allow = _allow_multiplier(cfg)
+        allow = _allow_multiplier(cfg, pair.venue if pair is not None else _cmd_cv(spot_s, perp_s)[1])
         frozen = pair.spec if pair is not None else None
         pair = replace(pair) if pair is not None else self.find_pair(coin, spot_s, perp_s, allow_multiplier=allow)
         if write_checks:
             for d in store.active_deals(self.conns.get()):
-                if d["token"] == pair.token or (d["perp_venue"] == perp_s and d["symbol"] == pair.symbol):
+                if d["token"] == pair.token or (d["perp_venue"] == pair.venue and d["symbol"] == pair.symbol):
                     st = v.DEAL_STATE_LABEL.get(d["state"], d["state"])
                     raise Refused(v.refused(f"по {coin} уже есть сделка {d['id']} ({st}) — вход запрещён"))
-        legs = self._legs(sim)
+        legs = self._legs_for(pair.chain, pair.venue, sim)
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(pair.chain)]
         total = int((usd * D(10) ** sdec).to_integral_value(ROUND_FLOOR))
         quotes = self._quotes(legs.spot, stable, pair.token, total)
@@ -848,7 +965,7 @@ class Desk:
                 was, now = frozen.m, pair.spec.m     # биржа сменила контракт (m) после входа — старый план не про него
                 ch = f" (m {_dn(was)} → {_dn(now)})" if was != now else ""
                 raise Refused(v.refused(f"контракт {pair.symbol} на бирже изменился{ch} — нужен новый план"))
-            lim = planner.limits_from_owner(cfg, VENUE, CHAIN)
+            lim = planner.limits_from_owner(cfg, pair.venue, pair.chain)
             plan = planner.plan(deal_id="", kind="entry", coin=coin, spot=spot_s, perp=perp_s, symbol=pair.symbol,
                                 leg_usd=usd, total_in_units=total, dec_in=sdec, calib=calib, mkt=mkt, lim=lim,
                                 now=self.clock(), units_per_contract=pair.spec.m, carry0=carry0)
@@ -868,7 +985,7 @@ class Desk:
         та же монета, множитель — только с разрешения владельца, а цена контракта / m ≈ цене токена на DEX
         (UNIT_PX_RATIO_MAX — единицы, не видные ни в имени, ни в baseAsset). Любое «не знаю» — отказ до свопа."""
         v = _views()
-        venue = v.VENUE_LABEL.get(legs.perp.venue, legs.perp.venue)
+        venue = v.VENUE_LABEL.get(pair.venue, pair.venue)
         fn = getattr(legs.perp, "instrument", None)
         pi, err = None, "нога не отдаёт контракт"
         if fn is not None:
@@ -881,7 +998,7 @@ class Desk:
             raise Refused(v.refused(f"множитель контракта {pair.symbol} на {venue} не известен ({err}) — не торгую"))
         if str(pi.base).upper() != pair.coin.upper():
             raise Refused(v.refused(f"контракт {pair.symbol} — это {pi.base}, а не {pair.coin}: другой актив, не торгую"))
-        m = unit_refusal(pair.coin, pair.symbol, m=pi.m, allow_multiplier=allow)
+        m = unit_refusal(pair.coin, pair.symbol, m=pi.m, allow_multiplier=allow, venue=pair.venue)
         if not bid or not p_ref:
             raise Refused(v.refused(f"цена для сверки единиц {pair.symbol} не получена — не торгую"))
         ratio = (bid / m) / p_ref
@@ -889,7 +1006,7 @@ class Desk:
             raise Refused(v.refused(f"цена {pair.symbol} {v.num(bid / m, 6)} против {v.num(p_ref, 6)} за токен на DEX — "
                                     f"единицы не сходятся (множитель контракта или не тот токен): не торгую"))
         return InstrumentSpec(chain=pair.chain, token=pair.token.lower(), token_dec=int(pair.token_dec),
-                              perp_venue=VENUE, perp_symbol=pair.symbol, units_per_contract=m,
+                              perp_venue=pair.venue, perp_symbol=pair.symbol, units_per_contract=m,
                               perp_base_asset=pi.base_asset, quote_asset=pi.quote_asset, contract_type=pi.contract_type,
                               period_h=pair.period_h, ident_ev=pair.ident_ev, source="exchangeInfo:baseAsset",
                               verified=True, verified_ts=self.clock(), px_ratio=ratio)
@@ -899,14 +1016,16 @@ class Desk:
         """Предпроверки, которые в live — отказ, а в симуляции — заметка в плане."""
         v = _views()
         notes = []
+        vl = v.VENUE_LABEL.get(pair.venue, pair.venue)
+        stn, nat = tconfig.STABLE_SYMBOL.get(pair.chain, "USDT"), tconfig.NATIVE_SYMBOL.get(pair.chain, "BNB")
         st = bal.get("stable")
         if st is None:
-            notes.append("баланс USDT не прочитан")
+            notes.append(f"баланс {stn} не прочитан")
         elif st < total:
-            notes.append(f"USDT в кошельке {v.num(D(st) / D(10) ** sdec)} — меньше {v.leg(usd)} на ногу")
+            notes.append(f"{stn} в кошельке {v.num(D(st) / D(10) ** sdec)} — меньше {v.leg(usd)} на ногу")
         if bal.get("native") is None:
-            notes.append("баланс BNB не прочитан — газ не проверен")
-        lev = cfg.get(f"perp.{VENUE}.leverage")
+            notes.append(f"баланс {nat} не прочитан — газ не проверен")
+        lev = cfg.get(f"perp.{pair.venue}.leverage")
         mg = legs.perp.available_margin()
         # маржа — на заявки плана (Σ кол-во · кэп дочерних: контракты · цена контракта, $), но не меньше суммы на ногу
         # (прежняя мера при m = 1): план с перепутанными единицами (ревью 13.09, С1: ×1000) не пройдёт и здесь
@@ -920,9 +1039,9 @@ class Desk:
             # (технический инвариант в единицах контракта; исполнитель берёт контракты по стакану на факт прихода)
             need = max(need, floor_step(toks / m, step) * max(caps))
         if mg is None:
-            notes.append("маржа Aster не прочитана")
+            notes.append(f"маржа {vl} не прочитана")
         elif lev is not None and mg < need / D(lev):
-            notes.append(f"маржа Aster {v.num(mg)} — меньше {v.num(need / D(lev))} USDT (сумма / плечо {lev}x)")
+            notes.append(f"маржа {vl} {v.num(mg)} — меньше {v.num(need / D(lev))} USDT (сумма / плечо {lev}x)")
         br = getattr(legs.perp, "leverage_bracket", None)
         if not legs.sim and br is not None and lev is not None:
             try:
@@ -1024,11 +1143,11 @@ class Desk:
         cfg = cfg or self.cfg()
         sim = bool(deal["sim"])
         if write_checks:
-            self._common_checks(cfg, sim, "выход")
+            self._common_checks(cfg, sim, "выход", *_deal_cv(deal))
         if deal["state"] not in (DealState.OPEN, DealState.PAUSED):
             st = v.DEAL_STATE_LABEL.get(deal["state"], deal["state"])
             raise Refused(v.refused(f"сделка {deal['id']} {st} — выход не начинаю"))
-        legs = self._legs(sim)
+        legs = self._deal_legs(deal)
         con = self.conns.get()
         dec = int(deal["token_dec"])
         bk = deal_book(con, deal["id"])
@@ -1093,7 +1212,7 @@ class Desk:
             bal = legs.spot.balances(deal["token"])
             approve_usd = ZERO if (sim or _allowance_ok(legs.spot, deal["token"], units)) else calib.g
             mkt = self._market(legs, pair, bal, calib, approve_usd)
-            lim = planner.limits_from_owner(cfg, VENUE, CHAIN)
+            lim = _lim(cfg, deal)
             plan = planner.plan(deal_id=deal["id"], kind="exit", coin=deal["coin"], spot=f"okx·{deal['chain']}",
                                 perp=deal["perp_venue"], symbol=deal["symbol"], leg_usd=D(units) / D(10) ** dec *
                                 calib.p_ref, total_in_units=units, dec_in=dec, calib=calib, mkt=mkt, lim=lim,
@@ -1110,7 +1229,7 @@ class Desk:
     def _plan_perp_only(self, deal, bk: DealBook, f, legs: Legs, cfg, ctx) -> Plan:
         """«выход <id> перп»: откупить весь шорт reduceOnly, спот не трогать (явная команда владельца)."""
         book = legs.perp.book(deal["symbol"], tconfig.ASTER_DEPTH_LIMIT)
-        lim = planner.limits_from_owner(cfg, VENUE, CHAIN)
+        lim = _lim(cfg, deal)
         fee = D(str(config.FEES_TAKER[legs.perp.venue]))
         try:
             pk = planner.pick_perp(book, "BUY", bk.short, f, fee, lim, reduce_only=True)
@@ -1129,7 +1248,7 @@ class Desk:
                     perp=deal["perp_venue"], symbol=deal["symbol"], leg_usd=pc.notional,
                     clips=[ClipPlan(seq=1, dex_in_units=0, children=ch)], est=est,
                     inputs={"book_top": {"mid": mid}, "fee_taker": fee, "size_usd": pc.notional},
-                    missing_owner_keys=list(cfg.live_missing(VENUE, CHAIN)), expires=self.clock() + tconfig.PLAN_TTL_S)
+                    missing_owner_keys=_live_miss(cfg, deal), expires=self.clock() + tconfig.PLAN_TTL_S)
 
     def _plan_blind_exit(self, deal, bk: DealBook, f, legs: Legs, cfg, ctx, units: int) -> Plan:
         """Полный выход сделки, у которой m не известен (ревью 13.09, M3): дельту ног в токенах не посчитать — план её
@@ -1137,7 +1256,7 @@ class Desk:
         журнала (контракты) — BUY reduceOnly. Ни то, ни другое от m не зависит (как «выход перп» и откат)."""
         v = _views()
         dec, stable = int(deal["token_dec"]), ctx["stable"]
-        lim = planner.limits_from_owner(cfg, VENUE, CHAIN)
+        lim = _lim(cfg, deal)
         fee = D(str(config.FEES_TAKER[legs.perp.venue]))
         book = legs.perp.book(deal["symbol"], tconfig.ASTER_DEPTH_LIMIT)
         ch, pc = [], planner.PerpCost(spread=ZERO, fee=ZERO, notional=ZERO)
@@ -1174,7 +1293,7 @@ class Desk:
                     inputs={"calib": calib.as_dict() if calib is not None else {}, "book_top": {"mid": planner.mid(book)},
                             "filters": {"step": f.step, "tick": f.tick}, "fee_taker": fee, "size_usd": S,
                             "r": tconfig.R_PRIOR, "side": "BUY", "reduce_only": True},
-                    missing_owner_keys=list(cfg.live_missing(VENUE, CHAIN)), expires=self.clock() + tconfig.PLAN_TTL_S)
+                    missing_owner_keys=_live_miss(cfg, deal), expires=self.clock() + tconfig.PLAN_TTL_S)
 
     def propose_exit(self, target: str, usd: D | None, perp_only: bool, chat: int | None) -> Proposal:
         deal = self.resolve_deal(target)
@@ -1199,7 +1318,7 @@ class Desk:
     # --- дохедж / откат / продолжить ---
     def _deficit(self, deal: dict) -> tuple[Legs, DealBook, Any, D]:
         v = _views()
-        legs = self._legs(bool(deal["sim"]))
+        legs = self._deal_legs(deal)
         bk = deal_book(self.conns.get(), deal["id"])
         if not bk.known:
             raise Refused(v.refused(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»"))
@@ -1213,7 +1332,7 @@ class Desk:
         deal = self.resolve_deal(target)
         if is_sol_deal(deal):
             return self.sol().propose_fix(kind, deal, chat)
-        self._common_checks(cfg, bool(deal["sim"]), "дохедж" if kind == "rehedge" else "откат")
+        self._common_checks(cfg, bool(deal["sim"]), "дохедж" if kind == "rehedge" else "откат", *_deal_cv(deal))
         if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
             raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
         legs, bk, f, delta = self._deficit(deal)
@@ -1240,7 +1359,8 @@ class Desk:
                 raise Refused(v.refused(f"инструмент сделки {deal['id']} не подтверждён ({bk.inst_why}) — дохедж "
                                         f"продажей запрещён; «откат {deal['id']}» или «выход {deal['id']}»"))
             if side == "SELL" and bk.m != 1:           # продажа контрактов с множителем — только с разрешения (R8)
-                unit_refusal(deal["coin"], deal["symbol"], m=bk.m, allow_multiplier=_allow_multiplier(cfg))
+                vn = _deal_cv(deal)[1]
+                unit_refusal(deal["coin"], deal["symbol"], m=bk.m, venue=vn, allow_multiplier=_allow_multiplier(cfg, vn))
             spec.update(side=side, qty=qty)
             ab = self._fix_ab(legs, deal, f, side, qty, cfg)
         else:
@@ -1252,7 +1372,7 @@ class Desk:
         plan = Plan(deal_id=deal["id"], kind=kind, coin=deal["coin"], spot=f"okx·{deal['chain']}",
                     perp=deal["perp_venue"], symbol=deal["symbol"], leg_usd=(abs(delta) * px / bk.m) if px else ZERO,
                     clips=[], est={"delta": delta, **ab}, inputs={"inst_hash": inst.inst_hash()},
-                    missing_owner_keys=list(cfg.live_missing(VENUE, CHAIN)), expires=self.clock() + tconfig.PLAN_TTL_S)
+                    missing_owner_keys=_live_miss(cfg, deal), expires=self.clock() + tconfig.PLAN_TTL_S)
         con = self.conns.get()
         iid, nonce = store.create_intent(con, deal_id=deal["id"], kind=kind, spec=spec, plan=plan, chat=chat)
         text = v.fix_plan(v.FixPlanView(intent_id=iid, kind=kind, coin=deal["coin"], deal_id=deal["id"], delta=delta,
@@ -1263,7 +1383,7 @@ class Desk:
     def _fix_ab(self, legs: Legs, deal: dict, f, side: str, qty: D, cfg: OwnerCfg) -> dict:
         """α/β дохеджа — в план: исполнитель берёт их оттуда. Числа владельца — как есть (стакан проверит исполнитель,
         как раньше); «auto» — подбор по стакану сейчас, заявки пойдут ровно с ним."""
-        lim = planner.limits_from_owner(cfg, VENUE, CHAIN)
+        lim = _lim(cfg, deal)
         if lim.alpha != planner.AUTO and lim.beta_bps != planner.AUTO:
             return {"alpha": lim.alpha, "beta_bps": lim.beta_bps, "ab_band": False, "alpha_auto": False,
                     "beta_auto": False}
@@ -1284,7 +1404,7 @@ class Desk:
         con = self.conns.get()
         if deal["state"] == DealState.HALTED_MISMATCH:
             from . import reconcile
-            legs = self._legs(bool(deal["sim"]))
+            legs = self._deal_legs(deal)
             chk = reconcile.check_deal(con, deal, legs)
             if chk.matched:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
@@ -1331,7 +1451,7 @@ class Desk:
         v = _views()
         cfg = self.cfg()
         sim = bool(deal["sim"])
-        self._common_checks(cfg, sim, "выход")
+        self._common_checks(cfg, sim, "выход", *_deal_cv(deal))
         con = self.conns.get()
         dec = int(deal["token_dec"])
         clips = store.clips_of(con, last["id"])
@@ -1373,7 +1493,7 @@ class Desk:
             raise Refused(_views().refused(f"инструмент сделки {deal['id']} не подтверждён ({inst.why}) — добор "
                                            f"запрещён; закрыть: «выход {deal['id']}»"))
         cfg = self.cfg()
-        self._common_checks(cfg, bool(deal["sim"]), "вход")
+        self._common_checks(cfg, bool(deal["sim"]), "вход", *_deal_cv(deal))
         # инструмент — замороженный сделки (Н2): таблица только подтверждает, что он не сменился и не отозван
         pair = self.pair_from(inst, deal, verify_table=True, spot_s=spec0["spot"], perp_s=spec0["perp"], cfg=cfg)
         plan, ctx = self.plan_entry(deal["coin"], spec0["spot"], spec0["perp"], usd, cfg=cfg, sim=bool(deal["sim"]),
@@ -1466,7 +1586,7 @@ class Desk:
             deal_id=plan.deal_id, perp_only=perp_only, sim=sim, exit_all=entry or bool(ctx.get("full")),
             req_usd=ctx.get("usd"), deal_leg_usd=dget(deal["leg_usd"]) if deal is not None else ctx.get("deal_leg_usd"),
             resume=bool(ctx.get("resume")), step=dget((inp.get("filters") or {}).get("step")),
-            leverage=cfg.get(f"perp.{VENUE}.leverage"), margin_type=cfg.get(f"perp.{VENUE}.margin_type"),
+            leverage=cfg.get(f"perp.{pair.venue}.leverage"), margin_type=cfg.get(f"perp.{pair.venue}.margin_type"),
             impact_usd=dex_cost, gas_usd_clip=dget(e.get("gas_per_swap_usd")), gas_usd_total=dget(e.get("gas_usd")),
             approve_gas_usd=(dget(e.get("approve_usd")) or None) if e.get("approve_usd") else None,
             native_px=mkt.native_px if mkt is not None else None, total_usd=dget(e.get("total_usd")),
@@ -1676,7 +1796,13 @@ class Engine:
             if deal["state"] == DealState.DRAFT:
                 store.set_deal_state(con, deal["id"], DealState.ABORTED, expect=DealState.DRAFT, reason="не начата")
             return
-        legs = self.legs(bool(deal["sim"]))
+        prof = owner_mod.EVM_PROFILE_OF.get(_deal_cv(deal), owner_mod.LEGACY_PROFILE)
+        if prof == owner_mod.LEGACY_PROFILE:
+            legs = self.legs(bool(deal["sim"]))
+        else:                                  # EVM-связка не BSC/Aster: ноги своей связки, иначе — не начинаем
+            legs, why = _profile_legs(self.legs, prof, bool(deal["sim"]))
+            if legs is None:
+                return self._fail(iid, f"живую сделку в этом режиме не двигаю: {why}")
         if legs is None or (not legs.sim and not legs.can_send):
             return self._fail(iid, "живую сделку в этом режиме не двигаю: ключи live не загружены")
         cfg = OwnerCfg.from_frozen(spec["owner"])
@@ -1798,8 +1924,9 @@ class Engine:
             m = effective_mode(cfg.mode, self.keys_mode or "dry")
             if m != "live":
                 raise Pause("mode", f"режим {m}: отправки запрещены")
+            ch, vn = _deal_cv(run.deal)
             try:
-                cfg.require_live(VENUE, CHAIN)
+                cfg.require_live(vn, ch)
             except OwnerMissing as e:
                 raise Pause("owner_missing", str(e)) from None
             reserve = cfg.get("dex.native_reserve")
@@ -1807,7 +1934,8 @@ class Engine:
                 nat = run.legs.spot.balances(run.token).get("native")
                 if nat is None or D(nat) < reserve * WEI:
                     have = "не прочитан" if nat is None else _views().num(D(nat) / WEI, 4)
-                    raise Pause("native", f"BNB {have} — меньше резерва {_views().num(reserve, 4)}")
+                    raise Pause("native", f"{tconfig.NATIVE_SYMBOL.get(ch, 'BNB')} {have} — меньше резерва "
+                                          f"{_views().num(reserve, 4)}")
         if run.kind == "entry":
             cap = cfg.get("limits.deal_max_usd_per_leg")
             if cap is not None and D(str(run.deal["leg_usd"])) > cap:
@@ -1845,7 +1973,7 @@ class Engine:
         e = run.plan.est or {}
         if "alpha" in e or "beta_bps" in e:
             return dget(e.get("alpha")), dget(e.get("beta_bps")), bool(e.get("ab_band"))
-        lim = planner.limits_from_owner(run.cfg, VENUE, CHAIN)
+        lim = _lim(run.cfg, run.deal)
         if isinstance(lim.alpha, str) or isinstance(lim.beta_bps, str):
             raise Pause("plan_ab", "α/β «auto» не заморожены в плане — исполнение не начинаю, нужна свежая команда")
         return lim.alpha, lim.beta_bps, False
@@ -1876,11 +2004,12 @@ class Engine:
                 raise Pause("inst_unverified", f"{v.m_unknown_text(run.did)} ({bk.inst_why})")
         if position and not run.legs.sim:
             pos = self._position(run)
+            vl = v.VENUE_LABEL.get(run.legs.perp.venue, run.legs.perp.venue)
             if pos is None:
-                raise Pause("position_unknown", "позиция Aster не прочитана — ноги не сверить")
+                raise Pause("position_unknown", f"позиция {vl} не прочитана — ноги не сверить")
             if pos != -bk.short:
                 mv = bk.m_view
-                raise Pause("position_mismatch", f"позиция Aster {v.contracts(pos, mv, True, run.f.step)} ≠ журнал "
+                raise Pause("position_mismatch", f"позиция {vl} {v.contracts(pos, mv, True, run.f.step)} ≠ журнал "
                                                  f"сделки {v.contracts(-bk.short, mv, True, run.f.step)}")
         return bk
 
@@ -1983,7 +2112,8 @@ class Engine:
 
     # --- шаги клипа ---
     def _setup(self, run: Run) -> None:
-        lev, mt = run.cfg.get(f"perp.{VENUE}.leverage"), run.cfg.get(f"perp.{VENUE}.margin_type")
+        vn = _deal_cv(run.deal)[1]
+        lev, mt = run.cfg.get(f"perp.{vn}.leverage"), run.cfg.get(f"perp.{vn}.margin_type")
         if lev is None or mt is None:
             if run.legs.sim:
                 return
@@ -2148,7 +2278,9 @@ class Engine:
                                         known_order_ids=frozenset(known))
                 if s.status == "NOT_FOUND":
                     store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED,
-                                            err="-2013 трижды, позиция и сделки неизменны — не выставлена")
+                                            err=("-2013 трижды, позиция и сделки неизменны — не выставлена"
+                                                 if perp.venue == "aster" else
+                                                 "не найдена, позиция и сделки неизменны — не выставлена"))
                     attempt += 1
                     if attempt > PERP_ATTEMPTS_MAX:
                         raise Pause("perp_unknown", f"заявка не выставляется {PERP_ATTEMPTS_MAX} раза подряд")
@@ -2169,7 +2301,7 @@ class Engine:
                         raise Pause("perp_rejected", "после округления заявка нулевая")
                     attempt += 1
                     continue
-                reason = "reduce_only_reject" if code == -2022 else "perp_rejected"
+                reason = "reduce_only_reject" if (code == -2022 or code in REDUCE_ONLY_CODES) else "perp_rejected"
                 v = _views()                   # владельцу: «Aster −2022», а не «aster -2022» (минус — «−»)
                 c = "?" if code is None else str(code).replace("-", v.MINUS)
                 raise Pause(reason, f"{v.VENUE_LABEL.get(perp.venue, perp.venue)} {c}: "
@@ -2293,8 +2425,8 @@ class Engine:
             mkt = planner.Market(book=book, filters=run.f, fee_taker=D(str(config.FEES_TAKER[perp.venue])),
                                  sigma_1s=sigma_1s(perp, run.symbol),
                                  funding_h=rate / D(str(run.spec.get("period_h") or 1)),
-                                 native_px=run.legs.native_px(), chain=CHAIN)
-            lim = replace(planner.limits_from_owner(run.cfg, VENUE, CHAIN), deal_max_usd=None, alpha=alpha,
+                                 native_px=run.legs.native_px(), chain=_deal_cv(run.deal)[0])
+            lim = replace(_lim(run.cfg, run.deal), deal_max_usd=None, alpha=alpha,
                           beta_bps=beta, ab_band=band)
             d0 = planner.dex_cost(max(run.seq, 1), to_usd(done), calib.k, calib.g, r, calib.c0).d_end \
                 if done > 0 else ZERO
@@ -2369,9 +2501,10 @@ class Engine:
         inst = deal_instrument(self.conns.get(), run.deal)
         if not inst.verified:                  # одобрено раньше, а m сделки не подтверждён (ревью 13.09, R6)
             raise Pause("limit", f"инструмент сделки {run.did} не подтверждён ({inst.why}) — вход не начинаю")
-        allow = _allow_multiplier(cfg)         # свежий owner.toml: владелец мог снять разрешение после плана (R8)
+        allow = _allow_multiplier(cfg, _deal_cv(run.deal)[1])   # свежий owner.toml: разрешение могли снять (R8)
         try:                                   # и намерение, одобренное до выката отказа по множителю (ревью 13.09, С1)
-            unit_refusal(run.deal["coin"], run.deal["symbol"], m=inst.m, allow_multiplier=allow)
+            unit_refusal(run.deal["coin"], run.deal["symbol"], m=inst.m, allow_multiplier=allow,
+                         venue=_deal_cv(run.deal)[1])
         except Refused:
             why = f": нет разрешения владельца ({MULT_KEY})" if (inst.m != 1 and not allow) else ""
             raise Pause("limit", f"контракт {run.deal['symbol']} с множителем — вход не начинаю{why}") from None
@@ -2548,7 +2681,7 @@ class Engine:
                                            "продажей не отправляю")
         if side == "SELL" and m != 1:          # продажа контрактов с множителем — по СВЕЖЕМУ разрешению владельца (R8)
             try:
-                allow = _allow_multiplier(self.owner_loader())
+                allow = _allow_multiplier(self.owner_loader(), _deal_cv(run.deal)[1])
             except OwnerConfigError as e:
                 raise Pause("owner", f"owner.toml не прочитан: {e}") from None
             if not allow:
@@ -2750,7 +2883,7 @@ class Engine:
             margin = None
         cost = fn["total_usd"] if fn["total_complete"] else None
         liq_pct = (fn["liq_dist_frac"] * 100) if fn["liq_dist_frac"] is not None else None
-        liq_set = run.cfg.get(f"perp.{VENUE}.liq_alert_pct") if entry else None
+        liq_set = run.cfg.get(f"perp.{run.deal['perp_venue']}.liq_alert_pct") if entry else None
         liq_thr = planner.liq_alert_pct(liq_set, liq_pct)      # «auto» — ½ расстояния на входе; число — как есть
         est = run.plan.est or {}
         plan_impact = ((dget(est.get("dex_fee_usd")) or ZERO) + (dget(est.get("dex_impact_usd")) or ZERO)
@@ -2762,7 +2895,8 @@ class Engine:
             deal_leg_usd=dget(run.deal["leg_usd"]), spot_qty=dex["tokens"], spot_usd=dex["usd"], perp_qty=pl["qty"],
             impact_usd=fn["impact_usd"], planned_impact_usd=plan_impact, gas_usd=gas["swap_usd"],
             approve_gas_usd=gas["approve_usd"] if approves else None, swaps=swaps, native_px=legs.native_px(),
-            leverage=run.cfg.get(f"perp.{VENUE}.leverage"), margin_type=run.cfg.get(f"perp.{VENUE}.margin_type"),
+            leverage=run.cfg.get(f"perp.{run.deal['perp_venue']}.leverage"),
+            margin_type=run.cfg.get(f"perp.{run.deal['perp_venue']}.margin_type"),
             liq_dist_pct=liq_pct, liq_alert_pct=liq_thr,
             dust_qty=dust, dust_usd=(dust * mid / run.m) if (dust is not None and mid) else None, step=run.f.step,
             basis_pct=(fn["basis_bps"] / 100) if fn["basis_bps"] is not None else None,

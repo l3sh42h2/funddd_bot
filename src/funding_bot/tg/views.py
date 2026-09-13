@@ -38,9 +38,9 @@ CENT = Decimal("0.01")
 SIM_MARK = "🧪"
 SIM_PREFIX = f"{SIM_MARK} <b>СИМУЛЯЦИЯ</b> · деньги не двигаются"
 
-CHAIN_LABEL = {"bsc": "BSC", "sol": "Solana", "rh": "Robinhood"}
-NATIVE = {"bsc": "BNB", "sol": "SOL", "rh": "ETH"}
-VENUE_LABEL = {"aster": "Aster", "binance": "Binance", "hyperliquid": "Hyperliquid"}
+CHAIN_LABEL = {"bsc": "BSC", "sol": "Solana", "rh": "Robinhood", "robinhood": "Robinhood"}
+NATIVE = {"bsc": "BNB", "sol": "SOL", "rh": "ETH", "robinhood": "ETH"}
+VENUE_LABEL = {"aster": "Aster", "binance": "Binance", "hyperliquid": "Hyperliquid", "gate": "Gate"}
 MODE_LABEL = {"dry": "симуляция", "readonly": "только чтение", "live": "live"}
 FIX_WORD = {"rehedge": "Дохедж", "undo": "Откат"}
 DEAL_STATE_LABEL = {"DRAFT": "черновик", "ENTERING": "входит", "PAUSED": "на паузе", "OPEN": "открыта",

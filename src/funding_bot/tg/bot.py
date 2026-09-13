@@ -642,6 +642,9 @@ def build_trader_legs(cfg, conns: Conns, holder: CfgHolder, env, *, build=None, 
     factories = {}
     if sol_on:
         factories[owner_mod.SOL_HL] = (factory or SolFactory)(owner_mod.load, conns, keys_mode=keys_mode, environ=env)
+    if cfg.profile_enabled(owner_mod.RH_GATE):     # FATCOIN 13.09: спот OKX DEX Robinhood × перп Gate (ключ EVM — старой связки)
+        from ..trade.runtime import EvmGateFactory
+        factories[owner_mod.RH_GATE] = EvmGateFactory(owner_mod.load, conns, holder, rt, environ=env)
     reg = RuntimeRegistry(lambda sim: rt.sim if sim else rt.live, factories)
     mode = rt.mode if legacy_on else (keys_mode or "dry")
     return rt, reg, keys_mode, mode, legacy_on
