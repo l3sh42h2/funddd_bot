@@ -26,6 +26,10 @@ def main(argv=None):
     t.add_argument("--mode", default="sf", choices=["sf", "ff"], help="sf = spot/futures, ff = futures/futures")
     t.add_argument("--by", default="spread", choices=["spread", "24", "72", "720", "gap"])
     sub.add_parser("trader", help="фаза 2: Telegram-бот владельца + исполнитель (сделки только по его команде)")
+    sub.add_parser("core", help="headless торговое ядро")
+    ui = sub.add_parser("interface", help="Telegram и dashboard через IPC ядра")
+    ui.add_argument("--port", type=int, default=config.WEB_PORT)
+    ui.add_argument("--host", default=config.WEB_HOST)
     tc = sub.add_parser("trade-check", help="фаза 2: проверки без отправок — owner.toml, ключи, подписанные чтения")
     tc.add_argument("--mode", default="readonly", choices=["dry", "readonly"],
                     help="не выше режима owner.toml; live не нужен — проверки ничего не отправляют")
@@ -105,6 +109,12 @@ def main(argv=None):
             else:
                 head = f"{r['base']:<12} {r.get('spot_label') or 'спот'}|{r['perp_ex']:<11} текущий {f(r['spread'])}/{r['period']}ч"
             print(f"{head}  курс {f(r['gap'], 2)}  {wins}")          # «Отклонения» нет (владелец 12.09)
+    elif a.cmd == "core":
+        from .core.bootstrap import run_core
+        return run_core()
+    elif a.cmd == "interface":
+        from .interface.runtime import run_interface
+        return run_interface(a.port, a.host)
     elif a.cmd == "trader":
         from .tg.bot import run_trader
         return run_trader()

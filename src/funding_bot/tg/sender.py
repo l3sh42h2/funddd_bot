@@ -29,7 +29,7 @@ import html, logging, queue, re, threading, time
 from dataclasses import dataclass
 from typing import Any, Callable
 from ..trade import tconfig
-from .api import TgBadRequest, TgError, TgForbidden, TgNetwork, TgRetryAfter, redact
+from ..trade.keys import redact
 
 log = logging.getLogger(__name__)
 
@@ -358,6 +358,7 @@ class Sender:
         self._last_call = self._clock()
 
     def _call(self, fn: Callable[[bool, str], Any], text: str, use_html: bool) -> Any:
+        from .api import TgBadRequest, TgError, TgForbidden, TgNetwork, TgRetryAfter
         net = 0
         while True:
             if self._abort.is_set():

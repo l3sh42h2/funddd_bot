@@ -1,22 +1,5 @@
-"""Проводка бота владельца с исполнителем (trade_spec §6, отчёт telegram §3, §7): один процесс `funding_bot trader`.
-
-Потоки (почему так):
-  опрос     — getUpdates → auth.classify → parse; здесь только быстрое: «стоп» (флаг в БД + Event), CAS кнопки
-              (auth.press — одно атомарное UPDATE) и короткие ответы. Двигать деньги диспетчер не может;
-  задания   — медленные чтения: план (4 котировки калибровки при 1 запросе/с ключа OKX ≈ 6 с), «позиции», «статус»;
-              раз в HOUSEKEEP_S — истечение планов (кнопки снимаются правкой сообщения);
-  исполнитель (engine.Engine) — единственный, кто подписывает и отправляет, и только одобренное намерение;
-  отправитель (sender.Sender) — очередь: исполнение никогда не ждёт Telegram;
-  сторож    — живость опроса, tg_health.json, выход с кодом 3 только при свободном исполнителе.
-
-Соединения с trade.db — по одному на поток (Conns.get() внутри потока): транзакции одного соединения из разных
-потоков перемешались бы. Кнопку жмут из потока опроса — тем же путём одобрение шло бы и из двух потоков сразу:
-CAS в store.approve_intent даёт ровно один submit.
-
-Рестарт: прерванное (approved/running) → interrupted, сверка (reconcile.startup) и сообщение «♻️ … сам не
-продолжаю». Автоматического продолжения нет никогда — только «продолжить <id>» со свежим планом и кнопками.
-SIGTERM (TimeoutStopSec=280): новое не начинается (engine.term), текущая пара ног доводится, «⏹ служба
-останавливается», отправитель досылает очередь.
+"""Compatibility command controller for M1/M2. No Telegram network client.
+Legacy presentation is retained until M3/M4; transport and persistence belong to separate processes.
 """
 from __future__ import annotations
 import json, logging, os, queue, signal, threading, time
@@ -27,9 +10,8 @@ from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Refused, build
 from ..trade.keys import KeysError, effective_mode, install_log_redaction, redact
 from ..trade.owner import OwnerConfigError
 from ..trade.store import DealState
-from . import auth, parse, views
-from .poller import Poller, Watchdog, WebhookSet, startup_check
-from .sender import Sender, escape, to_plain
+from ..tg import auth, parse, views
+from ..tg.sender import escape, to_plain
 
 log = logging.getLogger(__name__)
 
@@ -580,7 +562,7 @@ class Bot:
     def _texts_of(deal):
         from ..trade.runtime import is_sol_deal
         if is_sol_deal(deal):
-            from . import sol_views
+            from ..tg import sol_views
             return sol_views
         return views
 
@@ -590,38 +572,6 @@ class Bot:
         return Bot._texts_of(d).restart_check(d["coin"], d["id"], chk.matched, chk.detail, str(dr.new),
                                               bool(d["sim"]), hedged=chk.hedged, delta=chk.delta, usd=chk.delta_usd,
                                               step=chk.step, m=chk.m)
-
-    def start_poller(self) -> None:
-        self._poll_thread = threading.Thread(target=self.poller.run, name="tg-poller", daemon=True)
-        self._poll_thread.start()
-
-    def start(self, poll_api) -> None:
-        """Потоки опроса и заданий, сторож (его цикл запускает run_trader)."""
-        self.poll_api = poll_api
-        # у опроса своё соединение (claim/offset в его потоке); диспетчер берёт своё через Conns в том же потоке
-        self.poller = Poller(poll_api, store.connect(self.conns.path), self.handle, on_alarm=self.alarm)
-        self.start_poller()
-        self.jobs.start()
-        self.watchdog = Watchdog(poll_api, self.poller, executor_busy=self.engine.busy,
-                                 poller_alive=lambda: self._poll_thread is not None and self._poll_thread.is_alive(),
-                                 restart_poller=self.start_poller, on_alarm=self.alarm, health_path=tconfig.TG_HEALTH)
-
-    def shutdown(self, code: int, wd_stop: threading.Event | None = None) -> int:
-        self.engine.term.set()                 # новое не начинается; начатая пара ног доводится
-        if wd_stop is not None:
-            wd_stop.set()
-        self.jobs.stop()
-        if self.poller is not None:
-            self.poller.stop()
-        if code == 0:
-            self.say(views.service_stopping())
-        if not self.engine.wait_idle(STOP_WAIT_S):
-            log.error("исполнитель не освободился за %d с — выхожу (запись-до: рестарт сверит)", STOP_WAIT_S)
-        self.engine.stop()
-        left = self.sender.close(10)
-        if left:
-            log.error("при остановке не доставлено сообщений: %d", left)
-        return code
 
 
 def build_trader_legs(cfg, conns: Conns, holder: CfgHolder, env, *, build=None, factory=None):
@@ -648,114 +598,3 @@ def build_trader_legs(cfg, conns: Conns, holder: CfgHolder, env, *, build=None, 
     reg = RuntimeRegistry(lambda sim: rt.sim if sim else rt.live, factories)
     mode = rt.mode if legacy_on else (keys_mode or "dry")
     return rt, reg, keys_mode, mode, legacy_on
-
-
-def _notify(api, chat: int | None, html: str) -> None:
-    """Одно сообщение мимо очереди — когда процесс не стартует (владелец иначе не узнает почему)."""
-    if api is None or not chat:
-        return
-    try:
-        api.send_message(chat, html)
-    except Exception as e:                     # noqa
-        log.warning("tg: сообщение об отказе старта не доставлено: %s", redact(e))
-
-
-def _run_trader(environ=None) -> int:
-    """`funding_bot trader`. Код выхода: 0 — SIGTERM; 3 — сторож Telegram; 78 — настройка (без перезапуска
-    systemd); 1 — сеть на старте (systemd перезапустит)."""
-    env = os.environ if environ is None else environ
-    install_log_redaction()
-    token = (env.get("TG_BOT_TOKEN") or "").strip()
-    if not token:
-        log.error("нет TG_BOT_TOKEN в окружении (.env) — трейдер не запускаю")
-        return EXIT_CONFIG
-    try:
-        cfg = owner_mod.load()
-    except OwnerConfigError as e:
-        log.error("owner.toml: %s — трейдер не запускаю", e)
-        return EXIT_CONFIG
-    from .api import TgApi
-    try:
-        poll_api, send_api = TgApi(token), TgApi(token)
-    except ValueError as e:
-        log.error("%s", e)
-        return EXIT_CONFIG
-    conns, holder = Conns(), CfgHolder()
-    try:
-        rt, legs, keys_mode, mode, legacy_on = build_trader_legs(cfg, conns, holder, env)
-    except KeysError as e:
-        log.error("ключи: %s — трейдер не запускаю", redact(e))
-        _notify(send_api, cfg.owner_id, views.refused(f"трейдер не запущен: {redact(e)}"))
-        return EXIT_CONFIG
-    except (owner_mod.OwnerMissing, OwnerConfigError) as e:
-        # пустое значение владельца — настройка, а не сеть: без кода 78 systemd перезапускал бы молча каждые 5 с
-        log.error("owner.toml: %s — трейдер не запускаю", e)
-        _notify(send_api, cfg.owner_id, views.refused(f"трейдер не запущен в режиме {cfg.mode}: {escape(str(e))}"))
-        return EXIT_CONFIG
-    except Exception as e:                     # noqa — сеть/узел при сборке ног
-        log.error("сборка ног: %s", redact(e))
-        return EXIT_TRANSIENT
-    if legacy_on and rt.mode == "live":
-        from ..trade.aster_trade import AsterError
-        try:
-            rt.live.perp.check_clock()         # nonce Aster живёт в ±10 с: при расхождении > 2 с live не стартует
-        except AsterError as e:
-            log.error("%s", e)
-            _notify(send_api, cfg.owner_id, views.refused(f"трейдер не запущен: {e}"))
-            return EXIT_CONFIG
-        except Exception as e:                 # noqa
-            log.error("часы Aster не проверены: %s", redact(e))
-            return EXIT_TRANSIENT
-    ref: dict[str, Engine] = {}
-    desk = Desk(conns, legs, keys_mode=keys_mode, busy=lambda: ref["e"].busy())
-    engine = Engine(conns, legs, desk, keys_mode=keys_mode, holder=holder, busy_path=tconfig.TRADING_BUSY)
-    ref["e"] = engine
-    from ..serve import load_table
-    sender = Sender(send_api).start()
-    bot = Bot(conns=conns, desk=desk, engine=engine, sender=sender, legs=legs, poll_api=poll_api, mode=mode, rt=rt,
-              table_loader=load_table)
-    try:
-        info = startup_check(poll_api, bot.alarm)
-    except WebhookSet:
-        sender.close(10)
-        return EXIT_CONFIG
-    except Exception as e:                     # noqa — сеть: опрос переподключится сам
-        log.warning("tg: getMe/getWebhookInfo: %s", redact(e))
-        info = {}
-    try:
-        bot.startup()
-    except Exception:                          # noqa
-        log.exception("сверка на старте упала")
-        bot.say(views.error("сверка после перезапуска упала — сам ничего не продолжаю; «позиции» перед командами"))
-    engine.start()
-    bot.start(poll_api)
-    bot.say(views.bot_started(mode, info.get("username")))
-    stop, code = threading.Event(), [0]
-
-    def on_exit() -> None:
-        code[0] = EXIT_WATCHDOG
-        stop.set()
-
-    def on_signal(signum, _frame) -> None:
-        log.info("сигнал %s — останавливаюсь (пара ног доводится)", signum)
-        stop.set()
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
-    wd_stop = threading.Event()
-    threading.Thread(target=bot.watchdog.run, args=(wd_stop, on_exit), name="tg-watchdog", daemon=True).start()
-    while not stop.wait(1.0):
-        pass
-    return bot.shutdown(code[0], wd_stop)
-
-
-def run_trader(environ=None) -> int:
-    """Transition entrypoint: same execution lock as headless core, held through shutdown."""
-    from ..ipc.lock import ExecutionLock
-    from ..ipc.paths import execution_lock
-    try:
-        with ExecutionLock(execution_lock()):
-            return _run_trader(environ)
-    except BlockingIOError:
-        log.error("another trader/core owns execution lock")
-        return EXIT_CONFIG
