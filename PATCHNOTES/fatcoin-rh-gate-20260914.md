@@ -82,3 +82,6 @@ active, рестартов 0. md5 engine/gate_trade/instruments/runtime на VPS
 Readonly-репетиция RH × Gate (VPS, только чтение): часы +0.45 с; Gate available 2563 USDT, in_dual_mode false;
 m = 100, тик 0.001, шаг 1; биды 5 уровней ≈ $485; список завершённых заявок — 100 строк на limit=100, новые
 первыми, text есть; account_book.id есть; кошелёк 4663: USDG 451.95, ETH 0.0052.
+Найдено репетицией: GET /positions/FATCOIN_USDT без позиции отвечает HTTP 400 POSITION_NOT_FOUND (не объект с size 0)
+— position() давал «не прочитано» и остановил бы вход/сверку. Исправлено: эта метка = флэт, прочие ошибки — None.
+Знак my_trades.size подтверждён (100 из 100 совпали со знаком заявки). Установка — следующим выкатом.

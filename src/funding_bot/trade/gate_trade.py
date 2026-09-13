@@ -615,8 +615,9 @@ class GateTrade:
 
     def position(self, symbol: str) -> Decimal | None:
         """Знаковая позиция в КОНТРАКТАХ (не в токенах — перевод через m делает движок, как у Aster/1000BONK).
-        Gate всегда отдаёт объект позиции по контракту (даже флэт — size:0 по-настоящему флэт, а не «пусто»);
-        None — только при ошибке/обрыве чтения (урок «призраки позиций» — не путать «не прочитали» с «флэт»)."""
+        Флэт — size:0 в объекте позиции ИЛИ HTTP 400 label POSITION_NOT_FOUND: позиции по контракту ещё не было
+        (живой ответ 14.09 по FATCOIN_USDT — объект позиции есть НЕ всегда). None — только при прочей ошибке/обрыве
+        чтения (урок «призраки позиций» — не путать «не прочитали» с «флэт»)."""
         try:
             st, body, _ = self.call("GET", f"/futures/{self.SETTLE}/positions/{_urlquote(symbol, safe='')}",
                                     critical=True)
@@ -625,6 +626,8 @@ class GateTrade:
         except Exception as e:
             log.warning("gate positions %s: %s", symbol, type(e).__name__)
             return None
+        if st in (400, 404) and _label(body) == "POSITION_NOT_FOUND":
+            return _D0                         # позиции по контракту не было — флэт, а не «не прочитали»
         if _is_error(st) or not isinstance(body, dict):
             return None
         try:

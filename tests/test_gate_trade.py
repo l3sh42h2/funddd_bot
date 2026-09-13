@@ -573,6 +573,10 @@ def test_position_flat_is_real_zero_error_is_none(fake):
     assert t.position(SYM) == D(-12345)
     fake.script[("GET", f"/futures/{gt.SETTLE}/positions/{SYM}")] = [(500, {}), requests.ReadTimeout("x")]
     assert [t.position(SYM) for _ in range(2)] == [None, None]
+    # живой ответ 14.09: позиции по контракту ещё не было — 400 POSITION_NOT_FOUND = флэт; прочий 400 — не прочитано
+    fake.script[("GET", f"/futures/{gt.SETTLE}/positions/{SYM}")] = [
+        (400, {"label": "POSITION_NOT_FOUND", "message": None}), (400, {"label": "INVALID_PARAM_VALUE"})]
+    assert [t.position(SYM) for _ in range(2)] == [D(0), None]
 
 
 def test_available_margin_none_on_error(fake):
