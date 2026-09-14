@@ -55,3 +55,15 @@ Combined local profile: 65 passed, 1 skipped. Exact-value scanning ran wholly on
 VPS, including decompressed baseline sources: passed. Public DEX_EVM_ADDRESS and
 ASTER_USER literals were excluded only when matching a strict EVM address format;
 secret values and hashes were not exported by that scanner.
+
+First complete Linux profile (c24071f): 2633 passed, 12 failed, 12 skipped,
+1329.39 seconds. Ten failures were the now-fixed Git-dependent replay; one planner
+wall-time smoke failure under 80% CPU quota passed unchanged at 100% CPU/Nice10.
+The large-dashboard health failure exposed concurrent duplicate JSON rendering.
+Serve now single-flights cache misses, rechecks snapshot mtime after waiting, and
+returns the collector's atomically published data.json bytes without parsing and
+re-encoding them under the GIL. HTML still renders normally; missing-file fallback
+and gzip remain supported. No latency assertions were loosened.
+Linux focused validation at 100% CPU/Nice10: both original failing tests passed,
+13.54s total; 46,137,502-byte table, 3 clients, 9 downloads, 60 health requests,
+health p95 145.68ms (required <200ms). Local serve/load profile: 5 passed, 1.25s.

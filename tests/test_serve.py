@@ -34,3 +34,51 @@ def test_accepts_gzip_tokens_and_q():
     assert serve.accepts_gzip("gzip, deflate, br, zstd") and serve.accepts_gzip("deflate;q=0.5, gzip;q=0.8") and serve.accepts_gzip("*")
     assert not serve.accepts_gzip("gzip;q=0") and not serve.accepts_gzip("identity") and not serve.accepts_gzip(None)
     assert not serve.accepts_gzip("x-gzip-no")
+
+
+def test_concurrent_cache_misses_render_once(tmp_path, monkeypatch):
+    import concurrent.futures
+    from funding_bot import config
+    table = tmp_path / 'table.json'; table.write_text('{"n_ff": 0}')
+    monkeypatch.setattr(config, 'TABLE_PATH', table)
+    seen = set()
+    all_started = threading.Event()
+    class Cache(dict):
+        def get(self, key):
+            seen.add(threading.get_ident())
+            if len(seen) == 3:
+                all_started.set()
+            return super().get(key)
+    monkeypatch.setattr(serve, '_cache', Cache())
+    calls = []
+    entered, release = threading.Event(), threading.Event()
+    def load():
+        calls.append(1); entered.set()
+        assert release.wait(3)
+        return {'n_ff': 0}
+    monkeypatch.setattr(serve, 'load_table', load)
+    monkeypatch.setattr(serve.dashboard, 'render', lambda table: json.dumps(table, separators=(',', ':')))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(serve._cached, 'html', False) for _ in range(3)]
+        assert entered.wait(3)
+        assert all_started.wait(3)
+        release.set()
+        assert [f.result(3) for f in futures] == [b'{"n_ff":0}'] * 3
+    assert len(calls) == 1
+
+
+def test_data_response_keeps_atomic_snapshot_bytes_without_reencoding(tmp_path, monkeypatch):
+    table = tmp_path / 'table.json'
+    raw = b'{ "n_ff": 0, "tick_ts": 1, "snapshot_id": "first" }\n'
+    table.write_bytes(raw)
+    monkeypatch.setattr(config, 'TABLE_PATH', table)
+    monkeypatch.setattr(serve, '_cache', {})
+    def forbidden(): raise AssertionError('data.json must not parse the snapshot')
+    monkeypatch.setattr(serve, 'load_table', forbidden)
+    assert serve._cached('data', False) == raw
+    new = tmp_path / 'next.json'; new.write_bytes(b'{"snapshot_id":"second"}')
+    import os
+    stat = table.stat(); os.utime(new, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000))
+    new.replace(table)
+    assert serve._cached('data', False) == b'{"snapshot_id":"second"}'
+    assert gzip.decompress(serve._cached('data', True)) == b'{"snapshot_id":"second"}'

@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 _cache: dict[tuple, bytes] = {}
 _cache_lock = threading.Lock()
+_cache_build_lock = threading.Lock()
 POST_DRAIN_MAX = 65536          # тело POST до стольких байт вычитывается даже при отказе — keep-alive не рассинхронизируется
 
 
@@ -33,15 +34,35 @@ def _cached(kind: str, gz: bool) -> bytes:
         hit = _cache.get(key)
     if hit is not None:
         return hit
-    t = load_table()
-    body = (json.dumps(t, separators=(",", ":")) if kind == "data" else dashboard.render(t)).encode()
-    if gz:
-        body = gzip.compress(body, compresslevel=5)
-    with _cache_lock:
-        for k in [k for k in _cache if k[2] != mt]:
-            del _cache[k]
-        _cache[key] = body
-    return body
+    # Serialize cache misses only. Concurrent dashboard clients otherwise repeat
+    # the same large JSON render and starve the small independent /status route.
+    with _cache_build_lock:
+        try:
+            mt = os.stat(config.TABLE_PATH).st_mtime_ns
+        except FileNotFoundError:
+            mt = None
+        key = (kind, gz, mt)
+        with _cache_lock:
+            hit = _cache.get(key)
+        if hit is not None:
+            return hit
+        if kind == "data":
+            # Collector publishes complete JSON by atomic replace. Serve those
+            # exact bytes instead of parsing/encoding a large snapshot under GIL.
+            try:
+                with open(config.TABLE_PATH, "rb") as source:
+                    body = source.read()
+            except FileNotFoundError:
+                body = json.dumps(load_table(), separators=(",", ":")).encode()
+        else:
+            body = dashboard.render(load_table()).encode()
+        if gz:
+            body = gzip.compress(body, compresslevel=5)
+        with _cache_lock:
+            for k in [k for k in _cache if k[2] != mt]:
+                del _cache[k]
+            _cache[key] = body
+        return body
 
 
 def load_table(path=None) -> dict:
