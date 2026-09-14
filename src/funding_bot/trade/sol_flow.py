@@ -69,8 +69,11 @@ def _h(raw: int | None, dec: int) -> D | None:
     return None if raw is None else D(int(raw)) / D(10) ** dec
 
 
-def _step(perp) -> D:
-    return R.sz_step(perp.identity().sz_decimals)
+def _step(perp, symbol) -> D:
+    step = perp.filters(symbol).step
+    if not isinstance(step, D) or not step.is_finite() or step <= 0:
+        raise ValueError("perpetual quantity step is unproven")
+    return step
 
 
 def _tokens_per_step(inst: InstrumentSpec, step: D) -> D:
@@ -349,7 +352,7 @@ def check_deal(con, deal: Mapping, legs: SolLegs | None, *, resolve: bool = True
     inst = deal_instrument(con, deal)
     step = delta = hedged = None
     try:
-        step = _step(legs.perp)
+        step = _step(legs.perp, inst.perp_symbol)
     except Exception as e:              # noqa
         problems.append(f"мета HL: {type(e).__name__}")
     if bk.known:
@@ -503,7 +506,7 @@ class SolDesk:
         perp = legs.perp
 
         def make() -> HedgeContext:
-            step = _step(perp)
+            step = _step(perp, inst.perp_symbol)
             lev = cfg.get("perp.hyperliquid.leverage")
             params = PairParams(fs=inst.fs, fp=inst.fp, step=step, perp_fee_rate=legs.fee_rate(),
                                 min_notional=R.MIN_NOTIONAL_USD, exit_close_qty=close_qty,
@@ -820,7 +823,7 @@ class SolDesk:
             raise self.refuse(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»")
         dec_t = int(deal["token_dec"])
         perp = legs.perp
-        step = _step(perp)
+        step = _step(perp, inst.perp_symbol)
         T, S = bk.tokens(dec_t), bk.short
         if bk.tokens_raw <= 0:
             raise self.refuse(f"спота в сделке нет (шорт {S}) — «дохедж {deal['id']}» откупит шорт")
@@ -952,7 +955,7 @@ class SolDesk:
         bk = deal_book(con, deal["id"])
         if not bk.known:
             raise self.refuse(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»")
-        step = _step(legs.perp)
+        step = _step(legs.perp, inst.perp_symbol)
         T, S = bk.tokens(int(deal["token_dec"])), bk.short
         target = _target(inst, T, step)
         d = _delta(inst, T, S)
@@ -1096,7 +1099,7 @@ class SolEngine:
                                      "сначала «позиции»")
         deal = store.get_deal(con, deal["id"])
         try:
-            step = _step(legs.perp)
+            step = _step(legs.perp, inst.perp_symbol)
         except Exception as e:        # noqa — ничего не отправлено
             return self.e._fail(iid, f"мета {inst.perp_symbol} не прочитана: {redact(e)}")
         op = store.operation_of_intent(con, iid)

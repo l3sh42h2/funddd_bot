@@ -74,3 +74,9 @@ compatibility, C5 и review packet для Claude. C1–C5 завершённым
 operation_plan.py и perp_preflight.py — новые пока неподключённые форматы/bridge.
 Они не означают завершение generic core: план ещё не записывается, reader floor
 для generic activation ещё не введён; SolDesk по-прежнему требует снятия HL-привязок.
+
+Дополнительный шаг: SOL quantity step читается через общий filters(symbol),
+без прямого Hyperliquid identity().sz_decimals. SOL C2/lifecycle: 82 passed / 3.80 s.
+OperationPlan roundtrip/deep-frozen authorization/shared identity proof,
+account tampering, exit/reduce-only/currency bounds: 5 passed / 0.04 s.
+Остальная привязка SolDesk к HL этим изменением не устранена.
