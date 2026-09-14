@@ -147,6 +147,7 @@ class SimSpot:
 class SimPerp:
     """PerpLeg симуляции поверх публичной ноги (inner: filters/book/funding[/available_margin]). Заявки не уходят
     никуда: IOC исполняется по свежему стакану не глубже px_cap, остаток «истекает», как у биржи."""
+    ioc_partial_terminal = True
 
     def __init__(self, inner, *, fee_taker: D | None = None, clock: Callable[[], float] = time.time):
         self.inner = inner

@@ -243,7 +243,7 @@ class CoreService:
         if len(json.dumps(u).encode()) > 65536:
             raise RpcError('update_too_large')
         # STOP remains prompt while a slow plan is being quoted. Callbacks are also only local CAS/outbox work.
-        from ..tg import parse
+        from .. import operator_commands as parse
         name = parse.parse((u.get('message') or {}).get('text') or '').name
         priority = 0 if name == 'stop' else (1 if 'callback_query' in u else 2)
         with self._drain_lock:
@@ -273,7 +273,7 @@ class CoreService:
         self.conns.get().execute('INSERT OR REPLACE INTO core_plan_guards VALUES(?,?)', (iid,fp))
 
     def _check_plan_guard(self, update):
-        from ..tg.parse import parse_callback
+        from ..operator_commands import parse_callback
         cq = update.get('callback_query')
         if not isinstance(cq, dict):
             return True
@@ -302,7 +302,7 @@ class CoreService:
                 self.jobs.local.pending = []
                 # classify rechecks owner/chat/date; auth.press rechecks intent nonce/TTL/CAS and pause.
                 # Drain may begin after acceptance but before dispatch; old queued approvals cannot slip through.
-                from ..tg.parse import parse
+                from ..operator_commands import parse
                 name = parse((u.get('message') or {}).get('text') or '').name
                 if self.drain and name not in ('stop', 'help', 'positions', 'status'):
                     self.journal.finish(key, {'reason':'draining'}, 'interrupted')

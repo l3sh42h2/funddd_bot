@@ -296,6 +296,7 @@ class GateTrade:
     """PerpLeg для Gate (USDT-фьючерсы). Публичное — без ключей и без ворот режима (как у Aster); подписанное —
     через call() с воротами mode_state() на КАЖДЫЙ вызов."""
     venue = VENUE
+    ioc_partial_terminal = True  # only status=finished produces native PARTIALLY_FILLED
     SETTLE = SETTLE
     BASE = GATE_BASE
 

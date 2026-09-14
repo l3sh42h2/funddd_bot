@@ -733,7 +733,7 @@ class Desk:
         """Выход с именем связки или количеством (tg.parse.ProfileExit). Сделка связки — её план выхода (частичный в
         пилоте — честный отказ); сделка BSC — прежний выход только без количества и с именем «bsc», иначе отказ
         с форматом (сумма в токенах у BSC не разбирается)."""
-        from ..tg.parse import EXIT_FMT
+        from ..operator_commands import EXIT_FMT
         from .owner import SOL_HL
         deal = self.resolve_deal(cmd.target)
         v = _views()

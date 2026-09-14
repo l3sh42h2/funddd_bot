@@ -319,6 +319,7 @@ class AsterTrade:
     через call() с воротами. mode_state() → (режим owner.toml, пауза): движок читает их заново на каждый вызов;
     не задан или упал — считаем dry (закрыто)."""
     venue = VENUE
+    ioc_partial_terminal = True  # order_to_fill maps non-final exchange partial to UNKNOWN
     BASE = tconfig.ASTER_BASE
 
     def __init__(self, signer: AsterSigner | None = None, *, keys: Keys | None = None,

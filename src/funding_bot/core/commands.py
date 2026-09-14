@@ -10,7 +10,11 @@ from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Refused, build
 from ..trade.keys import KeysError, effective_mode, install_log_redaction, redact
 from ..trade.owner import OwnerConfigError
 from ..trade.store import DealState
-from ..tg import auth, parse, views
+from ..tg import views
+from . import authority as auth
+from ..ipc.source import legacy_telegram_source
+from .approvals import ApprovalAction, decide
+from .. import operator_commands as parse
 from ..tg.sender import escape, to_plain
 
 log = logging.getLogger(__name__)
@@ -174,7 +178,7 @@ class Bot:
         """Вердикт пишется в tg_updates.verdict. Исключение здесь поймает Poller (команда не повторится)."""
         now = self.clock()
         owner_id, cfg_err = self.owner()
-        d = auth.classify(u, owner_id, now=now, limiter=self.limiter)
+        d = auth.classify(legacy_telegram_source(u), owner_id, now=now, limiter=self.limiter)
         v = d.verdict
         if v == auth.STALE:
             self.sender.send(d.chat_id, views.stale(d.date))
@@ -203,8 +207,10 @@ class Bot:
     def _press(self, d: auth.Decision, now: float) -> None:
         con = self.conns.get()
         paused = store.execution_paused(con) or self.engine.pause_evt.is_set() or self.engine.drain_evt.is_set()
-        r = auth.press(con, d.text, paused=paused, now=now)
-        self._answer(d.callback_id, r.answer)
+        cb = parse.parse_callback(d.text)
+        action = ApprovalAction(cb.action, cb.intent_id, cb.nonce) if cb else None
+        r = decide(con, action, paused=paused, now=now)
+        self._answer(d.callback_id, getattr(views, 'CB_' + r.reason.upper()))
         if r.closed and d.chat_id is not None and d.message_id is not None:
             self.sender.edit(d.chat_id, d.message_id, self._closed(r.intent_id, r.closed, now), reply_markup=None)
         if r.submit:

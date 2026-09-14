@@ -20,6 +20,10 @@ class PerpJournal:
         intent = store.get_intent(con, self.intent_id)
         self.deal_id = intent['deal_id']
 
+    def _require_autocommit(self):
+        if self.con.in_transaction:
+            raise AdapterError(ErrorKind.CONFIG, 'native admission cannot join a caller transaction')
+
     def _proof(self, attempt_id):
         row = self.con.execute(
             "SELECT json FROM exec_events WHERE kind='adapter_perp_prepared' AND clip_id=? "
@@ -41,6 +45,7 @@ class PerpJournal:
                     quote_hash=prepared.quote.fingerprint)
 
     def prepare(self, prepared):
+        self._require_autocommit()
         a = prepared.quote.action
         price = D(json.loads(prepared.quote.native)['price_cap'])
         with store.tx(self.con):
@@ -61,6 +66,7 @@ class PerpJournal:
                 raise AdapterError(ErrorKind.IDENTITY, 'existing native attempt differs from prepared request')
 
     def claim(self, prepared):
+        self._require_autocommit()
         with store.tx(self.con):
             proof = self._check(prepared)
             if self._proof(prepared.attempt_id) != proof:
@@ -69,6 +75,7 @@ class PerpJournal:
                 raise AdapterError(ErrorKind.UNKNOWN, 'native attempt already admitted; resolve, never resend')
 
     def on_signed(self, attempt_id, nonce):
+        self._require_autocommit()
         if type(nonce) is not int or nonce < 0:
             raise store.StoreError('invalid native signing nonce')
         with store.tx(self.con):

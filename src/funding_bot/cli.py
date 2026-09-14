@@ -129,7 +129,7 @@ def main(argv=None):
         from .cabinet import cli_hash
         return cli_hash()
     elif a.cmd == "plan":
-        from .tg.parse import PERP_ALIASES, parse_amount, parse_coin, parse_spot
+        from .operator_commands import PERP_ALIASES, parse_amount, parse_coin, parse_spot
         from .tg.sender import to_plain
         from .trade.engine import Refused, plan_cli
         coin, spot, perp, usd = parse_coin(a.coin), parse_spot(a.spot), PERP_ALIASES.get(a.perp.lower()), parse_amount(a.usd)

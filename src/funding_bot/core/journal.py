@@ -153,7 +153,7 @@ class Outbox:
         self.lock = threading.RLock()
 
     def send(self, chat_id, text, *, html=True, reply_markup=None, silent=False, on_done=None):
-        from ..tg.parse import parse_callback
+        from ..operator_commands import parse_callback
         iid = None
         if reply_markup:
             for row in reply_markup.get('inline_keyboard', []):

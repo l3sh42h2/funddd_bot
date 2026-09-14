@@ -105,3 +105,16 @@ Linux checkpoint выполнен после последних code-право�
 - На этом checkpoint адаптеры/фундамент: 60 passed; scoped ingest: 16 passed. Это профильные проверки, не полный
   неизменяемый Linux artifact profile. M4/M5 остаются in_progress; generic production wiring, presenter boundary,
   scope integration, окончательная replay/приёмка и VPS switch ещё требуют работы.
+
+### Проверенные барьеры отправки и перенос решений команд
+
+- PerpJournal отказывает при внешней незавершённой транзакции: rollback вызывающего кода не может отменить
+  claim уже отправленного ордера и разрешить повторную отправку. Native Aster/Gate сохраняют доказанный
+  terminal partial, Hyperliquid предоставляет instrument для общего адаптера. Astra закрыл bounded review;
+  профиль native/adapter/M3: 67 passed.
+- Одобрение, nonce/TTL/CAS и проверка полномочий перенесены в core.approvals/core.authority; грамматика команд —
+  в operator_commands. Telegram compatibility facades сохранены. Inbox bytes/hash/key/offset не изменены.
+- Независимое Astra сравнение authority: 47 639 совпавших сценариев; 4 876 malformed-входов вместо прежнего
+  исключения дают IGNORE, иных различий не найдено. Профиль reviewer: 232 passed. Локальный IPC/approval: 26 passed.
+- Это промежуточный перенос AC-07: presenters/outbox ещё требуют отделения. Generic execution и scoped accounting
+  пока не подключены сквозным образом. M4/M5 остаются in_progress, боевого выката не было.

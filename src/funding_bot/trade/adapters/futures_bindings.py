@@ -82,4 +82,5 @@ def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.ti
         next_cursor = str(max(int(r['trade_id']) for r in rows) + 1) if rows else cursor
         return ExecutionPage(values, next_cursor, True)
 
-    return Bindings(native, journal, authorize, quote, submit, resolve, observe, executions, clock=clock)
+    return Bindings(native, journal, authorize, quote, submit, resolve, observe, executions, clock=clock,
+                    partial_terminal=getattr(native, 'ioc_partial_terminal', False))

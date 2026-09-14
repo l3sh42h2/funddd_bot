@@ -54,7 +54,7 @@ from ..client import BannedError, BudgetExceeded
 from . import hl_rules as R
 from . import store as _store
 from .keys import KeyMismatch, Keys, ModeForbidden, gate as mode_gate, redact_secrets
-from .types import Book, Filters, PerpFill
+from .types import Book, Filters, PerpFill, PerpInstrument
 
 log = logging.getLogger(__name__)
 D = Decimal
@@ -776,6 +776,21 @@ class HyperliquidTrade:
         if self.saved_identity is not None:
             R.check_same_identity(self.saved_identity, fresh)
         return fresh
+
+    def instrument(self, symbol: str) -> PerpInstrument:
+        """Native unit description for the common perpetual adapter boundary.
+
+        The existing pilot supports USDC collateral (token 0). An unrecognized
+        collateral has unknown quote currency, so the generic binding refuses it.
+        Frozen market identity remains checked by identity(), including HIP-3 asset IDs.
+        """
+        self._check_symbol(symbol)
+        ref = self.identity()
+        if ref.is_delisted or ref.fullcoin != symbol:
+            raise HlError('perpetual instrument is delisted or its identity changed')
+        base = symbol.split(':', 1)[-1]
+        quote = 'USDC' if type(ref.collateral_token) is int and ref.collateral_token == 0 else None
+        return PerpInstrument(symbol, base, base, Decimal(1), quote, 'PERPETUAL')
 
     def filters(self, symbol: str) -> Filters:
         """Для совместимости с движком. tick — ПРОИЗВОДНАЯ правила 5 значащих у текущей середины книги; заявку
