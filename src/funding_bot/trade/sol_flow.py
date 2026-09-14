@@ -27,6 +27,8 @@ from typing import Any, Mapping
 from . import hl_rules as R, instruments as I, planner, store, tconfig
 from .engine import (HedgeResult, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book, deal_instrument,
                      dget)
+from .exposure import Exposure
+from .operations import OperationController, SpotSettlement
 from .fees import NATIVE_SOL, native_cash_needed
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing, OwnerUnsupported, SOL_HL
@@ -73,17 +75,17 @@ def _step(perp) -> D:
 
 def _tokens_per_step(inst: InstrumentSpec, step: D) -> D:
     """Шаг перпа в токенах спота: h·Fp/Fs (меньше — не хеджируется, это перенос, а не голая нога)."""
-    return step * inst.fp / inst.fs
+    return Exposure(inst.fs, inst.fp, step).token_step
 
 
 def _delta(inst: InstrumentSpec, tokens: D, short: D) -> D:
     """Δ в токенах спота: T − S·Fp/Fs (Fs — единиц базы в токене спота, Fp — в единице перпа)."""
-    return tokens - short * inst.fp / inst.fs
+    return Exposure(inst.fs, inst.fp, D(1)).delta(tokens, short)
 
 
 def _target(inst: InstrumentSpec, tokens: D, step: D) -> D:
     """target_short(T) = floor_step(T·Fs/Fp, h) — контракты перпа (ТЗ §4)."""
-    return inst.contracts_for(tokens, step)
+    return Exposure(inst.fs, inst.fp, step).target(tokens)
 
 
 def inst_mismatch(deal: Mapping, spec: Mapping, inst: InstrumentSpec) -> str | None:
@@ -111,33 +113,15 @@ def inst_mismatch(deal: Mapping, spec: Mapping, inst: InstrumentSpec) -> str | N
 def apply_swap(con, deal_id: str, clip_id: int, op_id: str | None, reserve_raw: int, out: SwapOutcome) -> None:
     """Исход попытки → клип, операция, расходы. Вызывается внутри транзакции записи чека (sol_exec) или после
     доказанного неисполнения. Неизвестный исход сюда не приходит: он держит резерв операции и клип DEX_UNKNOWN."""
-    c = store.get_clip(con, clip_id)
-    if c is None:
-        raise store.StoreError(f"клипа {clip_id} нет")
-    st = c["state"]
-    fresh = st in (ClipState.DEX_SENT, ClipState.DEX_UNKNOWN)
-    if out.state == "ok":
-        if fresh:
-            store.set_clip_state(con, clip_id, ClipState.DEX_OK, dex_in=int(out.in_raw), dex_out=int(out.out_raw))
-            if op_id:
-                store.operation_settle(con, op_id, released_raw=int(reserve_raw), executed_raw=int(out.in_raw))
-        elif st in (ClipState.DEX_OK, ClipState.PERP_SENT, ClipState.BALANCED, ClipState.HEDGE_DEFICIT):
-            if (store.units(c["dex_in"]), store.units(c["dex_out"])) != (int(out.in_raw), int(out.out_raw)):
-                raise store.StoreError(f"клип {clip_id}: чек {out.signature} расходится с записанным исполнением")
-        else:
-            raise store.StoreError(f"клип {clip_id} в {st}: исполнение по чеку не применить")
-    elif out.state in ("failed", "expired", "not_sent"):
-        if fresh:
-            store.set_clip_state(con, clip_id, ClipState.DEX_REVERTED)
-            if op_id:
-                store.operation_settle(con, op_id, released_raw=int(reserve_raw), executed_raw=0)
-        elif st not in (ClipState.DEX_REVERTED, ClipState.PLANNED):
-            raise store.StoreError(f"клип {clip_id} в {st}, а своп {out.state} — ручная сверка")
-    else:
+    if out.state not in ("ok", "failed", "expired", "not_sent"):
         raise ValueError(f"исход {out.state!r} не применяется")
-    if out.fees and out.signature and not str(out.signature).startswith("sim-"):
-        store.add_fee_events(con, origin_kind="sol_swap", origin_ref=str(out.signature), components=out.fees,
-                             deal_id=deal_id, operation_id=op_id, clip_id=clip_id)
+    result = SpotSettlement(True, int(out.in_raw), int(out.out_raw)) if out.state == "ok" else SpotSettlement(False)
+    with store.tx(con):
+        OperationController(con).settle_spot(clip_id, result, operation_id=op_id, reserve_raw=int(reserve_raw))
+        if out.fees and out.signature and not str(out.signature).startswith("sim-"):
+            store.add_fee_events(con, origin_kind="sol_swap", origin_ref=str(out.signature), components=out.fees,
+                                 deal_id=deal_id, operation_id=op_id, clip_id=clip_id)
+
 
 
 def _attempts_of_deal(con, spot, deal_id: str) -> list[dict]:
@@ -1264,10 +1248,7 @@ class SolEngine:
             if need is None or have is None or have < need:
                 raise Pause("native", f"SOL {have if have is not None else 'не прочитан'} лампортов — меньше расходов "
                                       f"с резервом {need if need is not None else '(неизвестно)'}: своп не начинаю")
-        with store.tx(con):
-            store.set_clip_state(con, clip_id, ClipState.DEX_SENT, expect=ClipState.PLANNED)
-            if run.op_id:
-                store.operation_reserve(con, run.op_id, amount)
+        OperationController(con).begin_spot(clip_id, operation_id=run.op_id, reserve_raw=amount)
         logical = f"{run.op_id or run.iid}:{run.seq}"
         meta = dict(deal_id=run.did, op_id=run.op_id, clip_id=clip_id, intent_id=run.iid)
 
@@ -1451,13 +1432,15 @@ class SolEngine:
         T, S = bk.tokens(run.dec), bk.short
         target = _target(run.inst, T, run.step)
         cap = D(str(run.spec.get("hedge_capacity") or target))
-        need = min(target, cap) - S
+        decision = Exposure(run.inst.fs, run.inst.fp, run.step).decide(
+            T, S, "entry", rounding="target", capacity=cap)
+        need = decision.quantity
         if need > 0:
             self._progress(run, "hedge", tokens=_h(run.swap.out_raw, run.dec), qty=need)
             self._after_hedge(run, clip_id, self._hl_hedge(run, clip_id, "SELL", need, False))
         else:
             store.set_clip_state(con, clip_id, ClipState.BALANCED, perp_qty=ZERO, perp_quote=ZERO)
-        if target > cap:              # G09: получено больше одобренной ёмкости — продажа излишка в пилоте выключена
+        if decision.surplus:          # G09: получено больше одобренной ёмкости — продажа излишка в пилоте выключена
             raise Pause("surplus", f"пришло больше одобренного: шорт {cap} из нужных {target} — излишек без хеджа, "
                                    "продажа излишка в пилоте выключена")
         self._basis(run, clip_id)
@@ -1494,12 +1477,14 @@ class SolEngine:
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         target = _target(run.inst, bk.tokens(run.dec), run.step)
-        buy = bk.short - target
+        decision = Exposure(run.inst.fs, run.inst.fp, run.step).decide(
+            bk.tokens(run.dec), bk.short, "exit", rounding="target")
+        buy = decision.quantity
         if buy > 0:
             self._progress(run, "hedge", tokens=_h(run.swap.in_raw, run.dec), qty=buy)
         if buy > 0:                   # только на S − target по факту списания (возврат роутера — остаток захеджирован)
             self._after_hedge(run, clip_id, self._hl_hedge(run, clip_id, "BUY", buy, True))
-        elif buy < 0:                 # U08: недохедж не лечится отрицательным BUY или неявным SELL
+        elif decision.deficit:        # U08: недохедж не лечится отрицательным BUY или неявным SELL
             store.set_clip_state(con, clip_id, ClipState.HEDGE_DEFICIT, perp_qty=ZERO, perp_quote=ZERO)
             raise Pause("hedge_deficit", f"после продажи шорт {bk.short} меньше нужного {target} — заявку не шлю")
         else:
@@ -1521,7 +1506,9 @@ class SolEngine:
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         target = _target(run.inst, bk.tokens(run.dec), run.step)
-        side, qty = ("SELL", target - bk.short) if target > bk.short else ("BUY", bk.short - target)
+        decision = Exposure(run.inst.fs, run.inst.fp, run.step).decide(
+            bk.tokens(run.dec), bk.short, "rehedge", rounding="target")
+        side, qty = decision.side, decision.quantity
         if qty <= 0:
             return self._settle_fix(run, noop="ноги уже ровно — ничего не отправлено")
         if side != run.spec.get("side"):

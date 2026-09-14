@@ -24,6 +24,7 @@ import json, logging, time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable
+from .operations import OperationController, SpotSettlement
 from .. import config
 from . import marks, report, store, tconfig
 from .engine import DealBook, Legs, backfill_instruments, deal_book, dget
@@ -175,7 +176,7 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
     for c in rows:
         cid, st = int(c["id"]), c["state"]
         if legs.sim:
-            store.set_clip_state(con, cid, ClipState.DEX_REVERTED)
+            OperationController(con).settle_spot(cid, SpotSettlement(False))
             store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st,
                         why="симуляция: состояние потеряно при перезапуске — клип не случился")
             continue
@@ -185,7 +186,8 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
         if ok is not None and (ok["amount_in"] is None or ok["amount_out"] is None):
             ok = _refetch_amounts(con, legs.spot, ok, tok.get(cid, (None, None)))
         if ok is not None and ok["amount_in"] is not None and ok["amount_out"] is not None:
-            store.set_clip_state(con, cid, ClipState.DEX_OK, dex_in=int(ok["amount_in"]), dex_out=int(ok["amount_out"]))
+            OperationController(con).settle_spot(
+                cid, SpotSettlement(True, int(ok["amount_in"]), int(ok["amount_out"])))
             store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st, now="DEX_OK", tx=ok["tx_hash"])
             continue
         unknown = ok is not None or any(t["state"] in UNRESOLVED_TX for t in txs) \
@@ -196,7 +198,7 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
             out.append(f"клип {cid}: исход свопа неизвестен")
             continue
         # не подписан (строки нет — отправки не было: запись идёт ДО неё) / выброшен / откатился / отменён
-        store.set_clip_state(con, cid, ClipState.DEX_REVERTED)
+        OperationController(con).settle_spot(cid, SpotSettlement(False))
         store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st, now="DEX_REVERTED",
                     txs=[(t["tx_hash"], t["state"]) for t in txs])
     return out

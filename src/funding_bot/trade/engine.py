@@ -31,6 +31,8 @@ from ..symbols import norm_symbol_factor
 from . import owner as owner_mod, planner, report, store, tconfig
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
+from .exposure import Exposure
+from .operations import OperationController, SpotSettlement
 from .planner import PlanRefused
 from .runtime import is_sol_deal
 from .store import ClipState, DealState, IntentStatus, PerpOrderState
@@ -2156,14 +2158,14 @@ class Engine:
         DEX_UNKNOWN и пауза; откат в сети — один повтор по свежей котировке, второй — пауза."""
         con = self.conns.get()
         from .evm import SentUnknown
-        store.set_clip_state(con, clip_id, ClipState.DEX_SENT, expect=(ClipState.PLANNED, ClipState.DEX_REVERTED))
+        OperationController(con).begin_spot(clip_id, retry_reverted=True)
         try:
             res = run.legs.spot.swap(t_in, t_out, int(units), str(clip_id))
         except Exception as e:                 # noqa
             if isinstance(e, SentUnknown) or (not run.legs.sim and self._dex_touched(clip_id)):
                 store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
                 raise Pause("dex_unknown", f"исход свопа неизвестен: {redact(e)}") from None
-            store.set_clip_state(con, clip_id, ClipState.DEX_REVERTED)
+            OperationController(con).settle_spot(clip_id, SpotSettlement(False))
             store.event(con, "dex_not_sent", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, err=redact(e))
             raise Pause("dex_refused", f"своп не отправлен: {redact(e)}") from None
         if run.legs.sim:
@@ -2172,10 +2174,11 @@ class Engine:
         store.event(con, "dex", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, status=res.status,
                     tx=res.tx_hash, a_in=res.amount_in, a_out=res.amount_out, gas_usd=res.gas_usd)
         if res.status == "ok":
-            store.set_clip_state(con, clip_id, ClipState.DEX_OK, dex_in=int(res.amount_in), dex_out=int(res.amount_out))
+            OperationController(con).settle_spot(
+                clip_id, SpotSettlement(True, int(res.amount_in), int(res.amount_out)))
             return res
         if res.status == "reverted":
-            store.set_clip_state(con, clip_id, ClipState.DEX_REVERTED)
+            OperationController(con).settle_spot(clip_id, SpotSettlement(False))
             if retry:
                 log.warning("своп клипа %s откатился — один повтор по свежей котировке", clip_id)
                 return self._dex(run, clip_id, t_in, t_out, units, retry=False)
@@ -2389,14 +2392,9 @@ class Engine:
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         delta, step, m = bk.delta(run.dec), run.f.step, bk.m
-        ts = step * m                          # шаг перпа в токенах
-        side, qty, ro = None, ZERO, False
-        if last_full and bk.tokens(run.dec) < ts:
-            side, qty, ro = "BUY", bk.short, True
-        elif run.kind == "entry" and delta >= ts:
-            side, qty = "SELL", floor_step(delta / m, step)          # δ' = δ − m·qty ∈ [0, шаг·m)
-        elif run.kind == "exit" and delta < 0:
-            side, qty, ro = "BUY", min(ceil_step(-delta / m, step), bk.short), True
+        decision = Exposure(D(1), m, step).decide(bk.tokens(run.dec), bk.short, run.kind,
+                                                 last_full=last_full)
+        side, qty, ro = decision.side, decision.quantity, decision.reduce_only
         if side is None or qty <= 0:
             store.set_clip_state(con, clip_id, ClipState.BALANCED, perp_qty=ZERO, perp_quote=ZERO, carry_in=carry_in,
                                  carry_out=delta)
@@ -2677,11 +2675,9 @@ class Engine:
         if not bk.m_known:                     # одобрено раньше, а m сделки теперь не известен (ревью 13.09, M3)
             raise Pause("inst_unverified", f"{_views().m_unknown_text(run.did)} ({bk.inst_why}) — дохедж не отправляю")
         delta, step, m = bk.delta(run.dec), run.f.step, bk.m
-        if delta >= step * m:                  # дельта — токены, qty — контракты (те же формулы, что _hedge_clip)
-            side, qty, ro = "SELL", floor_step(delta / m, step), False
-        elif delta < 0:
-            side, qty, ro = "BUY", min(ceil_step(-delta / m, step), bk.short), True
-        else:
+        decision = Exposure(D(1), m, step).decide(bk.tokens(run.dec), bk.short, "rehedge")
+        side, qty, ro = decision.side, decision.quantity, decision.reduce_only
+        if side is None or qty <= 0:
             return self._settle_fix(run, noop="ноги уже ровно — ничего не отправлено")
         if side == "SELL" and not bk.inst_ok:  # одобрено раньше, а m сделки не подтверждён (ревью 13.09, R6)
             raise Pause("inst_unverified", f"инструмент сделки {run.did} не подтверждён ({bk.inst_why}) — дохедж "
