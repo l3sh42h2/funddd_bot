@@ -227,3 +227,38 @@ def test_two_gate_signers_cannot_join_same_connection_transaction(tmp_path,monke
     assert results[0]=='FILLED' and results[1].startswith('OperationalError:'), results
     assert sum(r.method=='POST' for r in fake.sent)==1
     assert fake.position_row['size']==-2
+
+
+@pytest.mark.parametrize('venue', ['aster', 'gate'])
+@pytest.mark.parametrize('resolved_before_sign', [False, True])
+def test_native_subclass_super_and_nested_view_keep_signing_fence(tmp_path, venue, resolved_before_sign):
+    con, native, fake, journal, params, proof = setup(tmp_path, venue)
+    base = type(native)
+
+    class Child(base):
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('a view must not construct another transport')
+
+        def ioc(self, *args, **kwargs):
+            self.child_calls = getattr(self, 'child_calls', 0) + 1
+            return super().ioc(*args, **kwargs)
+
+        def history_account(self):
+            return super().history_account()
+
+    native.__class__ = Child
+    first = native.execution_view(con, proof['account'])
+    nested = first.execution_view(con, proof['account'])
+    assert isinstance(nested, Child) and type(first) is type(nested)
+    assert nested._native is native
+    posts = sum(r.method == 'POST' for r in fake.sent)
+    if resolved_before_sign:
+        assert recover_not_submitted(con, **dict(proof, native=nested))
+        with pytest.raises(store.StoreError):
+            nested.ioc(*params, on_signed=lambda n: journal.on_signed(params[4], n))
+        assert sum(r.method == 'POST' for r in fake.sent) == posts
+    else:
+        nested.ioc(*params, on_signed=lambda n: journal.on_signed(params[4], n))
+        assert sum(r.method == 'POST' for r in fake.sent) == posts + 1
+        assert not recover_not_submitted(con, **dict(proof, native=nested))
+    assert native.child_calls == first.child_calls == nested.child_calls == 1

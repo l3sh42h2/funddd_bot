@@ -349,10 +349,28 @@ def test_shallow_leg_does_not_block_latest_repair(tmp_path):
 
 def test_first_tick_is_not_blocked_by_history(tmp_path):
     """Пустая БД на старте: тик не ждёт посимвольных обходов — они в фоне, таблица пишется сразу."""
-    w = make_world(); w["hyperliquid"].delay = 0.2
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    w = make_world()
+    entered, release = Event(), Event()
+    history = w['hyperliquid'].history_since
+
+    def blocked_history(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), 'test history was never released'
+        return history(*args, **kwargs)
+    w['hyperliquid'].history_since = blocked_history
     col, t = _collector(tmp_path, w, background=True)
-    t0 = time.time(); tbl = col.once(); dt = time.time() - t0
-    assert tbl["n_ff"] == 13 and dt < 0.5                                   # вызовы истории Hyperliquid по 0.2 с — в фоне
+    # Prove independence while history is still blocked. A 500 ms wall-clock
+    # assertion measured the shared runner's load, not the dependency itself.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        tick = pool.submit(col.once)
+        try:
+            assert entered.wait(5)
+            tbl = tick.result(timeout=5)
+            assert tbl['n_ff'] == 13 and not release.is_set()
+        finally:
+            release.set()
     for _ in range(300):
         if not col._maint_running and col.backfill_state["finished_ts"]:
             break

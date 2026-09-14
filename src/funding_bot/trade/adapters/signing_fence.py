@@ -13,17 +13,36 @@ from .. import store
 
 BARRIER = 'mandatory-signed-callback-v1'
 _OWNER_LOCK = Lock()
+_VIEW_TYPES = {}
 
 
 class ExecutionView:
     """Connection-local fence; transport state, budgets and caches stay shared."""
+    def __new__(cls, native):
+        while isinstance(native, ExecutionView):
+            native = object.__getattribute__(native, '_native')
+        # Native overrides may use super(); their self must remain an instance
+        # of the native class. Never initialize/copy another transport.
+        native_type = type(native)
+        with _OWNER_LOCK:
+            view_type = _VIEW_TYPES.get(native_type)
+            if view_type is None:
+                view_type = type('ExecutionView_' + native_type.__name__, (ExecutionView, native_type), {})
+                _VIEW_TYPES[native_type] = view_type
+        return object.__new__(view_type)
+
     def __init__(self, native):
+        while isinstance(native, ExecutionView):
+            native = object.__getattribute__(native, '_native')
         object.__setattr__(self, '_native', native)
         object.__setattr__(self, '_execution_fence', None)
 
-    def __getattr__(self, name):
-        value = getattr(self._native, name)
-        if isinstance(value, MethodType) and value.__self__ is self._native:
+    def __getattribute__(self, name):
+        if name in {'_native', '_execution_fence', '__class__', '__dict__'}:
+            return object.__getattribute__(self, name)
+        native = object.__getattribute__(self, '_native')
+        value = getattr(native, name)
+        if isinstance(value, MethodType) and value.__self__ is native:
             return MethodType(value.__func__, self)
         return value
 

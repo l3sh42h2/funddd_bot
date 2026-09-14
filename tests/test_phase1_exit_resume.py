@@ -276,7 +276,7 @@ def test_resume_of_partial_exit_refused_while_stopped(tmp_path):
 
 
 def test_resume_of_partial_exit_refused_when_instrument_unverified(tmp_path):
-    """R6: m сделки не подтверждён (inst_json битый) — частичный остаток по units тоже не считается; целиком — можно."""
+    """Tampering with an execution-bound frozen instrument blocks all new sends."""
     e = fx.live_env(tmp_path, clip="50")
     p = _open(e)
     _interrupted(e, p.deal_id, 100)
@@ -288,7 +288,7 @@ def test_resume_of_partial_exit_refused_when_instrument_unverified(tmp_path):
     assert "не подтверждён" in ei.value.html and f"«выход {p.deal_id}» целиком" in ei.value.html
     assert _n_intents(e) == n and fx.sends(e) == before
     fx.run_approved(e, e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER))
-    assert _state(e, p.deal_id) == DealState.CLOSED
+    assert _state(e, p.deal_id) == DealState.PAUSED and fx.sends(e) == before
 
 
 # ==== 8. bot.requote для «продолжить» выхода — снова через остаток, а не usd / цена ====================================
@@ -395,7 +395,7 @@ def test_resume_m1000_sells_exactly_the_rest_and_stays_even(tmp_path):
 def test_dqa9q_partial_exit_resume_after_update(tmp_path):
     e = t11._dqa9q_env(tmp_path)
     e.path.write_text(fx.live_toml("50"))      # клипы по 50 $ — чтобы выход прервался посередине
-    reconcile.startup(e.con, e.legs, now=tm.NOW)
+    t11._activate_core(e)
     x1 = _interrupted(e, "DQA9Q", 100)
     target = _spec(e, x1.intent_id)["units"]
     r = e.desk.propose_resume("DQA9Q", chat=fx.OWNER)

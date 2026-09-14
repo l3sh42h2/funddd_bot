@@ -18,11 +18,22 @@ def _table(**row):
 def _refund_last_exit_swap(e, pct: int):
     """Роутер вернул pct % входа последнего свопа выхода (списал меньше, чем просили)."""
     orig = e.spot.swap
+    build = e.spot.build_swap
 
-    def swap(t_in, t_out, amount, clip_ref):
+    def build_swap(t_in, t_out, amount, **kw):
+        # A successful partial route must still honor its quoted minimum.
+        # Model that route's actual input/output, not a receipt below minOut.
+        if t_in.lower() != fx.STABLE:
+            amount = amount * (100 - pct) // 100
+        return build(t_in, t_out, amount, **kw)
+    e.spot.build_swap = build_swap
+
+    def swap(t_in, t_out, amount, clip_ref, **kw):
         if t_in.lower() == fx.STABLE:
-            return orig(t_in, t_out, amount, clip_ref)
-        return orig(t_in, t_out, amount * (100 - pct) // 100, clip_ref)
+            return orig(t_in, t_out, amount, clip_ref, **kw)
+        result = orig(t_in, t_out, amount * (100 - pct) // 100, clip_ref, **kw)
+        assert result.amount_out >= kw['approved_min_receive']
+        return result
     e.spot.swap = swap
 
 

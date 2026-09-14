@@ -638,7 +638,7 @@ def test_restart_exiting_closes_only_below_one_contract(tmp_path):
 # ==== регрессия m = 1: DQA9Q — тексты и числа прежние ======================================================================
 def test_dqa9q_m1_texts_and_numbers_unchanged(tmp_path):
     e = t11._dqa9q_env(tmp_path)
-    reconcile.startup(e.con, e.legs, now=t11.tm.NOW)
+    t11._activate_core(e)
     deal = store.get_deal(e.con, "DQA9Q")
     chk = reconcile.check_deal(e.con, deal, e.legs_live)
     assert chk.m == 1 and chk.detail == "кошелёк 4 902 AIW3, шорт 4 902 — как в журнале".replace(" 9", views.NBSP + "9")

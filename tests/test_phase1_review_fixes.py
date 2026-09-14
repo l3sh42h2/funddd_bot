@@ -37,10 +37,11 @@ def _broken(e, did):
     e.con.execute("UPDATE deals SET inst_json=? WHERE id=?", (json.dumps(raw), did))
 
 
-def test_unreadable_inst_m1000_no_undo_no_rehedge_and_full_exit_closes(tmp_path):
-    """Сценарий ревьюера: m = 1000, 2 444.6 токена, шорт 2 контр. По m = 1 «откат» продал бы 2 442 захеджированных
-    токена (голый шорт −2 000), а полный выход был закрыт «ноги не ровно». Теперь: m не известен — дохедж, откат и
-    частичный выход отказаны, сверка и «позиции» не советуют их, полный выход продаёт весь спот и откупает весь шорт."""
+def test_tampered_bound_inst_m1000_blocks_all_execution(tmp_path):
+    """Legacy unknown-unit views never authorize rewriting a bound identity.
+
+    The authentic pre-binding DQA9Q fixture separately covers permitted legacy exits.
+    """
     e = t12.mult_env(tmp_path)
     did = t12.enter(e).deal_id
     _broken(e, did)
@@ -67,32 +68,31 @@ def test_unreadable_inst_m1000_no_undo_no_rehedge_and_full_exit_closes(tmp_path)
     txt = flat(views.positions([views.PositionView(**r) for r in rows], ts=time.time(), matched=matched))
     assert f"множитель контракта не известен — только <code>выход {did}</code> целиком" in txt, txt
     assert "без хеджа" not in txt
-    # полный выход: весь спот одним свопом, весь шорт reduceOnly — CLOSED, ничего не осталось
+    # Old planning presentation remains readable, but execution binding rejects tampering.
     x = e.desk.propose_exit(did, None, False, chat=fx.OWNER)
     t = flat(x.html)
     assert "Выход AIW3 · всё" in t and "Продать спот 2 445 · откупить шорт 2 контр." in t and "(= " not in t, t
     assert "Множитель контракта не известен — продаю весь спот и откупаю весь шорт" in t
-    n0 = len(e.perp.calls)
+    before = fx.sends(e)
     fx.run_approved(e, x)
-    assert [(c["side"], c["qty"], c["ro"]) for c in e.perp.calls[n0:]] == [("BUY", 2, True)]
-    assert e.perp.pos == 0 and e.spot.bal[fx.TOKEN] == 0
-    assert store.get_deal(e.con, did)["state"] == DealState.CLOSED
-    assert "закрыта" in e.hooks.reports[-1] and fx.html_ok(e.hooks.reports[-1])
+    assert fx.sends(e) == before and e.perp.pos == -2
+    assert store.get_intent(e.con, x.intent_id)['status'] == IntentStatus.FAILED
+    assert store.get_deal(e.con, did)['state'] == DealState.OPEN
 
 
-def test_unreadable_inst_perp_only_exit_then_full_exit_closes(tmp_path):
-    """Безопасный путь без m: «выход перп» (весь шорт) → текст зовёт «выход», не «откат» → «выход» продаёт спот."""
+
+def test_tampered_bound_inst_perp_only_also_refuses(tmp_path):
+    """Execution binding covers both legs; corrupt identity cannot close either."""
     e = t12.mult_env(tmp_path)
     did = t12.enter(e).deal_id
     _broken(e, did)
-    fx.run_approved(e, e.desk.propose_exit(did, None, True, chat=fx.OWNER))
-    assert e.perp.pos == 0 and store.get_deal(e.con, did)["state"] == DealState.PAUSED
-    rep = flat(e.hooks.reports[-1])
-    assert "Откуплено 2 контр. = " in rep and f"<code>выход {did}</code>" in rep and "откат" not in rep, rep
-    with pytest.raises(eng.Refused):
-        e.desk.propose_fix("undo", did, chat=fx.OWNER)
-    fx.run_approved(e, e.desk.propose_exit(did, None, False, chat=fx.OWNER))
-    assert store.get_deal(e.con, did)["state"] == DealState.CLOSED and e.spot.bal[fx.TOKEN] == 0
+    before = fx.sends(e)
+    for perp_only in (True, False):
+        proposal = e.desk.propose_exit(did, None, perp_only, chat=fx.OWNER)
+        fx.run_approved(e, proposal)
+        assert store.get_intent(e.con, proposal.intent_id)['status'] == IntentStatus.FAILED
+        assert fx.sends(e) == before and e.perp.pos == -2
+
 
 
 @pytest.mark.parametrize("variant,source,known", [("ratio", "legacy:m_unknown", False),
@@ -126,7 +126,7 @@ def test_approved_undo_and_auto_unwind_send_nothing_when_m_becomes_unknown(tmp_p
     fx.run_approved(e, und)
     assert fx.sends(e) == before and e.spot.approvals == appr
     assert store.get_intent(e.con, und.intent_id)["status"] == IntentStatus.FAILED
-    assert store.get_deal(e.con, did)["reason"] == "inst_unverified"
+    assert any("счёт исполнения не подтверждён" in message.lower() for message in e.hooks.reports)
     e.engine._unwind_due[did] = 0.0
     n = _n_intents(e)
     e.engine._check_unwinds()

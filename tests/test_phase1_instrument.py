@@ -178,6 +178,15 @@ def _dqa9q_env(tmp_path, *, old_db: bool = True):
     return e
 
 
+def _activate_core(e):
+    """Use actual startup: backfill, authenticated execution binding, recovery."""
+    from funding_bot.core.commands import Bot
+    bot = object.__new__(Bot)
+    bot.conns, bot.legs, bot.clock = e.conns, e.legs, lambda: tm.NOW
+    bot.chat = lambda: None
+    return bot.startup()
+
+
 def test_dqa9q_backfill_on_startup_writes_verified_m1_once(tmp_path):
     e = _dqa9q_env(tmp_path)
     assert store.get_deal(e.con, "DQA9Q")["inst_json"] is None

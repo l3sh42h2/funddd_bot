@@ -440,7 +440,7 @@ def test_perp_only_exit_then_undo_without_table(tmp_path):
 def test_dqa9q_exit_after_update_uses_frozen_instrument(tmp_path, started):
     e = t11._dqa9q_env(tmp_path, old_db=started)
     if started:
-        reconcile.startup(e.con, e.legs, now=tm.NOW)
+        t11._activate_core(e)
     e.desk.table_loader = _no_table
     # намерение прежнего кода (без отпечатка), одобренное до выката: старт его гасит, а если нет — не исполняется
     x0 = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
@@ -453,6 +453,13 @@ def test_dqa9q_exit_after_update_uses_frozen_instrument(tmp_path, started):
     x1 = e.desk.propose_exit("DQA9Q", D(100), False, chat=fx.OWNER)
     assert _spec_of(e, x1.intent_id)["inst_hash"] == _deal_hash(e, "DQA9Q") == x1.plan.inputs["inst_hash"]
     assert (store.get_deal(e.con, "DQA9Q")["inst_json"] is None) is (not started)
+    if not started:
+        # No authenticated startup binding yet: never silently adopt an account
+        # from an exit button. Core activation is read-only at the venue.
+        fx.run_approved(e, x1)
+        assert fx.sends(e) == (0, 0)
+        t11._activate_core(e)
+        x1 = e.desk.propose_exit("DQA9Q", D(100), False, chat=fx.OWNER)
     fx.run_approved(e, x1)
     assert _state(e, "DQA9Q") == DealState.OPEN
     _even(e, "DQA9Q")
