@@ -25,7 +25,7 @@ class Journal:
         con = self.conns.get()
         if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_meta'").fetchone():
             version = con.execute("SELECT value FROM core_meta WHERE key='schema_version'").fetchone()
-            if version and version[0] not in ('1', '2'):
+            if version and version[0] != '1':
                 raise RpcError('unsupported_core_schema')
         con.executescript(SCHEMA)
         con.execute("INSERT OR IGNORE INTO core_meta VALUES('schema_version','1')")
@@ -93,19 +93,9 @@ class Journal:
                     (json.dumps({'reason': 'core_restart_requires_new_plan'}), time.time()))
 
     def emit(self, payload):
-        con = self.conns.get()
-        body = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        # A new wire event and its rollback reader fence must commit together.
-        from ..trade import store
-        with store.tx(con):
-            if payload.get('dto_version') == 2:
-                # Old Journal implementations already enforce this gate. A
-                # previous artifact's runner must not boot an unaware core.
-                con.execute("UPDATE core_meta SET value='2' WHERE key='schema_version'")
-                con.execute("INSERT INTO core_meta(key,value) VALUES('notification_dto_version','2') "
-                            "ON CONFLICT(key) DO UPDATE SET value='2'")
-            cur = con.execute('INSERT INTO core_notifications(payload,created) VALUES(?,?)', (body, time.time()))
-            return cur.lastrowid
+        cur = self.conns.get().execute('INSERT INTO core_notifications(payload,created) VALUES(?,?)',
+                                       (json.dumps(payload, ensure_ascii=False), time.time()))
+        return cur.lastrowid
 
     def notifications(self, after=0, limit=20):
         if not isinstance(after, int) or after < 0 or not isinstance(limit, int) or not 1 <= limit <= 20:
@@ -198,60 +188,6 @@ class Outbox:
 
     def answer_callback_query(self, callback_id, text):
         return self._emit(dict(kind='answer', callback_id=callback_id, text=text))
-
-    def approval_reply(self, callback_id, reason):
-        from ..ipc.notifications import DTO_VERSION, APPROVAL_REASONS
-        if reason not in APPROVAL_REASONS:
-            raise RpcError('unsupported_approval_reason')
-        return self._emit(dict(kind='approval_reply', dto_version=DTO_VERSION,
-                               callback_id=callback_id, reason=reason))
-
-    def notice(self, recipient, topic, **facts):
-        from ..ipc.notifications import DTO_VERSION, validate_notice
-        validate_notice(topic, facts)
-        return self._emit(dict(kind='operator_notice', dto_version=DTO_VERSION,
-                               chat_id=recipient, topic=topic, facts=facts))
-
-    def status_report(self, chat_id, snapshot):
-        from dataclasses import asdict
-        from ..ipc.notifications import DTO_VERSION
-        from ..ipc.reports import StatusView, encode
-        if not isinstance(snapshot, StatusView):
-            raise RpcError('invalid_status_snapshot')
-        return self._emit(dict(kind='status_report', dto_version=DTO_VERSION,
-                               chat_id=chat_id, snapshot=encode(asdict(snapshot))))
-
-    def positions_report(self, chat_id, snapshots, *, at, matched, mismatch, sim):
-        from dataclasses import asdict
-        from ..ipc.notifications import DTO_VERSION
-        from ..ipc.reports import PositionView, encode
-        if not all(isinstance(s, PositionView) for s in snapshots):
-            raise RpcError('invalid_positions_snapshot')
-        return self._emit(dict(kind='positions_report', dto_version=DTO_VERSION, chat_id=chat_id,
-                               snapshots=encode([asdict(s) for s in snapshots]), at=at,
-                               matched=matched, mismatch=mismatch, sim=sim))
-
-    def restart_report(self, chat_id, snapshot, *, solana=False, check_only=False):
-        from dataclasses import asdict
-        from ..ipc.notifications import DTO_VERSION
-        from ..ipc.reports import RestartView, encode
-        if not isinstance(snapshot, RestartView) or type(solana) is not bool or type(check_only) is not bool:
-            raise RpcError('invalid_restart_snapshot')
-        return self._emit(dict(kind='restart_report', dto_version=DTO_VERSION, chat_id=chat_id,
-                               snapshot=encode(asdict(snapshot)), solana=solana, check_only=check_only))
-
-    def plan_closed(self, chat_id, message_id, summary, action, at):
-        from ..ipc.notifications import DTO_VERSION
-        return self._emit(dict(kind='plan_closed', dto_version=DTO_VERSION, chat_id=chat_id,
-                               message_id=message_id, summary=summary, action=action, at=at))
-
-    def plan_proposed(self, chat_id, intent_id, nonce, summary, legacy_body, on_done=None):
-        from ..ipc.notifications import DTO_VERSION
-        if self.plan_guard is None:
-            raise RpcError('plan_guard_missing')
-        self.plan_guard(intent_id)
-        return self._emit(dict(kind='plan_proposed', dto_version=DTO_VERSION, chat_id=chat_id,
-                               plan_id=intent_id, nonce=nonce, summary=summary, legacy_body=legacy_body), on_done)
 
     def ack(self, eid, result):
         with self.lock:

@@ -633,7 +633,8 @@ def test_first_transition_migrates_latest_state_offsets_and_secrets_privately(tm
     assert oct((paths.state / 'secrets/core.env').stat().st_mode & 0o777) == '0o600'
 
 
-def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state(tmp_path, monkeypatch):
+@pytest.mark.parametrize('late_dto', [False, True])
+def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state(tmp_path, monkeypatch, late_dto):
     paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
     paths.lock = tmp_path / 'deploy.lock'; paths.execution_lock = paths.state / 'core/execution.lock'
     old_manifest = {'release_id': 'old-release', 'source_revision': '1' * 40,
@@ -642,6 +643,8 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
                     'component_hashes': {'core': 'old', 'collector': 'old', 'interface': 'old'},
                     'dependencies': {'old': 1}, 'ipc_version': 1, 'dto_version': 1,
                     'schema_version': 2, 'min_reader': 2, 'compatible_readers': [2]}
+    if late_dto:
+        old_manifest['dto_version'] = 2
     old_release = paths.releases / 'old-release'; old_release.mkdir(parents=True)
     af.atomic_json(old_release / 'release-manifest.json', old_manifest)
     old_state = {'format_version': 1, 'generation': 7, **{k: old_manifest[k] for k in (
@@ -655,11 +658,22 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
                         verification_identity_sha256='w' * 64,
                         component_hashes={'core': 'new', 'collector': 'new', 'interface': 'new'},
                         dependencies={'new': 1})
+    new_manifest['dto_version'] = 1
+    from funding_bot.core.journal import Journal, Outbox
+    from funding_bot.trade.engine import Conns
+    from funding_bot.trade import store
+    (paths.state / 'core').mkdir(parents=True)
+    conns = Conns(paths.state / 'core/trade.db')
+    store.require_reader(conns.get(), 2)
+    out = Outbox(Journal(conns))
     events = []
     monkeypatch.setattr(job, 'verify_bundle', lambda *a: ({'identity': {}}, dict(new_manifest)))
     monkeypatch.setattr(job, 'current_identity', lambda *_: expected_value)
-    monkeypatch.setattr(job, 'database_info', lambda *_: {'schema_version': 2, 'min_reader': 2})
-    monkeypatch.setattr(job, 'wait_drain', lambda *a, **k: events.append('safe_old'))
+    def wait_old(*a, **k):
+        if late_dto:
+            out.approval_reply('cb', 'paused')
+        events.append('safe_old')
+    monkeypatch.setattr(job, 'wait_drain', wait_old)
     monkeypatch.setattr(job, '_wait_inactive', lambda *a: events.append('old_stopped'))
     monkeypatch.setattr(job, 'provision_accounts', lambda *a: events.append('accounts'))
     def backup(src, dst):
@@ -692,6 +706,13 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
             args = list(map(str, argv))
             code = 0 if args[:4] == ['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'] else 0
             return subprocess.CompletedProcess(argv, code, '')
+    if late_dto:
+        monkeypatch.setattr(job, 'restore_before_switch', lambda *a, **kw: dict(old_state['components']))
+        with pytest.raises(job.DeployFailure, match='new release cannot read stopped trade.db'):
+            job.Job(paths, Commands(), Client).install(tmp_path / 'artifact', tmp_path / 'receipt', expected)
+        assert 'lock_free' in events and 'units' not in events and 'switch' not in events
+        assert 'dry_migration' not in events
+        return
     report = job.Job(paths, Commands(), Client).install(tmp_path / 'artifact', tmp_path / 'receipt', expected)
     state = json.loads(paths.release_state.read_text())
     assert report['status'] == 'healthy' and state['release_id'] == 'new-release' and state['generation'] == 8

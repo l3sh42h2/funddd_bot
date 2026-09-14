@@ -83,3 +83,28 @@ Checkpoint общего lifecycle и корневых операций (2026-09-
   исключения дают IGNORE, иных различий не найдено. Профиль reviewer: 232 passed. Локальный IPC/approval: 26 passed.
 - Это промежуточный перенос AC-07: presenters/outbox ещё требуют отделения. Generic execution и scoped accounting
   пока не подключены сквозным образом. M4/M5 остаются in_progress, боевого выката не было.
+
+### AC-07: уведомления и отчёты перенесены в interface (промежуточно)
+
+- core.commands больше не импортирует Telegram views/sender. Коды ответов approval, публичные шапки планов,
+  кнопки, короткие operator notices, status/positions/restart snapshots обрабатывает interface.presenter.
+- Точные Decimal передаются явными значениями, None сохраняет неизвестность. Snapshot не сериализует
+  произвольные Python-объекты. Шапка плана включает только публичные поля, исключает owner/wallet/inst config.
+- Plan guard вызывается до постановки плана в outbox. Durable plan_id/nonce/ACK binding сохранены;
+  ACK связывает сообщение с планом и не одобряет сделку. Ошибка UI после approval не отменяет единственный submit.
+- Старые send/edit/answer продолжают доставляться. Первый DTO2 event атомарно поднимает core_meta.schema_version
+  до 2. Новый deploy проверяет DTO reader повторно после остановки writer; регрессии late-event проверены
+  для rollback и установки downgrade. Старый verified runner может попытаться выбрать код, но предыдущий
+  Journal откажется запускаться по уже существовавшим schema gates; не утверждается, что старый runner знает DTO2.
+- Найдено и исправлено падение команды «статус» из-за self.sender.fails в процессе core (Outbox такого счётчика
+  не имеет). Свои Telegram delivery/poll health добавляет interface при отображении отчёта.
+- Профиль уведомления/approval/IPC/M5/TG: 222 passed, 1 Linux-only skipped, 6.47s. Дополнительный install test
+  со свежим DTO2 событием во время drain: 2 passed (включая прежний сценарий). Отдельный полный Linux прогон не делался.
+- Astra закрыл два reader-gate замечания и проверил пакет кнопок/ACK; расширение reports проходит отдельное bounded review.
+- AC-07 ещё НЕ закрыт: p.html/Refused.html и execution progress/report hooks сохраняют legacy представление;
+  core read-model и общий денежный lifecycle требуют дальнейшего переноса. M4/M5 in_progress, production не менялся.
+
+- Дополнение: Astra нашёл утечку HTML-escaped зарегистрированного секрета через резервный лог say/alarm при
+  отсутствующем owner. Эти ветки больше не логируют тело сообщения; synthetic secret regression проверяет обе.
+  Последний целевой notification profile: 22 passed. Canonical report dataclasses перенесены в ipc/reports,
+  Telegram re-exports сохранены для старых callers; core.commands больше напрямую не зависит от tg package.

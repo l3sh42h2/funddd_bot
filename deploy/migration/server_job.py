@@ -92,7 +92,15 @@ def database_info(path):
         row = con.execute("SELECT v FROM flags WHERE k='tg_offset'").fetchone()
         if row:
             offset = int(row[0])
-        return {'schema_version': schema, 'min_reader': min_reader, 'tg_offset': offset}
+        notification_dto = 1
+        if 'core_meta' in tables:
+            row = con.execute("SELECT value FROM core_meta WHERE key='notification_dto_version'").fetchone()
+            if row:
+                notification_dto = int(row[0])
+                if notification_dto < 1:
+                    raise DeployFailure('invalid notification DTO reader version')
+        return {'schema_version': schema, 'min_reader': min_reader, 'tg_offset': offset,
+                'notification_dto_version': notification_dto}
     finally:
         con.close()
 
@@ -231,7 +239,9 @@ def freeze_release(root):
 
 def compatible_reader(manifest, db):
     readers = manifest.get('compatible_readers')
-    return isinstance(readers, list) and db['min_reader'] in readers and manifest.get('schema_version', 0) >= db['min_reader']
+    return (isinstance(readers, list) and db['min_reader'] in readers
+            and manifest.get('schema_version', 0) >= db['min_reader']
+            and manifest.get('dto_version', 1) >= db.get('notification_dto_version', 1))
 
 
 def ui_only(previous, new):
@@ -836,6 +846,10 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
     commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
     _wait_inactive(commands, 'funding_bot-collector.service')
     execution_lock_free(paths.execution_lock)
+    # Drain can still produce notifications. Only this post-writer snapshot is
+    # authoritative for the code reader that is about to replace the current one.
+    if not compatible_reader(previous_manifest, database_info(paths.state / 'core/trade.db')):
+        raise DeployFailure('ROLLBACK_READER_INCOMPATIBLE')
     install_units(previous_release, commands)
     switch_link(paths, previous_release)
     commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
@@ -1132,6 +1146,8 @@ class Job:
                     report['backup'] = {'path': str(backup), 'sha256': af.backup_database(db_path, backup)}
                 if not is_ui:
                     execution_lock_free(p.execution_lock)
+                    if not compatible_reader(template, database_info(p.state / 'core/trade.db')):
+                        raise DeployFailure('new release cannot read stopped trade.db')
                     self.commands.run(['chown', 'funding-core:funding-core', p.execution_lock])
                     os.chmod(p.execution_lock, 0o600)
                     report['stages'].append('execution_released')

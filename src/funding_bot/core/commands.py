@@ -10,12 +10,11 @@ from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Refused, build
 from ..trade.keys import KeysError, effective_mode, install_log_redaction, redact
 from ..trade.owner import OwnerConfigError
 from ..trade.store import DealState
-from ..tg import views
+from ..ipc.reports import PositionView, StatusView, RestartView
 from . import authority as auth
 from ..ipc.source import legacy_telegram_source
 from .approvals import ApprovalAction, decide
 from .. import operator_commands as parse
-from ..tg.sender import escape, to_plain
 
 log = logging.getLogger(__name__)
 
@@ -145,33 +144,26 @@ class Bot:
     def say(self, html: str, *, reply_markup: dict | None = None, on_done=None, silent: bool = False) -> bool:
         chat = self.chat()
         if chat is None:
-            log.warning("owner_id не задан — сообщение только в журнал: %s", redact(to_plain(html)[:300]))
+            log.warning("owner_id не задан — сообщение не доставлено")
             return False
         return self.sender.send(chat, html, reply_markup=reply_markup, on_done=on_done, silent=silent)
 
     def alarm(self, kind: str, text: str) -> None:
         chat = self.chat()
         if chat is None:
-            log.error("тревога %s без владельца: %s", kind, redact(to_plain(text)[:200]))
+            log.error("тревога без владельца — сообщение не доставлено")
             return
         self.sender.alarm(chat, text, kind)
 
-    def _head(self, iid: str | None) -> views.PlanHead:
-        """Шапка плана из данных намерения и сделки (переживает перезапуск, в отличие от HTML в памяти): подпись
-        кнопки «✅ Войти 200 $» и строка закрытия «⏳ Вход AIW3 · 200 $ на ногу — принят 18:58, исполняю».
-        Никогда не бросает: в _press шапка строится ДО engine.submit — сбой подписи не должен оставить принятое
-        намерение без исполнения (и план без кнопок)."""
+    def _plan_summary(self, iid):
+        from ..ipc.notifications import plan_summary
         try:
             con = self.conns.get()
             it = store.get_intent(con, iid) if iid else None
-            return views.intent_head(it, store.get_deal(con, it["deal_id"]) if it else None)
-        except Exception as e:                 # noqa
-            log.warning("tg: шапка плана %s не построена: %s", iid, redact(e))
-            return views.PlanHead("План", "✅ Да", self.mode == "dry")
-
-    def _closed(self, iid: str | None, action: str, ts: float) -> str:
-        h = self._head(iid)
-        return views.plan_closed(action, h.title, ts, h.sim)
+            return plan_summary(it, store.get_deal(con, it['deal_id']) if it else None)
+        except Exception as e:
+            log.warning('plan summary: %s', redact(e))
+            return {'fallback': True, 'sim': self.mode == 'dry'}
 
     # --- диспетчер (поток опроса) ---
     def handle(self, u: dict) -> str | None:
@@ -181,9 +173,9 @@ class Bot:
         d = auth.classify(legacy_telegram_source(u), owner_id, now=now, limiter=self.limiter)
         v = d.verdict
         if v == auth.STALE:
-            self.sender.send(d.chat_id, views.stale(d.date))
+            self.sender.notice(d.chat_id, 'command_stale', date=d.date)
         elif v == auth.STRANGER_START:
-            self.sender.send(d.chat_id, views.start_reply(d.chat_id, d.user_id))
+            self.sender.notice(d.chat_id, 'operator_identity', chat_id=d.chat_id, user_id=d.user_id)
         elif v == auth.STRANGER_CB:
             self._answer(d.callback_id, None)
             log.info("tg: чужое нажатие от %s — игнор", d.user_id)
@@ -210,30 +202,38 @@ class Bot:
         cb = parse.parse_callback(d.text)
         action = ApprovalAction(cb.action, cb.intent_id, cb.nonce) if cb else None
         r = decide(con, action, paused=paused, now=now)
-        self._answer(d.callback_id, getattr(views, 'CB_' + r.reason.upper()))
-        if r.closed and d.chat_id is not None and d.message_id is not None:
-            self.sender.edit(d.chat_id, d.message_id, self._closed(r.intent_id, r.closed, now), reply_markup=None)
-        if r.submit:
-            log.info("tg: намерение %s одобрено владельцем — исполнителю", r.intent_id)
-            self.engine.submit(r.intent_id)
+        try:
+            if d.callback_id and self.poll_api is not None:
+                try:
+                    self.poll_api.approval_reply(d.callback_id, r.reason)
+                except Exception as e:
+                    log.warning('approval notification: %s', redact(e))
+            if r.closed and d.chat_id is not None and d.message_id is not None:
+                self.sender.plan_closed(d.chat_id, d.message_id, self._plan_summary(r.intent_id), r.closed, now)
+        except Exception as e:
+            log.warning("approval delivery deferred: %s", redact(e))
+        finally:
+            if r.submit:
+                log.info("tg: намерение %s одобрено владельцем — исполнителю", r.intent_id)
+                self.engine.submit(r.intent_id)
 
     def _job(self, chat: int, name: str, fn: Callable[[], Any]) -> None:
         if not self.jobs.put(name, fn):
-            self.sender.send(chat, views.error("команд в очереди слишком много — повторите через минуту"))
+            self.sender.notice(chat, 'error', reason='команд в очереди слишком много — повторите через минуту')
 
     def _command(self, d: auth.Decision, cfg_err: OwnerConfigError | None) -> None:
         cmd = parse.parse(d.text or "")
         chat = d.chat_id
         name = cmd.name
         if cfg_err is not None and name not in ("stop", "help", "start", "unknown"):
-            self.sender.send(chat, views.owner_config_error(cfg_err))    # «стоп» работает и с битым файлом
+            self.sender.notice(chat, 'configuration_error', reason=redact(cfg_err))    # «стоп» работает и с битым файлом
             return
         if name == "stop":
             self.stop_cmd(chat)
         elif name in ("help", "start"):
-            self.sender.send(chat, views.help_text(sim=self.mode == "dry", sol=self._sol_on()))
+            self.sender.notice(chat, 'help_requested', sim=self.mode == 'dry', sol=self._sol_on())
         elif name == "unknown":
-            self.sender.send(chat, views.unknown(cmd))
+            self.sender.notice(chat, 'command_unknown', reason=cmd.reason)
         elif name == "resume":
             if cmd.target is None:
                 self.resume_cmd(chat)
@@ -242,18 +242,18 @@ class Bot:
                 t = cmd.target
                 self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_resume(t, chat)))
         elif name == "entry":
-            self.sender.send(chat, views.planning(cmd.coin, "entry"))
+            self.sender.notice(chat, 'planning_started', coin=cmd.coin, side='entry')
             self._job(chat, name, lambda: self.propose(
                 chat, lambda: self.desk.propose_entry(cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat)))
         elif name == "exit":
-            self.sender.send(chat, views.planning(cmd.target, "exit"))
+            self.sender.notice(chat, 'planning_started', coin=cmd.target, side='exit')
             self._job(chat, name, lambda: self.propose(
                 chat, lambda: self.desk.propose_exit(cmd.target, cmd.usd, cmd.perp_only, chat)))
         elif name == "profile_entry":             # связка Solana × Hyperliquid: инструмент — из реестра профиля
-            self.sender.send(chat, views.planning(cmd.coin, "entry"))
+            self.sender.notice(chat, 'planning_started', coin=cmd.coin, side='entry')
             self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_profile_entry(cmd, chat)))
         elif name == "profile_exit":
-            self.sender.send(chat, views.planning(cmd.target, "exit"))
+            self.sender.notice(chat, 'planning_started', coin=cmd.target, side='exit')
             self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_profile_exit(cmd, chat)))
         elif name in ("rehedge", "undo"):
             self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_fix(name, cmd.target, chat)))
@@ -271,11 +271,8 @@ class Bot:
         self.engine.pause_evt.set()
         store.event(con, "stop", was=was)
         cur = self.engine.current
-        if was:
-            text = views.already_paused()
-        else:
-            text = views.paused(cur[1], cur[2]) if cur else views.paused()
-        self.sender.send(chat, text)
+        self.sender.notice(chat, 'pause_changed', already=was, clip=cur[1] if cur else None,
+                           clips=cur[2] if cur else None)
 
     def resume_cmd(self, chat: int, quiet: bool = False) -> None:
         con = self.conns.get()
@@ -289,7 +286,7 @@ class Bot:
         ids = [r[0] for r in con.execute(
             "SELECT i.id FROM intents i JOIN deals d ON d.id = i.deal_id WHERE i.status IN ('interrupted','partial') "
             "AND d.state = 'PAUSED' ORDER BY i.created DESC LIMIT 5")]
-        self.sender.send(chat, views.resumed(ids) if was else views.not_paused())
+        self.sender.notice(chat, 'resume_changed', was=was, interrupted=ids)
 
     # --- планы (поток заданий) ---
     def propose(self, chat: int, fn: Callable[[], Any]):
@@ -300,17 +297,17 @@ class Bot:
             self.sender.send(chat, e.html)
             return None
         except OwnerConfigError as e:
-            self.sender.send(chat, views.owner_config_error(e))
+            self.sender.notice(chat, 'configuration_error', reason=redact(e))
             return None
         except Exception as e:                 # noqa
             log.exception("план не построен")
-            self.sender.send(chat, views.error(f"план не построен: {type(e).__name__}: {redact(e)}"))
+            self.sender.notice(chat, 'error', reason=f'план не построен: {type(e).__name__}: {redact(e)}')
             return None
         if isinstance(p, str):
             self.sender.send(chat, p)
             return None
-        self.sender.send(chat, p.html, reply_markup=views.plan_keyboard(p.intent_id, p.nonce, self._head(p.intent_id).ok),
-                         on_done=lambda m, iid=p.intent_id: self._plan_sent(iid, chat, m))
+        self.sender.plan_proposed(chat, p.intent_id, p.nonce, self._plan_summary(p.intent_id), p.html,
+                                  on_done=lambda m, iid=p.intent_id: self._plan_sent(iid, chat, m))
         for old in getattr(p, "superseded", ()) or ():     # новый план сделки — у прежних снимаются кнопки
             self._close_plan(old, "expired")
         return p
@@ -334,8 +331,7 @@ class Bot:
     def _close_plan(self, iid: str, action: str) -> None:
         row = store.get_intent(self.conns.get(), iid)
         if row and row["chat"] and row["msg_id"]:
-            self.sender.edit(int(row["chat"]), int(row["msg_id"]), self._closed(iid, action, self.clock()),
-                             reply_markup=None)
+            self.sender.plan_closed(int(row["chat"]), int(row["msg_id"]), self._plan_summary(iid), action, self.clock())
 
     def housekeep(self) -> None:
         for iid in store.expire_intents(self.conns.get(), now=self.clock()):
@@ -370,7 +366,7 @@ class Bot:
         if chat is None or deal is None:
             return
         self._close_plan(iid, "requote")
-        self.sender.send(chat, views.requote(reason, sim=bool(deal["sim"])))
+        self.sender.notice(chat, 'plan_requoted', reason=reason, sim=bool(deal['sim']))
         if spec.get("resume"):
             fn = lambda: self.desk.propose_resume(deal["id"], chat)
         elif it["kind"] == "entry" and spec.get("profile") == owner_mod.SOL_HL:
@@ -439,11 +435,11 @@ class Bot:
         kw = {} if profile is None else {"profile": profile}      # «позиции sol» — сделки одной связки
         rows, matched, mism = reconcile.positions(con, self.legs, now=now, busy_deal=busy_deal,
                                                   resolve=not self.engine.busy(), **kw)
-        items = [views.PositionView(**r) for r in rows]
+        items = [PositionView(**r) for r in rows]
         sim = bool(items) and all(i.sim for i in items)
-        self.sender.send(chat, views.positions(items, ts=now, matched=matched, mismatch=mism, sim=sim))
+        self.sender.positions_report(chat, items, at=now, matched=matched, mismatch=mism, sim=sim)
 
-    def status_view(self) -> views.StatusView:
+    def status_view(self) -> StatusView:
         now = self.clock()
         con = self.conns.get()
         try:
@@ -500,12 +496,12 @@ class Bot:
                     used -= Decimal(str(json.loads(r[0]).get("cost_usd") or 0))
                 except (ValueError, InvalidOperation, AttributeError, TypeError):
                     continue
-        return views.StatusView(
+        return StatusView(
             ts=now, mode=mode, running=running, paused=store.is_paused(con) or self.engine.pause_evt.is_set(),
             open_deals=len(store.active_deals(con)), max_open_deals=cfg.get("limits.max_open_deals") if cfg else None,
             tg_last_ok_ago_s=self.poller.last_ok_age() if self.poller else None,
             tg_reconnects_24h=self.watchdog.renewals_within(86400) if self.watchdog else 0,
-            sender_fails=self.sender.fails, data_ages=tuple(ages), aster_weight_pct=weight, chain="bsc",
+            sender_fails=0, data_ages=tuple(ages), aster_weight_pct=weight, chain="bsc",
             wallet_stable=w_stable, wallet_native=w_native, margin_avail=margin,
             cap_usd=cfg.get("limits.deal_max_usd_per_leg") if cfg else None,
             daily_stop=cfg.get("limits.daily_loss_stop_usd") if cfg else None, daily_used_usd=used,
@@ -529,7 +525,7 @@ class Bot:
         return out
 
     def status_cmd(self, chat: int) -> None:
-        self.sender.send(chat, views.status(self.status_view()))
+        self.sender.status_report(chat, self.status_view())
 
     # --- старт и остановка ---
     def startup(self) -> reconcile.StartupReport:
@@ -540,22 +536,27 @@ class Bot:
             self._close_plan(iid, "expired")
         for dr in rep.deals:
             sim = bool(dr.deal["sim"])
-            tv = self._texts_of(dr.deal)       # связка Solana × Hyperliquid — свои тексты голой ноги (без «откат»)
             for it in dr.intents:
                 clip, clips = reconcile.restart_clip(con, it)
                 ok = dr.check.matched is True and dr.new != DealState.HALTED_MISMATCH
                 matched = True if ok else (False if dr.check.matched is False else None)
-                self.say(tv.restart(views.RestartView(
+                self._restart_report(dr.deal, RestartView(
                     intent_id=it["id"], kind="entry" if it["kind"] == "entry" else "exit", deal_id=dr.deal["id"],
                     clip=clip, clips=clips, matched=matched, details=self._restart_details(dr), sim=sim,
                     coin=dr.deal["coin"], hedged=dr.check.hedged, delta=dr.check.delta, state=str(dr.new),
-                    delta_usd=dr.check.delta_usd, step=dr.check.step, m=dr.check.m)))
+                    delta_usd=dr.check.delta_usd, step=dr.check.step, m=dr.check.m))
             # m сделки не известен (ревью 13.09, M3) — не штатное: сказать, что закрывает только «выход» целиком
             if not dr.intents and (dr.new != dr.old or dr.check.matched is not True
                                    or not getattr(dr.check.book, "m_known", True)):
-                self.say(self._check_line(dr))
+                chk = dr.check
+                self._restart_report(dr.deal, RestartView(
+                    intent_id='', kind='check', deal_id=dr.deal['id'], coin=dr.deal['coin'],
+                    matched=chk.matched, details=chk.detail, state=str(dr.new), sim=sim,
+                    hedged=chk.hedged, delta=chk.delta, delta_usd=chk.delta_usd, step=chk.step, m=chk.m), check_only=True)
         for p in rep.wallet_problems:
-            self.say(views.error(f"кошелёк после перезапуска: {p}"))
+            chat = self.chat()
+            if chat is not None:
+                self.sender.notice(chat, 'error', reason=f'кошелёк после перезапуска: {redact(p)}')
         return rep
 
     @staticmethod
@@ -564,20 +565,11 @@ class Bot:
                 DealState.CLOSED: "выход был доведён — сделка закрыта"}.get(dr.new)
         return "; ".join(x for x in (dr.check.detail, tail) if x)
 
-    @staticmethod
-    def _texts_of(deal):
+    def _restart_report(self, deal, snapshot, *, check_only=False):
         from ..trade.runtime import is_sol_deal
-        if is_sol_deal(deal):
-            from ..tg import sol_views
-            return sol_views
-        return views
-
-    @staticmethod
-    def _check_line(dr: reconcile.DealRestart) -> str:
-        d, chk = dr.deal, dr.check
-        return Bot._texts_of(d).restart_check(d["coin"], d["id"], chk.matched, chk.detail, str(dr.new),
-                                              bool(d["sim"]), hedged=chk.hedged, delta=chk.delta, usd=chk.delta_usd,
-                                              step=chk.step, m=chk.m)
+        chat = self.chat()
+        if chat is not None:
+            self.sender.restart_report(chat, snapshot, solana=is_sol_deal(deal), check_only=check_only)
 
 
 from ..trade.assembly import build_trader_legs

@@ -125,6 +125,15 @@ class Interface:
                 finally:
                     with self.inflight_lock:
                         self.inflight.discard(eid)
+            try:
+                from .presenter import present
+                ev = present(ev, transport_health={
+                    'sender_fails': getattr(self.sender, 'fails', 0),
+                    'tg_last_ok_ago_s': time.time() - self.last_poll if self.last_poll is not None else None,
+                })
+            except Exception:
+                done(None)
+                raise
             kind = ev['kind']
             if kind == 'answer':
                 try:
