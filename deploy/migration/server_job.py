@@ -501,6 +501,23 @@ def wait_components(paths, commands, manifest, *, timeout=180, sleep=time.sleep)
     raise DeployFailure('component readiness timeout: ' + last)
 
 
+def wait_interface(commands, manifest, *, timeout=180, sleep=time.sleep):
+    deadline = time.monotonic() + timeout
+    last = 'not checked'
+    while time.monotonic() < deadline:
+        try:
+            pid = _service_pid(commands, 'funding_bot-interface.service')
+            response = commands.run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:8792/status']).stdout.encode()
+            if len(response) > 16 * 1024:
+                raise DeployFailure('interface status exceeds 16 KiB')
+            value = json.loads(response)
+            _health_identity(value, manifest, pid, 'interface')
+            return value
+        except (OSError, ValueError, json.JSONDecodeError, DeployFailure, subprocess.SubprocessError) as e:
+            last = str(e); sleep(2)
+    raise DeployFailure('interface readiness timeout: ' + last)
+
+
 def resume_legacy(paths, commands):
     for name in ('funding_bot-collector.service', 'funding_bot-web.service',
                  'funding_bot-trader.service', 'funding_bot-tunnel.service'):
@@ -546,6 +563,9 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
     wait_drain(client, health.get('release_id') or previous_manifest['release_id'], epoch)
     commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
     _wait_inactive(commands, 'funding_bot-core.service')
+    commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
+    commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
+    _wait_inactive(commands, 'funding_bot-collector.service')
     execution_lock_free(paths.execution_lock)
     install_units(previous_release, commands)
     switch_link(paths, previous_release)
@@ -630,10 +650,11 @@ class Job:
                     p.backups.mkdir(parents=True, exist_ok=True)
                     backup = p.backups / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + template['release_id'] + '-trade.db')
                     report['backup'] = {'path': str(backup), 'sha256': af.backup_database(db_path, backup)}
-                execution_lock_free(p.execution_lock)
-                self.commands.run(['chown', 'funding-core:funding-core', p.execution_lock])
-                os.chmod(p.execution_lock, 0o600)
-                report['stages'].append('execution_released')
+                if not is_ui:
+                    execution_lock_free(p.execution_lock)
+                    self.commands.run(['chown', 'funding-core:funding-core', p.execution_lock])
+                    os.chmod(p.execution_lock, 0o600)
+                    report['stages'].append('execution_released')
                 release, manifest = install_release(p, artifact, receipt, template, self.commands)
                 migration_dry_run(release, p.state / 'core/trade.db', self.commands)
                 report['stages'].append('artifact_installed')
@@ -660,11 +681,7 @@ class Job:
                     switch_link(p, release); switched = True
                     self.commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
                     # UI identity is checked without touching the live core.
-                    ip = _service_pid(self.commands, 'funding_bot-interface.service')
-                    response = self.commands.run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:8792/status']).stdout.encode()
-                    if len(response) > 16 * 1024:
-                        raise DeployFailure('interface status exceeds 16 KiB')
-                    _health_identity(json.loads(response), manifest, ip, 'interface')
+                    wait_interface(self.commands, manifest)
                     components = dict(previous_state['components'], interface=manifest['release_id'])
                     drain = previous_state.get('drain', False)
                     report['stages'].append('ui_only_switched')
@@ -672,6 +689,8 @@ class Job:
                     self.commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
                     self.commands.run(['systemctl', 'stop', 'funding_bot-web.service'], check=False)
                     self.commands.run(['systemctl', 'disable', *OLD_SERVICES], check=False)
+                    self.commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
+                    _wait_inactive(self.commands, 'funding_bot-collector.service')
                     switch_link(p, release); switched = True
                     self.commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     self.commands.run(['systemctl', 'start', 'funding_bot-core.service'])

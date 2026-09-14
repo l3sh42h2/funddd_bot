@@ -107,12 +107,15 @@ def installed_for(python):
 
 def component_hashes(sources):
     interface_only = ('src/funding_bot/interface/', 'src/funding_bot/serve.py',
-                      'src/funding_bot/cabinet.py', 'src/funding_bot/cabinet_text.py')
-    source_items = {k: v for k, v in sources.items() if k.startswith('src/funding_bot/')}
-    interface = {k: v for k, v in source_items.items() if k.startswith(interface_only)}
+                      'src/funding_bot/cabinet.py', 'src/funding_bot/cabinet_text.py',
+                      'deploy/migration/funding_bot-interface.service',
+                      'deploy/migration/funding_bot-tunnel.service')
+    runtime_items = {k: v for k, v in sources.items()
+                     if k.startswith(('src/funding_bot/', 'deploy/')) or k == 'pyproject.toml'}
+    interface = {k: v for k, v in runtime_items.items() if k.startswith(interface_only)}
     # Shared modules are conservatively assigned to both core and collector.  A
-    # release is UI-only only when their complete component hashes are equal.
-    shared = {k: v for k, v in source_items.items() if k not in interface}
+    # release is UI-only only when their code, packaging and deploy paths are equal.
+    shared = {k: v for k, v in runtime_items.items() if k not in interface}
     return {'interface': af.value_digest(interface), 'core': af.value_digest(shared),
             'collector': af.value_digest(shared)}
 
