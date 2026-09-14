@@ -93,3 +93,15 @@ Linux checkpoint выполнен после последних code-право�
   root DAC fixture: `test_shared_pace_dac_allows_two_uids_but_denies_private_controls` — **1 passed, 0.20s**.
   Использованы синтетические UID/файлы; source archive и временные каталоги удалены. Production services/data не менялись.
 - Это отдельный тест прав, не полная проверка Linux-артефакта и не боевой выкат. M4/M5 остаются in_progress.
+
+### Result v2 и scoped ingest: промежуточный исходный код
+
+- Replay false acceptance исправлены и закрыты Astra: отсутствующие fills/network_total и записи после cut не
+  дают verified-known-complete. Result v2 отделяет execution/finality от completeness fees и сохраняет raw amounts.
+- PerpJournal/futures bindings проверены локально через production_registry на Aster/Gate/HL fake native callbacks:
+  один native submit, подпись записана до внешнего callback, повторный claim не отправляет снова, hedge/link flags сохранены.
+- Scoped accounting защищает namespace account/venue/symbol, атомарные страницы и cursors, неизменяемую historical
+  attribution. Пока это отдельный модуль: существующие store/reconcile/read-model ещё не переключены на него.
+- На этом checkpoint адаптеры/фундамент: 60 passed; scoped ingest: 16 passed. Это профильные проверки, не полный
+  неизменяемый Linux artifact profile. M4/M5 остаются in_progress; generic production wiring, presenter boundary,
+  scope integration, окончательная replay/приёмка и VPS switch ещё требуют работы.

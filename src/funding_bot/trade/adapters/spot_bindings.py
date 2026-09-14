@@ -24,6 +24,9 @@ def evm(native, *, quote_token, quote_decimals, journal, authorize, resolve_row,
     def quote(spec, action, bounds):
         if native.wallet.lower() != spec.account.lower() or str(native.ci) != spec.network:
             raise AdapterError(ErrorKind.IDENTITY, 'EVM native scope mismatch')
+        if spec.quote_decimals is not None and (spec.quote_decimals != quote_decimals or
+                                                spec.quote_currency.lower() != quote_token.lower()):
+            raise AdapterError(ErrorKind.IDENTITY, 'EVM counter-asset identity or decimals mismatch')
         buy = action.side == 'BUY'
         token_in, token_out = (quote_token, spec.instrument) if buy else (spec.instrument, quote_token)
         din, dout = (quote_decimals, spec.decimals) if buy else (spec.decimals, quote_decimals)
@@ -67,6 +70,9 @@ def solana(native, router, *, token, quote_asset, journal, authorize, con, price
     def quote(spec, action, bounds):
         if token.mint != spec.instrument or native.wallet != spec.account or native.genesis != spec.network:
             raise AdapterError(ErrorKind.IDENTITY, 'Solana native scope mismatch')
+        if spec.decimals != token.decimals or (spec.quote_decimals is not None and
+                (spec.quote_decimals != quote_asset.decimals or spec.quote_currency != quote_asset.mint)):
+            raise AdapterError(ErrorKind.IDENTITY, 'Solana counter-asset identity or decimals mismatch')
         buy = action.side == 'BUY'
         inp, out = (quote_asset, token) if buy else (token, quote_asset)
         amount = bounds.get('spend') if buy else action.quantity

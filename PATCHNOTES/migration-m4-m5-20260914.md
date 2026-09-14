@@ -53,3 +53,20 @@ Checkpoint общего lifecycle и корневых операций (2026-09-
 - Профиль EVM/SOL/root: 115 passed / 7.61s. IPC/process профиль вне sandbox: 20 passed / 4.70s.
 - По отдельному разрешению владельца получен приватный финансовый срез двух EVM сделок с VPS в /tmp для offline
   replay; ключей, конфигурации кошельков и подписанных payload в выгрузке нет. В Git эти данные не включаются.
+
+Следующий checkpoint адаптеров и учёта (in_progress, не релиз):
+- Replay не принимает отсутствие SOL fills, receipt network_total или данные после среза за полную эквивалентность.
+  Исправления закрыты независимым Astra review; 13 snapshot tests passed.
+- Result v2 сохраняет scope, фактические raw суммы, валюты и native reference. Исполнение и полнота комиссий
+  разделены; неизвестные fees не становятся нулём. Пустой PARTIAL остаётся UNKNOWN. Astra закрыл эти замечания.
+- Добавлены общий rejection kind и явное доказательство terminal IOC partial; старый API rejection сохранён.
+- PerpJournal использует существующий perp_orders как барьер отправки и exec_events для fingerprint;
+  повторный claim отказан. Futures binding сохраняет hedge permission и HL journal links.
+- Новый scoped_accounting — пока изолированный фундамент ingest, НЕ подключённый к production readers/writers.
+  Разные аккаунты/символы имеют отдельные ключи; legacy attribution неизменяема; неприписанные строки сохраняются.
+  Неполная страница и устаревший watermark не доказывают полноту данных. Последний профиль: 16 passed.
+- Последний совместный adapter profile: 60 passed. Фундамент native journals, spot mapping и scoped ingest
+  ещё не означает сквозное подключение общего API к денежному пути или закрытие AC-07/11–17/29.
+- Оба помощника Sol остановлены сервисом из-за usage limit; завершённые коммиты и незавершённые файлы сохранены,
+  продолжение и проверки выполняет координатор. Лимит не обходился сменой модели.
+- Боевой бот, его службы и trade.db не менялись. Полная Linux-проверка артефакта и M5 переключение не выполнены.

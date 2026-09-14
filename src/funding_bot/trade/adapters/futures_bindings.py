@@ -10,7 +10,14 @@ from .contracts import AdapterError, ErrorKind, Quote, Observation, ExecutionPag
 from .native import Bindings
 
 
-def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.time):
+def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.time,
+         hedge=False, links=None):
+    # These are core-owned execution permissions and journal links, never quote input.
+    if type(hedge) is not bool:
+        raise AdapterError(ErrorKind.CONFIG, 'hedge permission must be boolean')
+    native_links = dict(links) if links is not None else None
+    if native_links is not None and set(native_links) != {'deal_id', 'intent_id', 'clip_id'}:
+        raise AdapterError(ErrorKind.CONFIG, 'incomplete native journal links')
     def quote(spec, action, bounds):
         price = bounds.get('price_cap')
         if not isinstance(price, D) or not price.is_finite() or price <= 0:
@@ -28,7 +35,7 @@ def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.ti
         if action.quantity < filt.min_qty or action.quantity > filt.max_qty_limit:
             raise AdapterError(ErrorKind.INVALID, 'native quantity limits')
         value = price * action.quantity
-        if value < filt.min_notional:
+        if value < filt.min_notional and not (action.reduce_only and spec.venue == 'hyperliquid'):
             raise AdapterError(ErrorKind.INVALID, 'native minimum notional')
         # IOC quantity/price bounds; fees are deliberately not declared known here.
         buy = action.side == 'BUY'
@@ -42,8 +49,13 @@ def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.ti
         a = prepared.quote.action
         price = D(json.loads(prepared.quote.native)['price_cap'])
         # Existing native adapter performs its clock/mode, signing and unknown-result guards.
+        kwargs = {'on_signed': lambda nonce: on_signed(prepared.attempt_id, nonce)}
+        if hedge:
+            kwargs['hedge'] = True
+        if spec.venue == 'hyperliquid' and native_links is not None:
+            kwargs['links'] = dict(native_links)
         return native.ioc(spec.instrument, a.side, a.quantity, price, prepared.attempt_id, a.reduce_only,
-                          on_signed=lambda nonce: on_signed(prepared.attempt_id, nonce))
+                          **kwargs)
 
     def resolve(spec, ref):
         record = attempt_lookup(ref)

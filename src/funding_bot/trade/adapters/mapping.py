@@ -5,7 +5,7 @@ from ..types import InstrumentSpec
 
 
 def map_legacy(deal, *, spot_account, perp_account, filters, spot_quote, network,
-               spot_tick, metadata_revision):
+               spot_tick, metadata_revision, quote_decimals=None):
     inst = InstrumentSpec.from_json(deal['inst_json'])
     if not inst.verified or not (inst.ident_ev or inst.identity_hash):
         raise AdapterError(ErrorKind.IDENTITY, 'historical instrument has no verified identity proof')
@@ -24,7 +24,7 @@ def map_legacy(deal, *, spot_account, perp_account, filters, spot_quote, network
                    spot_account, inst.token, multiplier=inst.fs, step=D(1).scaleb(-inst.token_dec), tick=spot_tick,
                    quote_currency=spot_quote, settlement_currency=spot_quote,
                    capabilities=Capabilities('dex', 'spot', family, amount=True), network=network,
-                   decimals=inst.token_dec, **common)
+                   decimals=inst.token_dec, quote_decimals=quote_decimals, **common)
     if not inst.quote_asset:
         raise AdapterError(ErrorKind.IDENTITY, 'perpetual quote currency unknown')
     perp = LegSpec(str(deal['id']) + ':perp', 'hedge', 'short', inst.perp_venue, inst.perp_venue,
