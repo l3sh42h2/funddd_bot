@@ -22,12 +22,13 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
 
-SCHEMA_VERSION = 1
-MIN_READER = 1
+SCHEMA_VERSION = 2
+MIN_READER = 2
 STREAMS = frozenset({"fills", "funding"})
 PROOF_KINDS = frozenset({"frozen_leg", "public_config", "public_api_identity", "migration_manifest"})
 _ACCOUNT_SCOPE = re.compile(r"acct:v1:[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}\Z")
@@ -100,6 +101,15 @@ class ImportReport:
 
 
 _DDL = (
+    """CREATE TABLE IF NOT EXISTS scoped_deal_accounts(
+         deal_id TEXT PRIMARY KEY, account_scope TEXT NOT NULL, venue TEXT NOT NULL,
+         symbol TEXT NOT NULL, created REAL NOT NULL,
+         FOREIGN KEY(account_scope,venue,symbol)
+           REFERENCES scoped_account_proofs(account_scope,venue,symbol))""",
+    """CREATE TRIGGER IF NOT EXISTS scoped_deal_accounts_no_update
+         BEFORE UPDATE ON scoped_deal_accounts BEGIN SELECT RAISE(ABORT, 'append-only'); END""",
+    """CREATE TRIGGER IF NOT EXISTS scoped_deal_accounts_no_delete
+         BEFORE DELETE ON scoped_deal_accounts BEGIN SELECT RAISE(ABORT, 'append-only'); END""",
     """CREATE TABLE IF NOT EXISTS scoped_accounting_schema(
          id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, min_reader INTEGER NOT NULL,
          updated REAL NOT NULL)""",
@@ -185,17 +195,33 @@ def _table_exists(con: sqlite3.Connection, name: str) -> bool:
 
 def migrate(con: sqlite3.Connection, *, now: float | None = None) -> None:
     """Install this additive schema atomically without changing store.SCHEMA_VERSION."""
-    if _table_exists(con, "scoped_accounting_schema"):
-        row = con.execute("SELECT version, min_reader FROM scoped_accounting_schema WHERE id=1").fetchone()
-        if row is not None and (int(row[0]) > SCHEMA_VERSION or int(row[1]) > SCHEMA_VERSION):
-            raise SchemaTooNew(f"scoped accounting schema {row[0]} requires reader {row[1]}")
     stamp = time.time() if now is None else _finite_time(now, "now")
     with _tx(con):
+        expected_tables = [m[1] for statement in _DDL
+                           if (m := re.match(r'CREATE TABLE IF NOT EXISTS (\w+)\(', statement))]
+        if _table_exists(con, "scoped_accounting_schema"):
+            row = con.execute("SELECT version, min_reader FROM scoped_accounting_schema WHERE id=1").fetchone()
+            if row is None:
+                raise ScopedAccountingError('installed accounting schema metadata is missing')
+            if int(row[0]) > SCHEMA_VERSION or int(row[1]) > SCHEMA_VERSION:
+                raise SchemaTooNew(f"scoped accounting schema {row[0]} requires reader {row[1]}")
+            # IF NOT EXISTS must not turn a lost financial table into an empty,
+            # apparently valid source. Only the real v1 upgrade may add bindings.
+            for name in expected_tables:
+                if int(row[0]) == 1 and name == 'scoped_deal_accounts':
+                    continue
+                if not _table_exists(con, name):
+                    raise ScopedAccountingError('installed accounting table is missing: ' + name)
+        elif any(_table_exists(con, name) for name in expected_tables):
+            raise ScopedAccountingError('accounting tables exist without schema metadata')
         for statement in _DDL:
             con.execute(statement)
         row = con.execute("SELECT version, min_reader FROM scoped_accounting_schema WHERE id=1").fetchone()
         if row is None:
             con.execute("INSERT INTO scoped_accounting_schema VALUES(1,?,?,?)",
+                        (SCHEMA_VERSION, MIN_READER, stamp))
+        elif int(row[0]) == 1 and int(row[1]) <= 1:
+            con.execute('UPDATE scoped_accounting_schema SET version=?,min_reader=?,updated=? WHERE id=1',
                         (SCHEMA_VERSION, MIN_READER, stamp))
         elif int(row[0]) != SCHEMA_VERSION or int(row[1]) > SCHEMA_VERSION:
             raise SchemaTooNew(f"unsupported scoped accounting schema {tuple(row)}")
@@ -357,6 +383,137 @@ def add_funding(con: sqlite3.Connection, scope: ProvenScope, rows: Iterable[Mapp
     stamp = time.time() if now is None else _finite_time(now, "now")
     with _tx(con):
         return _add_funding(con, scope, rows, stamp)
+
+
+def bind_deal(con, deal_id: str, scope: ProvenScope, *, now=None):
+    """Bind an explicitly proven account; never infer it from matching native IDs.
+
+    The caller must establish the frozen account's provenance before invoking
+    this function, exactly as for ingestion. No legacy financial rows are moved.
+    """
+    _require_schema(con)
+    stamp = time.time() if now is None else _finite_time(now, 'now')
+    with _tx(con):
+        deal = con.execute('SELECT perp_venue,symbol,sim FROM deals WHERE id=?', (deal_id,)).fetchone()
+        if deal is None or scope.venue != ('sim:' if deal[2] else '') + deal[0] or scope.symbol != deal[1]:
+            raise ScopedAccountingError('proven account differs from deal venue/symbol')
+        old = con.execute('SELECT account_scope,venue,symbol FROM scoped_deal_accounts WHERE deal_id=?',
+                          (deal_id,)).fetchone()
+        if old is not None and tuple(old) != scope.key:
+            raise ScopedAccountingError('deal account attribution is immutable')
+        _ensure_scope(con, scope, stamp)
+        con.execute('INSERT OR IGNORE INTO scoped_deal_accounts VALUES(?,?,?,?,?)',
+                    (deal_id, *scope.key, stamp))
+
+
+def _consistent_read(fn):
+    """Validate attribution and select its rows from one SQLite read snapshot."""
+    @wraps(fn)
+    def read(con, *args, **kwargs):
+        own = not con.in_transaction
+        if own:
+            con.execute('BEGIN')  # Deferred read transaction; does not lock out the writer in WAL.
+        try:
+            result = fn(con, *args, **kwargs)
+        except BaseException:
+            if own:
+                con.rollback()
+            raise
+        if own:
+            con.commit()
+        return result
+    return read
+
+
+@_consistent_read
+def deal_scope(con, deal_id: str) -> ProvenScope | None:
+    """None means legacy unbound, never 'use the current account'."""
+    if not _table_exists(con, 'scoped_accounting_schema') and not _table_exists(con, 'scoped_deal_accounts'):
+        return None
+    _require_schema(con)
+    if not _table_exists(con, 'scoped_deal_accounts'):
+        raise ScopedAccountingError('installed binding table is missing')
+    row = con.execute('SELECT p.account_scope,p.venue,p.symbol,p.proof_kind,p.proof_ref,p.version '
+                      'FROM scoped_deal_accounts d JOIN scoped_account_proofs p USING(account_scope,venue,symbol) '
+                      'WHERE d.deal_id=?', (deal_id,)).fetchone()
+    if row is None:
+        if con.execute('SELECT 1 FROM scoped_deal_accounts WHERE deal_id=?', (deal_id,)).fetchone():
+            raise ScopedAccountingError('bound deal has no account proof')
+        return None
+    scope = ProvenScope(*tuple(row))
+    deal = con.execute('SELECT perp_venue,symbol,sim FROM deals WHERE id=?', (deal_id,)).fetchone()
+    if deal is None or scope.venue != ('sim:' if deal[2] else '') + deal[0] or scope.symbol != deal[1]:
+        raise ScopedAccountingError('bound deal identity changed')
+    return scope
+
+
+@_consistent_read
+def deal_fills(con, deal_id: str, intent_id: str | None = None) -> list[dict] | None:
+    """None selects legacy reader; [] is a scoped empty result, with no fallback."""
+    scope = deal_scope(con, deal_id)
+    if scope is None:
+        return None
+    # Native IDs are not a per-deal namespace. If two deals on one account
+    # claim an order, refuse attribution rather than charge its fills twice.
+    ambiguous = con.execute('''SELECT 1 FROM perp_orders a
+        JOIN clips ca ON ca.id=a.clip_id JOIN intents ia ON ia.id=ca.intent_id
+        JOIN perp_orders b ON b.venue=a.venue AND b.symbol=a.symbol AND b.order_id=a.order_id
+        JOIN clips cb ON cb.id=b.clip_id JOIN intents ib ON ib.id=cb.intent_id
+        JOIN scoped_deal_accounts db ON db.deal_id=ib.deal_id
+        WHERE ia.deal_id=? AND ib.deal_id<>ia.deal_id
+          AND db.account_scope=? AND db.venue=? AND db.symbol=?
+          AND a.venue=db.venue AND a.symbol=db.symbol LIMIT 1''', (deal_id, *scope.key)).fetchone()
+    if ambiguous:
+        raise ScopedAccountingError('native order is attributed to multiple deals on this account')
+    query = ('SELECT f.* FROM scoped_perp_fills f WHERE f.account_scope=? AND f.venue=? AND f.symbol=? '
+             'AND EXISTS(SELECT 1 FROM perp_orders o JOIN clips c ON c.id=o.clip_id '
+             'JOIN intents i ON i.id=c.intent_id WHERE i.deal_id=? AND o.venue=f.venue '
+             'AND o.symbol=f.symbol AND CAST(o.order_id AS TEXT)=f.order_id')
+    args = [*scope.key, deal_id]
+    if intent_id is not None:
+        query += ' AND i.id=?'
+        args.append(intent_id)
+    cursor = con.execute(query + ') ORDER BY f.ts,f.trade_id', args)
+    names = [item[0] for item in cursor.description]
+    return [dict(zip(names, tuple(row))) for row in cursor]
+
+
+@_consistent_read
+def deal_funding(con, deal, *, until_ms=None) -> list[dict] | None:
+    scope = deal_scope(con, deal['id'])
+    if scope is None:
+        return None
+    saved = con.execute('SELECT created,state,updated FROM deals WHERE id=?', (deal['id'],)).fetchone()
+    if saved is None:
+        raise ScopedAccountingError('bound deal is missing')
+    start = int(_finite_time(saved[0], 'deal.created') * 1000)
+    if until_ms is not None:
+        until_ms = _timestamp_ms(until_ms, 'until_ms')
+    if saved[1] in ('CLOSED', 'ABORTED'):
+        closed = int(_finite_time(saved[2], 'deal.updated') * 1000)
+        until_ms = closed if until_ms is None else min(until_ms, closed)
+    if until_ms is not None and until_ms < start:
+        raise ScopedAccountingError('funding window ends before deal creation')
+    # An account-level payment cannot be allocated by ticker/time when two
+    # deal windows overlap (including an equal close/open boundary).
+    others = con.execute('''SELECT d.created,d.state,d.updated FROM deals d
+        JOIN scoped_deal_accounts b ON b.deal_id=d.id
+        WHERE b.account_scope=? AND b.venue=? AND b.symbol=? AND d.id<>?''',
+        (*scope.key, deal['id']))
+    for other in others:
+        other_start = int(_finite_time(other[0], 'other.created') * 1000)
+        other_end = int(_finite_time(other[2], 'other.updated') * 1000) if other[1] in ('CLOSED', 'ABORTED') else None
+        if other_end is not None and other_end < other_start:
+            raise ScopedAccountingError('other deal funding window is invalid')
+        if (until_ms is None or other_start <= until_ms) and (other_end is None or other_end >= start):
+            raise ScopedAccountingError('account funding has overlapping deal windows; allocation proof required')
+    query = 'SELECT ts,income,tran_id FROM scoped_funding_income WHERE account_scope=? AND venue=? AND symbol=? AND ts>=?'
+    args = [*scope.key, start]
+    if until_ms is not None:
+        query += ' AND ts<=?'
+        args.append(int(until_ms))
+    cursor = con.execute(query + ' ORDER BY ts,tran_id', args)
+    return [dict(zip(('ts', 'income', 'tran_id'), tuple(row))) for row in cursor]
 
 
 def get_cursor(con: sqlite3.Connection, scope: ProvenScope, stream: str) -> dict[str, Any] | None:
