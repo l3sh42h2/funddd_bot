@@ -1241,7 +1241,7 @@ OP_NEXT: dict[str, frozenset] = {
     OpState.PARTIAL: frozenset({OpState.APPROVED, OpState.STOPPED, OpState.ABANDONED, OpState.PAUSED_RISK,
                                 OpState.PAUSED_UNKNOWN}),
     OpState.STOPPED: frozenset({OpState.APPROVED, OpState.ABANDONED, OpState.PAUSED_RISK, OpState.PAUSED_UNKNOWN}),
-    OpState.PAUSED_RISK: frozenset({OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.ABANDONED,
+    OpState.PAUSED_RISK: frozenset({OpState.APPROVED, OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.ABANDONED,
                                     OpState.PAUSED_UNKNOWN}),
     OpState.PAUSED_UNKNOWN: frozenset({OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK}),
 }
@@ -1423,6 +1423,21 @@ def _opt_real(v: Any, what: str) -> float | None:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise StoreError(f"{what}: нужно время числом, получено {v!r}")
     return float(v)
+
+
+def append_route_rounds(con, rows: Iterable[dict]) -> int:
+    """Persist a fresh quote batch after earlier rounds of the same immutable root."""
+    rows = [dict(r) for r in rows]
+    with tx(con):
+        offsets = {}
+        for r in rows:
+            key = (r["operation_id"], r["clip_seq"])
+            if key not in offsets:
+                previous = con.execute("SELECT MAX(round_no) FROM route_candidates WHERE operation_id=? "
+                                       "AND clip_seq=?", key).fetchone()[0]
+                offsets[key] = 0 if previous is None else int(previous) + 1
+            r["round_no"] = int(r["round_no"]) + offsets[key]
+        return add_route_candidates(con, rows)
 
 
 def add_route_candidates(con, rows: Iterable[dict], *, now: float | None = None) -> int:

@@ -341,7 +341,9 @@ def test_drain_evidence_invalidated_by_later_ledger_commit(conns, monkeypatch):
     try:
         begin=s.dispatch('begin_drain', {'release_id':'R2','expected_state_revision':0}, None, 0)
         payload=dict(drain_epoch=begin['drain_epoch'])
-        assert s.dispatch('get_drain_state',payload,None,0)['safe_to_switch']
+        proof = s.dispatch('get_drain_state',payload,None,0)
+        assert proof['safe_to_switch']
+        assert proof['release_id'] == 'R2' and proof['drain_epoch'] == begin['drain_epoch']
         # A later fill/backfill commit invalidates even if no pending attempt exists.
         conns.get().execute("INSERT INTO flags VALUES('fixture_new_fill','1')")
         monkeypatch.setattr(recovery, 'check', lambda *_, **kwargs: ['position_unverified'])

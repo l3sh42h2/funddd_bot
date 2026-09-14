@@ -444,7 +444,10 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
     expired = store.expire_intents(con, now=ts + 10 ** 9)      # кнопки прежнего процесса: котировки уже не те
     drafts = [r[0] for r in con.execute("SELECT id FROM deals WHERE state=?", (str(DealState.DRAFT),))]
     for did in drafts:
-        store.set_deal_state(con, did, DealState.ABORTED, expect=DealState.DRAFT, reason="не начата (перезапуск)")
+        from .operation_roots import abandon_unstarted
+        with store.tx(con):
+            abandon_unstarted(con, did)
+            store.set_deal_state(con, did, DealState.ABORTED, expect=DealState.DRAFT, reason="не начата (перезапуск)")
     # сделки до фазы 1 (ревью 13.09): подтверждённый по журналу инструмент (m = 1) записывается один раз; боту текст
     # не нужен (C: штатное не пишем) — событие inst_backfill в журнале
     bf = backfill_instruments(con, now=ts)

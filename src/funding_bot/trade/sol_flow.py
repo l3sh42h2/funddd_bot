@@ -754,7 +754,7 @@ class SolDesk:
                                        target_raw=ctx["amount_raw"],
                                        fee_cap_raw=None if fx is None else _raw(D(fx), int(inst.quote_dec)),
                                        bounds=approval)
-        store.add_route_candidates(con, ctx["dec"].records(op_id, 0))
+        store.append_route_rounds(con, ctx["dec"].records(op_id, 0))
         spec = {"kind": "entry", "profile": SOL_HL, "coin": rec.display_symbol, "usd": cmd.usdc,
                 "amount_raw": ctx["amount_raw"], "token": inst.token, "token_dec": int(inst.token_dec),
                 "symbol": inst.perp_symbol, "sim": sim, "owner": cfg.frozen_json(), "funding_h": ctx["funding_h"],
@@ -875,7 +875,8 @@ class SolDesk:
                    units=units, book=bk)
         return plan, ctx
 
-    def propose_exit(self, deal: Mapping, usd: D | None, perp_only: bool, chat: int | None) -> Proposal:
+    def propose_exit(self, deal: Mapping, usd: D | None, perp_only: bool, chat: int | None,
+                     *, operation_id: str | None = None) -> Proposal:
         if perp_only:
             raise self.refuse(f"«выход перп» в пилоте выключен — «выход {deal['id']}» продаёт спот сделки и закрывает "
                               "шорт")
@@ -888,19 +889,26 @@ class SolDesk:
                         min_out_raw=int(winner.effective_min_out or 0),
                         min_net_usdc=str(wr.conservative if (wr and wr.conservative is not None) else
                                          (wr.metric if wr else "")) or None)
-        op_id = store.create_operation(con, deal_id=deal["id"], profile_id=SOL_HL, inst_hash=inst.inst_hash(),
-                                       mode="dry" if sim else "live", side="exit", target_kind="full_position_snapshot",
-                                       target_asset=inst.token, target_decimals=int(inst.token_dec),
-                                       target_raw=ctx["units"], bounds=approval)
-        store.add_route_candidates(con, ctx["dec"].records(op_id, 0))
         spec = {"kind": "exit", "profile": SOL_HL, "coin": deal["coin"], "usd": None, "units": ctx["units"],
                 "all": True, "perp_only": False, "token": inst.token, "token_dec": int(inst.token_dec),
                 "symbol": inst.perp_symbol,
                 "sim": sim, "owner": cfg.frozen_json(), "period_h": 1, "instrument": inst.as_dict(),
-                "inst_hash": inst.inst_hash(), "operation_id": op_id, "approval": approval, "root": None,
+                "inst_hash": inst.inst_hash(), "approval": approval, "root": None,
                 "root_units": ctx["units"]}
-        iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="exit", spec=spec, plan=plan, chat=chat)
-        store.link_intent(con, op_id, iid)
+        from .operation_roots import propose
+        if operation_id is not None:
+            previous = store.get_operation(con, operation_id)
+            if previous is None:
+                raise self.refuse("исходная операция выхода не найдена")
+            spec["root_units"] = int(previous["target_raw"])
+            spec["resume"] = True
+        try:
+            iid, nonce = propose(con, deal=deal, kind="exit", spec=spec, plan=plan,
+                                 profile_id=SOL_HL, chat=chat, operation_id=operation_id)
+        except store.StoreError as exc:
+            raise self.refuse(f"продолжение исходной цели выхода: {exc}") from None
+        op_id = store.operation_of_intent(con, iid)["id"]
+        store.append_route_rounds(con, ctx["dec"].records(op_id, 0))
         superseded = store.supersede_intents(con, deal["id"], keep=iid)     # старые кнопки этой сделки — не исполняются
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"), sim=sim,
                     path=winner.path, operation_id=op_id)
@@ -979,14 +987,18 @@ class SolDesk:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
                 return v.resume_checked(deal["id"], sim=bool(deal["sim"]))
             return v.resume_mismatch(deal["id"], chk.detail, sim=bool(deal["sim"]))
-        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') ORDER BY created DESC "
+        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') "
+                           "AND status NOT IN ('proposed','rejected','expired') ORDER BY created DESC "
                            "LIMIT 1", (deal["id"],)).fetchone()
         if last is None:
             raise self.refuse("у сделки нет входа — продолжать нечего")
         if last["status"] in (IntentStatus.PARTIAL, IntentStatus.INTERRUPTED, IntentStatus.FAILED):
             if last["kind"] == "entry":
                 raise self.refuse(f"добор в пилоте выключен — «выход {deal['id']}» закрывает сделку")
-            return self.propose_exit(deal, None, False, chat)     # полный выход: снимок позиции заново — повтор верен
+            op = store.operation_of_intent(con, last["id"])
+            if op is None:
+                raise self.refuse("у предыдущего выхода нет корневой операции — нужна проверка журнала")
+            return self.propose_exit(deal, None, False, chat, operation_id=op["id"])
         raise self.refuse(f"последнее намерение {last['id']} — {last['status']}: продолжать нечего")
 
 
@@ -1111,7 +1123,12 @@ class SolEngine:
     def _fail_op(self, it: dict) -> None:
         op = store.operation_of_intent(self.con, it["id"])
         if op is not None and op["state"] in (OpState.PROPOSED, OpState.APPROVED):
-            _op_to(self.con, op["id"], OpState.APPROVED, OpState.STOPPED, OpState.ABANDONED, reason="не начата")
+            if int(op["reserved_raw"]):
+                _op_to(self.con, op["id"], OpState.APPROVED, OpState.PAUSED_UNKNOWN, reason="исход не выяснен")
+            else:
+                _op_to(self.con, op["id"], OpState.APPROVED, OpState.STOPPED, reason="не начата")
+                if not int(op["confirmed_raw"]):
+                    _op_to(self.con, op["id"], OpState.ABANDONED, reason="не начата")
 
     # --- ворота ---
     def guard(self, run: SolRun, *, entry: bool = False) -> None:
@@ -1219,7 +1236,7 @@ class SolEngine:
                                  inflight_unknown=self.desk.inflight(con, legs))
         if run.op_id:
             try:
-                store.add_route_candidates(con, dec.records(run.op_id, 1))
+                store.append_route_rounds(con, dec.records(run.op_id, 1))
             except store.StoreError as e:
                 log.warning("route_candidates %s: %s", run.op_id, e)
         w, _wr = self.desk.pick(dec, legs.sim)
@@ -1251,7 +1268,7 @@ class SolEngine:
                 raise Pause("native", f"SOL {have if have is not None else 'не прочитан'} лампортов — меньше расходов "
                                       f"с резервом {need if need is not None else '(неизвестно)'}: своп не начинаю")
         OperationController(con).begin_spot(clip_id, operation_id=run.op_id, reserve_raw=amount)
-        logical = f"{run.op_id or run.iid}:{run.seq}"
+        logical = f"{run.op_id or run.iid}:{run.iid}:{run.seq}"
         meta = dict(deal_id=run.did, op_id=run.op_id, clip_id=clip_id, intent_id=run.iid)
 
         def apply(o: SwapOutcome) -> None:
@@ -1601,7 +1618,7 @@ class SolEngine:
         _op_to(con, run.op_id, op_state, reason=None if op_state != OpState.PARTIAL else "остаток после выхода")
         if run.kind == "exit" and new != DealState.CLOSED:
             store.event(con, "exit_residual", deal_id=run.did, intent_id=run.iid, tokens=T, short=S)
-        store.set_intent_status(con, run.iid, IntentStatus.DONE)
+        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if op_state == OpState.PARTIAL else IntentStatus.DONE)
         warn = []
         if run.t_swap is not None:
             naked_ms = int((self.e.clock() - run.t_swap) * 1000)
@@ -1733,7 +1750,7 @@ class SolEngine:
             unknown = p.reason in _UNKNOWN_REASONS or op["reserved_raw"] != "0"
             if unknown:
                 _op_to(con, run.op_id, OpState.PAUSED_UNKNOWN, reason=p.reason)
-            elif not progressed:
+            elif not progressed and not int(op["confirmed_raw"]):
                 _op_to(con, run.op_id, OpState.STOPPED, OpState.ABANDONED, reason=p.reason)
             elif p.reason in ("stop", "terminate"):
                 _op_to(con, run.op_id, OpState.STOPPED, reason=p.reason)

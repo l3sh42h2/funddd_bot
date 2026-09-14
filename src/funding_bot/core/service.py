@@ -187,6 +187,7 @@ class CoreService:
             blockers.append('fresh_recovery_required')
         counts = state['pending']
         return dict(drain=self.drain, drain_epoch=health['drain_epoch'], ready=health['ready'],
+                    release_id=self.drain_state.state.get('release_id'),
                     state_revision=health['state_revision'], recovery=dict(rec),
                     execution=dict(busy=self.engine.busy(), lock_held=health['execution_lock_held'],
                                    owner_pid=health['pid'], owner_boot_id=health['boot_id']),

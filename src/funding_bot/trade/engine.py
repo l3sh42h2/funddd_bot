@@ -1430,7 +1430,8 @@ class Desk:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
                 return v.resume_checked(deal["id"], sim=bool(deal["sim"]))
             return v.resume_mismatch(deal["id"], chk.detail, sim=bool(deal["sim"]))
-        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') ORDER BY created DESC "
+        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') "
+                           "AND status NOT IN ('proposed','rejected','expired') ORDER BY created DESC "
                            "LIMIT 1", (deal["id"],)).fetchone()
         if last is None:
             raise Refused(v.refused("у сделки нет входа — продолжать нечего"))
@@ -2125,7 +2126,13 @@ class Engine:
             target = DealState.ABORTED          # ничего не куплено и не продано — сделки нет
         else:
             target = DealState.PAUSED
-        self._set_deal(run.did, target, reason=p.reason)
+        if target == DealState.ABORTED:
+            from .operation_roots import abandon_unstarted
+            with store.tx(con):
+                abandon_unstarted(con, run.did)
+                self._set_deal(run.did, target, reason=p.reason)
+        else:
+            self._set_deal(run.did, target, reason=p.reason)
         store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if progressed else IntentStatus.FAILED,
                                 err=p.text)
         store.event(con, "paused", deal_id=run.did, intent_id=run.iid, reason=p.reason, text=p.text,

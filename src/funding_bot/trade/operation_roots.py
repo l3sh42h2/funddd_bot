@@ -10,6 +10,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .. import config
@@ -225,12 +226,18 @@ def _legacy_id(root_intent_id: str) -> str:
 def _legacy_chain(con, deal_id: str) -> tuple[list[dict], dict, dict] | None:
     rows = [dict(r) for r in con.execute(
         "SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') ORDER BY created,id", (deal_id,))]
-    if not rows or rows[-1]["status"] not in _UNFINISHED:
+    accepted = [r for r in rows if r["status"] not in {
+        IntentStatus.PROPOSED, IntentStatus.REJECTED, IntentStatus.EXPIRED}]
+    if not accepted or accepted[-1]["status"] not in _UNFINISHED:
         return None
-    last = rows[-1]
+    last = accepted[-1]
     last_spec = _spec(last)
     if last_spec.get("perp_only"):
         return None
+    # A fresh entry quote can own a different root on the same draft deal.
+    # Once a durable link exists it outranks chronological legacy inference.
+    if last_spec.get("operation_id") or store.operation_of_intent(con, last["id"]) is not None:
+        return [last], last, last_spec
     if last["kind"] == "entry":
         chain = [r for r in rows if r["kind"] == "entry" and r["created"] <= last["created"]]
         root = chain[0]
@@ -268,6 +275,12 @@ def _adopt_legacy(con, deal: Mapping) -> str | None:
     chain, root, root_spec = found
     if root_spec.get("operation_id"):
         linked, _ = _linked(con, root)
+        return linked["id"]
+    linked = store.operation_of_intent(con, root["id"])
+    if linked is not None:
+        if (linked["deal_id"], linked["side"], linked["inst_hash"]) != (
+                deal["id"], root["kind"], root_spec.get("inst_hash")):
+            raise store.StoreError("legacy durable root identity differs from its intent")
         return linked["id"]
     inst_hash = root_spec.get("inst_hash")
     if not isinstance(inst_hash, str) or not inst_hash:
@@ -346,3 +359,32 @@ def _adopt_legacy(con, deal: Mapping) -> str | None:
             final = OpState.STOPPED
         store.set_operation_state(con, op_id, final, expect=OpState.RUNNING, reason="legacy interrupted adoption")
         return op_id
+
+
+def abandon_unstarted(con, deal_id: str) -> None:
+    """Release only a root with proof that no spot/perpetual action began."""
+    with store.tx(con):
+        op = store.active_operation(con, deal_id)
+        if op is None:
+            return
+        if int(op['reserved_raw']) or int(op['confirmed_raw']):
+            raise store.StoreError('cannot abandon a root with executed or reserved input')
+        unsafe = con.execute(
+            "SELECT 1 FROM clips c JOIN operation_intents oi ON oi.intent_id=c.intent_id "
+            "WHERE oi.operation_id=? AND c.state NOT IN ('PLANNED','DEX_REVERTED') LIMIT 1", (op['id'],)).fetchone()
+        orders = con.execute(
+            "SELECT p.state,p.executed_qty FROM perp_orders p JOIN clips c ON c.id=p.clip_id "
+            "JOIN operation_intents oi ON oi.intent_id=c.intent_id WHERE oi.operation_id=?", (op['id'],)).fetchall()
+        for state, quantity in orders:
+            try:
+                qty = Decimal(quantity)
+                no_effect = state in {'NOT_PLACED', 'REJECTED', 'EXPIRED'} and qty.is_finite() and qty == 0
+            except (TypeError, InvalidOperation):
+                no_effect = False
+            if not no_effect:
+                raise store.StoreError('unstarted root has unresolved perpetual execution evidence')
+        if unsafe:
+            raise store.StoreError('unstarted root has unresolved spot execution evidence')
+        if op['state'] != OpState.STOPPED:
+            store.set_operation_state(con, op['id'], OpState.STOPPED, reason='no action started')
+        store.set_operation_state(con, op['id'], OpState.ABANDONED, reason='no action started')

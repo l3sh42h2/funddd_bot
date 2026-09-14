@@ -145,7 +145,8 @@ def test_failed_link_validation_rolls_back_intent_cas(con):
     assert row_count(con, "operations") == row_count(con, "operation_intents") == 0
 
 
-def test_same_root_resume_keeps_target_and_counters_until_fresh_approval(con):
+@pytest.mark.parametrize("pause_state", [OpState.STOPPED, OpState.PAUSED_RISK])
+def test_same_root_resume_keeps_target_and_counters_until_fresh_approval(con, pause_state):
     d = deal(con)
     iid, nonce = roots.propose(
         con, deal=d, kind="entry", spec=spec("entry", APPROVAL_1), plan=plan(d["id"], "entry", 100),
@@ -155,7 +156,7 @@ def test_same_root_resume_keeps_target_and_counters_until_fresh_approval(con):
     op_id = store.operation_of_intent(con, iid)["id"]
     store.operation_reserve(con, op_id, 100)
     store.operation_settle(con, op_id, released_raw=100, executed_raw=40)
-    assert store.set_operation_state(con, op_id, OpState.PARTIAL, expect=OpState.RUNNING)
+    assert store.set_operation_state(con, op_id, pause_state, expect=OpState.RUNNING)
     assert store.set_intent_status(con, iid, IntentStatus.PARTIAL, expect=IntentStatus.RUNNING)
     before = store.get_operation(con, op_id)
 
@@ -167,7 +168,7 @@ def test_same_root_resume_keeps_target_and_counters_until_fresh_approval(con):
     proposed = store.get_operation(con, op_id)
     assert (proposed["target_raw"], proposed["confirmed_raw"], proposed["reserved_raw"]) == ("100", "40", "0")
     assert (proposed["bounds_hash"], proposed["approval_version"], proposed["state"]) == (
-        before["bounds_hash"], 1, OpState.PARTIAL,
+        before["bounds_hash"], 1, pause_state,
     )
     assert json.loads(store.get_intent(con, iid2)["spec_json"])["operation_id"] == op_id
     assert source.get("operation_id") is None
