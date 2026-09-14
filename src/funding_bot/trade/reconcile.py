@@ -388,7 +388,8 @@ def _entry_px(con, deal: dict) -> D | None:
         return None
 
 
-def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = None) -> StartupReport:
+def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = None,
+            generic_registry=None, generic_context_factory=None) -> StartupReport:
     """Шаги рестарта. Сам ничего не продолжает: прерванное становится interrupted, дальше — только команда
     владельца (свежий план и кнопки)."""
     ts = time.time() if now is None else now
@@ -413,6 +414,26 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
             ints.setdefault(it["deal_id"], []).append(it)
     out = []
     for d in store.active_deals(con):
+        from . import generic_recovery
+        if generic_recovery.is_generic(d):
+            from types import SimpleNamespace
+            with store.tx(con):
+                op = store.active_operation(con, d['id'])
+                if op and op['state'] in (store.OpState.APPROVED, store.OpState.RUNNING):
+                    target = store.OpState.PAUSED_UNKNOWN if int(op['reserved_raw']) else store.OpState.STOPPED
+                    store.set_operation_state(con, op['id'], target, expect=op['state'],
+                                              reason='restart: manual generic recovery required')
+                if d['state'] in (DealState.ENTERING, DealState.EXITING):
+                    store.set_deal_state(con, d['id'], DealState.PAUSED, expect=d['state'], reason='restart')
+            proof = generic_recovery.check(con, d, registry=generic_registry,
+                                          context_factory=generic_context_factory, now=ts)
+            chk = DealCheck(d['id'], proof.matched, proof.detail, SimpleNamespace(m_view=D(1)),
+                            hedged=proof.hedged, delta=proof.delta)
+            current = store.get_deal(con, d['id'])['state']
+            store.event(con, 'generic_restart_check', deal_id=d['id'], matched=proof.matched,
+                        hedged=proof.hedged, detail=proof.detail, now=ts)
+            out.append(DealRestart(deal=d, check=chk, old=d['state'], new=current, intents=ints.get(d['id'], [])))
+            continue
         if is_sol_deal(d):                     # связка SOL × HL: свои ноги и сверка (X12); BSC-путь ниже прежний
             out.append(_sol_restart(con, d, legs_fn, ints, ts))
             continue
@@ -523,13 +544,29 @@ def restart_clip(con, intent: dict) -> tuple[int | None, int | None]:
 
 # --- «позиции» -------------------------------------------------------------------------------------------
 def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_deal: str | None = None,
-              resolve: bool = True, profile: str | None = None) -> tuple[list[dict], bool | None, str | None]:
+              resolve: bool = True, profile: str | None = None, generic_registry=None,
+              generic_context_factory=None) -> tuple[list[dict], bool | None, str | None]:
     """Строки для views.PositionView по правде (balanceOf, positionRisk), сверка с журналом. Сделку, которую сейчас
     ведёт исполнитель, не сверяем: посреди клипа кошелёк и журнал законно расходятся. profile — только сделки одной
     связки («позиции sol»)."""
     from .runtime import profile_of_deal
     rows, verdicts, problems = [], [], []
     for d in store.active_deals(con):
+        from . import generic_recovery
+        if generic_recovery.is_generic(d):
+            if profile is not None:
+                op = store.active_operation(con, d['id'])
+                if not op or op['profile_id'] != profile:
+                    continue
+            from ..core.leg_report import build
+            proof = generic_recovery.check(con, d, registry=generic_registry,
+                context_factory=generic_context_factory if d['id'] != busy_deal else None, now=now)
+            rows.append(dict(deal_id=d['id'], coin=d['coin'], state=d['state'], chain=None,
+                perp_venue=None, sim=bool(d['sim']), reason=d.get('reason'), generic_legs=build(con, deal_id=d['id'])))
+            verdicts.append(proof.matched)
+            if proof.matched is not True:
+                problems.append(f"{d['id']}: {proof.detail}")
+            continue
         if profile is not None and profile_of_deal(d) != profile:
             continue
         dec = int(d["token_dec"])

@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Callable, Mapping
 from .keys import redact
-from .owner import EVM_PROFILE_OF, LEGACY_PROFILE, RH_GATE, SOL_HL
+from .owner import EVM_PROFILE_OF, LEGACY_PROFILE, RH_GATE, SOL_HL, SOL_PROFILES
 
 log = logging.getLogger(__name__)
 D = Decimal
@@ -50,7 +50,10 @@ def profile_of_deal(deal: Mapping) -> str:
 
 
 def is_sol_deal(deal: Mapping) -> bool:
-    return profile_of_deal(deal) == SOL_HL
+    # Network family selects the SOL native spot port.  Profile/venue only
+    # selects independently assembled legs; it must not select a second
+    # business engine.
+    return str(dict(deal).get("chain") or "").strip().lower() in SOL_CHAINS
 
 
 def hl_account_id(network: str, master: str, account: str, dex: str) -> str:
@@ -155,7 +158,7 @@ class RuntimeRegistry:
 
     def _pair_components(self, profile, sim, spot, perp):
         """Turn independent venue components into the legacy leg DTO."""
-        if profile != SOL_HL:
+        if profile not in SOL_PROFILES:
             from .engine import Legs, NativePrice
             from .sim import SimPerp, SimSpot
             native = getattr(spot, 'native_usd', None)
@@ -166,38 +169,48 @@ class RuntimeRegistry:
                         and getattr(spot, 'sender', None) is not None)
             return Legs(s, p, sim, native, can_send=can_send)
         ex, router, chain = spot
-        hl, fee_rate = perp
+        if isinstance(perp, tuple) and len(perp) == 2:
+            native_perp, fee_rate = perp
+        else:
+            native_perp, fee_rate = perp, (lambda: None)
         cfg = None
         # Component factories retain their owner loader for identity; use it
         # only for constructing the compatibility SolLegs envelope.
         owner = self.component_factories[profile]['spot']
         cfg = owner.owner_loader()
-        wallet = cfg.get('wallets.sol_hl.solana_address')
-        user = cfg.get('wallets.sol_hl.hl_user_address')
-        account = cfg.get('wallets.sol_hl.hl_account_address')
-        dex = cfg.get(f'profiles.{SOL_HL}.perp_dex') or 'para'
-        network = cfg.get(f'profiles.{SOL_HL}.perp_network') or 'mainnet'
+        wallet = cfg.get('wallets.sol_hl.solana_address') if profile == SOL_HL else cfg.get('wallets.solana.solana_address')
+        user = cfg.get('wallets.sol_hl.hl_user_address') if profile == SOL_HL else None
+        account = cfg.get('wallets.sol_hl.hl_account_address') if profile == SOL_HL else None
+        dex = cfg.values.get(f'profiles.{profile}.perp_dex') or ''
+        network = cfg.values.get(f'profiles.{profile}.perp_network') or 'mainnet'
         from . import store
         from .fees import NATIVE_SOL, PriceObs
         from .hl_rules import to_dec
         from .sim import SimHlPerp, SimSolSpot
         from .solana import USDC_MINT
         def native_obs():
+            if getattr(native_perp, 'venue', None) != 'hyperliquid':
+                return None
             try:
-                mids = hl.http.info({'type': 'allMids'})
+                mids = native_perp.http.info({'type': 'allMids'})
                 return PriceObs(NATIVE_SOL, USDC_MINT, to_dec(mids['SOL'], 'SOL'), time.monotonic(), 'HL allMids SOL')
             except Exception:
                 return None
         npx = lambda: (lambda o: None if o is None else o.price)(native_obs())
-        acct = hl_account_id(network, user, account, dex)
+        # A non-HL factory supplies its own stable account scope; it never
+        # needs HL master/agent methods merely because spot is Solana.
+        acct = (getattr(native_perp, 'account_id', None) or
+                (hl_account_id(network, user, account, dex) if getattr(native_perp, 'venue', None) == 'hyperliquid'
+                 else f'{getattr(native_perp, "venue", "perp")}:{network}:{account}:{dex}'))
         if sim:
-            return SolLegs(SimSolSpot(ex, wallet=wallet), SimHlPerp(hl), router, True, acct, wallet,
-                           npx, native_obs, fee_rate, False, block_height=chain.block_height)
-        return SolLegs(ex, hl, router, False, acct, wallet, npx, native_obs, fee_rate,
+            simulated = SimHlPerp(native_perp) if getattr(native_perp, 'venue', None) == 'hyperliquid' else native_perp
+            return SolLegs(SimSolSpot(ex, wallet=wallet), simulated, router, True, acct, wallet,
+                           npx, native_obs, fee_rate, False, profile=profile, block_height=chain.block_height)
+        return SolLegs(ex, native_perp, router, False, acct, wallet, npx, native_obs, fee_rate,
                        can_send=(getattr(ex, '_loaded_mode', 'dry') == 'live'
-                                 and getattr(hl, '_loaded_mode', 'dry') == 'live'
+                                 and getattr(native_perp, '_loaded_mode', 'dry') == 'live'
                                  and getattr(ex, 'signer', None) is not None
-                                 and getattr(hl, 'signer', None) is not None),
+                                 and getattr(native_perp, 'signer', None) is not None), profile=profile,
                        block_height=chain.block_height)
 
     def for_deal(self, deal: Mapping):
@@ -404,10 +417,10 @@ class EvmSpotFactory:
 class SolSpotFactory:
     """Independent Solana spot leg; the HL credential scope is never touched."""
 
-    def __init__(self, owner_loader, conns=None, *, credentials=None, keys_mode=None, environ=None,
+    def __init__(self, owner_loader, conns=None, *, profile=SOL_HL, credentials=None, keys_mode=None, environ=None,
                  rpc_session=None, jup_session=None, okx=None, clock=time.time,
                  mono=time.monotonic, sleep=time.sleep):
-        self.owner_loader, self.conns = owner_loader, conns
+        self.owner_loader, self.conns, self.profile = owner_loader, conns, profile
         self.credentials, self.keys_mode, self.environ = credentials, keys_mode, environ
         self.rpc_session, self.jup_session, self.okx = rpc_session, jup_session, okx
         self.clock, self.mono, self.sleep = clock, mono, sleep
@@ -415,7 +428,7 @@ class SolSpotFactory:
 
     def __call__(self, sim):
         cfg = self.owner_loader()
-        mode = cfg.profile_mode(SOL_HL)
+        mode = cfg.profile_mode(self.profile)
         if not sim and mode == 'dry':
             return None
         if sim in self._built:
@@ -423,9 +436,9 @@ class SolSpotFactory:
         keys = None if mode == 'dry' else (self.credentials.solana(cfg, mode) if self.credentials else None)
         from . import store
         from .keys import effective_mode
-        state = lambda: (effective_mode(self.owner_loader().profile_mode(SOL_HL), mode),
+        state = lambda: (effective_mode(self.owner_loader().profile_mode(self.profile), mode),
                          store.execution_paused(self.conns.get()) if self.conns is not None else False)
-        result = build_sol_component(cfg, mode=mode, keys=keys,
+        result = build_sol_component(cfg, mode=mode, keys=keys, profile=self.profile,
                                      mode_state=state, rpc_session=self.rpc_session,
                                      jup_session=self.jup_session, okx=self.okx, clock=self.clock,
                                      mono=self.mono, sleep=self.sleep)
@@ -438,16 +451,16 @@ class SolSpotFactory:
 class AsterPerpFactory:
     """Independent Aster perpetual leg; EVM spot credentials are not loaded."""
 
-    def __init__(self, owner_loader, conns=None, *, credentials=None, keys_mode=None, session=None,
+    def __init__(self, owner_loader, conns=None, *, profile=LEGACY_PROFILE, credentials=None, keys_mode=None, session=None,
                  clock=time.time, sleep=time.sleep):
-        self.owner_loader, self.conns = owner_loader, conns
+        self.owner_loader, self.conns, self.profile = owner_loader, conns, profile
         self.credentials, self.keys_mode, self.session = credentials, keys_mode, session
         self.clock, self.sleep = clock, sleep
         self._built = {}
 
     def __call__(self, sim):
         cfg = self.owner_loader()
-        mode = cfg.profile_mode(LEGACY_PROFILE)
+        mode = cfg.profile_mode(self.profile)
         if not sim and mode == 'dry':
             return None
         if sim in self._built:
@@ -455,7 +468,7 @@ class AsterPerpFactory:
         from .aster_trade import AsterTrade
         from . import store
         from .keys import effective_mode
-        state = lambda: (effective_mode(self.owner_loader().profile_mode(LEGACY_PROFILE), mode),
+        state = lambda: (effective_mode(self.owner_loader().profile_mode(self.profile), mode),
                          store.execution_paused(self.conns.get()) if self.conns is not None else False)
         if mode == 'dry' or self.credentials is None:
             perp = AsterTrade(mode_state=state, session=self.session, now=self.clock, sleep=self.sleep)
@@ -473,16 +486,16 @@ class AsterPerpFactory:
 class GatePerpFactory:
     """Independent Gate perpetual leg; no EVM, Aster, SOL or HL credentials."""
 
-    def __init__(self, owner_loader, conns=None, *, credentials=None, keys_mode=None, session=None,
+    def __init__(self, owner_loader, conns=None, *, profile=RH_GATE, credentials=None, keys_mode=None, session=None,
                  clock=time.time, sleep=time.sleep):
-        self.owner_loader, self.conns = owner_loader, conns
+        self.owner_loader, self.conns, self.profile = owner_loader, conns, profile
         self.credentials, self.keys_mode, self.session = credentials, keys_mode, session
         self.clock, self.sleep = clock, sleep
         self._built = {}
 
     def __call__(self, sim):
         cfg = self.owner_loader()
-        mode = cfg.profile_mode(RH_GATE)
+        mode = cfg.profile_mode(self.profile)
         if not sim and mode == 'dry':
             return None
         if sim in self._built:
@@ -490,7 +503,7 @@ class GatePerpFactory:
         from .gate_trade import GateTrade
         from . import store
         from .keys import effective_mode
-        state = lambda: (effective_mode(self.owner_loader().profile_mode(RH_GATE), mode),
+        state = lambda: (effective_mode(self.owner_loader().profile_mode(self.profile), mode),
                          store.execution_paused(self.conns.get()) if self.conns is not None else False)
         if mode == 'dry' or self.credentials is None:
             perp = GateTrade(mode_state=state, session=self.session, now=self.clock, sleep=self.sleep)
@@ -672,7 +685,8 @@ def build_sol_component(cfg, *, mode, keys, mode_state, profile=SOL_HL,
     identity = dict(profile_params or {})
     identity.update(public_scope or {})
     identity.update(public_identity or {})
-    wallet = wallet or identity.get('wallet') or identity.get('solana_address') or cfg.get(f"wallets.{profile}.solana_address")
+    wallet_key = "wallets.sol_hl.solana_address" if profile == SOL_HL else "wallets.solana.solana_address"
+    wallet = wallet or identity.get('wallet') or identity.get('solana_address') or cfg.get(wallet_key)
     if not wallet:
         raise ValueError("Solana wallet identity missing")
     genesis = genesis or identity.get('genesis') or cfg.get("spot.solana.expected_genesis_hash") or MAINNET_GENESIS

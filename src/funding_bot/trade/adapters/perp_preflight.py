@@ -90,6 +90,48 @@ def agent_gate(perp, *, venue: str, sim: bool, what: str) -> None:
         hl_preflight.agent_gate(perp, sim=sim, what=what)
 
 
+def inspect(perp, request: PreflightRequest, *, inst=None, venue: str | None = None) -> PreflightResult:
+    """Read-only frozen-leg proof for planning; never changes leverage/setup."""
+    venue = venue or getattr(perp, "venue", None)
+    if not venue:
+        raise PreflightRefused("venue", "площадка перпа не задана")
+    try:
+        native, filt = perp.instrument(request.symbol), perp.filters(request.symbol)
+    except Exception as e:
+        raise PreflightRefused("meta", f"мета {venue} не прочитана: {redact(e)}") from None
+    if (getattr(native, "symbol", request.symbol) != request.symbol or
+            getattr(native, "quote_asset", None) != request.quote_currency or
+            getattr(native, "m", None) != request.multiplier):
+        raise PreflightRefused("identity", f"замороженный инструмент {request.symbol} изменился")
+    step = getattr(filt, "step", None)
+    if not isinstance(step, D) or not step.is_finite() or step <= 0:
+        raise PreflightRefused("meta", f"шаг {request.symbol} неизвестен")
+    available = None
+    if venue == "hyperliquid":
+        if inst is None:
+            raise PreflightRefused("identity", "замороженная спецификация перпа не передана")
+        try:
+            ref = perp.identity()
+            if ref.fullcoin != inst.perp_symbol or ref.is_delisted or (
+                    inst.perp_asset_id is not None and ref.asset != inst.perp_asset_id):
+                raise PreflightRefused("identity", f"рынок {request.symbol} изменился")
+            margin = perp.margin()
+        except PreflightRefused:
+            raise
+        except Exception as e:
+            raise PreflightRefused("hl_meta", f"мета Hyperliquid не прочитана: {redact(e)}") from None
+        if not margin.trade_supported:
+            raise PreflightRefused("margin", f"режим счёта HL «{margin.mode}» первой версией не поддержан: "
+                                   f"{margin.reason or ''}".strip())
+        available = margin.available
+    else:
+        try:
+            available = perp.available_margin()
+        except Exception as e:
+            raise PreflightRefused("margin", f"маржа {venue} не прочитана: {redact(e)}") from None
+    return PreflightResult(step, None, available, None, native)
+
+
 def entry(perp, request: PreflightRequest, *, inst=None, venue: str | None = None) -> PreflightResult:
     """Validate the perp leg before spot execution.
 

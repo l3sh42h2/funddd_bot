@@ -208,7 +208,8 @@ def test_report_snapshots_preserve_exact_amounts_unknowns_and_interface_health(t
                        perp_qty=None, m_unknown=True, sim=True)
     out.positions_report(42, [pos], at=123, matched=False, mismatch=True, sim=True)
     ev = out.journal.notifications()[1]
-    assert decode(ev['snapshots'])[0] == asdict(pos)
+    assert PositionView(**decode(ev['snapshots'])[0]) == pos
+    assert 'generic_legs' not in decode(ev['snapshots'])[0]  # legacy DTO remains readable by the previous interface
     assert present(ev)['text'] == views.positions([pos], ts=123, matched=False, mismatch=True, sim=True)
     restart = RestartView(intent_id='I1', kind='exit', deal_id='D1', coin='A', delta=D('0.2'),
                           delta_usd=None, matched=False, details='<not reconciled>', sim=True)

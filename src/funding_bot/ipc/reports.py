@@ -78,6 +78,7 @@ class PositionView:
     pnl_exit_usd: Decimal | None = None     # … и если закрыть всё прямо сейчас (котировка OKX, стакан, комиссии)
     pnl_uncovered: bool = False         # стакан мельче шорта — выход оценён по худшему уровню
     m_unknown: bool = False             # множитель контракта не известен (ревью 13.09, M3): только «выход» целиком
+    generic_legs: dict | None = None    # independent-leg projection; no inferred legacy spot/future fields
 
 
 @dataclass(frozen=True)

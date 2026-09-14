@@ -414,6 +414,8 @@ def pnl_block(v: dict) -> str:
     p = v.get("pnl")
     if not p:
         return ""
+    if v.get('legs') is not None:
+        return '<div class="pnl"><div class="pl m">PnL: нет подтверждённой оценки.</div></div>'
     sol = bool(v.get("sol"))
     unit = v.get("unit") or "$"                 # связка Solana × Hyperliquid — USDC (не объявляется точным USD)
     e = lambda x: html.escape("" if x is None else str(x))
@@ -693,7 +695,10 @@ def deal_card(v: dict) -> str:
         if v.get(flag):
             out.append(f'<div class="why unk">{text}</div>')
     sv = v.get("sol")
-    if sv:                                      # связка Solana × Hyperliquid: фактический маршрут, а не «okx»
+    if v.get('legs') is not None:
+        from .interface.leg_presenter import render
+        out.append('<div class="pair">' + render(v['legs']).replace('\n', '<br>') + '</div>')
+    elif sv:                                      # связка Solana × Hyperliquid: фактический маршрут, а не «okx»
         rt = " · ".join(sv["routes"]) if sv["routes"] else "Jupiter / OKX — лучший"
         out.append(f'<div class="pair">спот Solana · {e(rt)} <span class="up">▲</span> | перп Hyperliquid '
                    f'<span class="dn">▼</span> <span class="mono">{e(sv["fullcoin"])}</span> · '
@@ -705,7 +710,8 @@ def deal_card(v: dict) -> str:
     else:
         out.append(f'<div class="pair">спот okx·{e(v["chain"])} <span class="up">▲</span> | перп {e(v["venue"])} '
                    f'<span class="dn">▼</span> <span class="mono">{e(v["symbol"])}</span> · {e(_usd(v["leg_usd"]))} на ногу</div>')
-    out.append(pnl_block(v))
+    if v.get('legs') is None:
+        out.append(pnl_block(v))
     kv = [_kv("открыта", _t(v["opened"]))]
     if v["state"] in _TERMINAL:
         kv.append(_kv("отменена" if v["state"] == "ABORTED" else "закрыта", _t(v["closed"])))

@@ -25,7 +25,7 @@ READER = 4
 def _dec(value: Any, name: str, *, optional: bool = False) -> Decimal | None:
     if value is None and optional:
         return None
-    if isinstance(value, bool):
+    if isinstance(value, (bool, float)):
         raise ValueError(f"{name} must be an exact decimal")
     try:
         result = Decimal(str(value))
@@ -225,6 +225,9 @@ def record_fact(con, fact: ExecutionFact, *, deal_id: str | None = None,
         rows = con.execute("SELECT json FROM exec_events WHERE kind=?", (KIND,)).fetchall()
         for (raw,) in rows:
             old = json.loads(raw or "{}")
+            if (old.get("scope") == fact.scope and old.get("native_ref") == fact.native_ref
+                    and old.get("identity") != fact.durable_identity):
+                raise ValueError("native execution already assigned to another operation/leg")
             if old.get("identity") != fact.durable_identity:
                 continue
             if old.get("digest") == digest or _canonical({k: v for k, v in old.items() if k != "digest"}) == _canonical(payload):
@@ -248,10 +251,14 @@ def _fact(raw: str) -> ExecutionFact:
         funding=tuple((Decimal(x["amount"]), x["currency"]) for x in p.get("funding", [])))
 
 
-def rebuild(con, *, operation_id: str | None = None) -> dict[str, Any]:
+def rebuild(con, *, operation_id: str | None = None, deal_id: str | None = None) -> dict[str, Any]:
     """Pure read-model rebuild.  Currency buckets never cross-convert."""
-    query = "SELECT json FROM exec_events WHERE kind=? ORDER BY ts,rowid"
+    query = "SELECT json FROM exec_events WHERE kind=?"
     args: tuple[Any, ...] = (KIND,)
+    if deal_id is not None:
+        query += " AND deal_id=?"
+        args += (deal_id,)
+    query += " ORDER BY rowid"
     rows = con.execute(query, args).fetchall()
     legs = {}
     for (raw,) in rows:
@@ -260,7 +267,7 @@ def rebuild(con, *, operation_id: str | None = None) -> dict[str, Any]:
             continue
         key = (fact.leg_id, fact.scope)
         leg = legs.setdefault(key, {"leg_id": fact.leg_id, "spec_hash": fact.spec_hash,
-            "scope": fact.scope, "qty": Decimal(0), "executions": 0, "fees": {},
+            "scope": fact.scope, "market_kind": fact.market_kind, "qty": Decimal(0), "executions": 0, "fees": {},
             "unknown_fees": 0, "fees_complete": True, "funding": {}})
         if leg["spec_hash"] != fact.spec_hash:
             raise ValueError("leg specification changed within accounting scope")
@@ -295,3 +302,16 @@ def _encode_leg(leg):
 # another persistence API.
 append_fact = record_fact
 project = rebuild
+
+
+def record_result(con, result, spec, *, operation_id, side, deal_id=None,
+                  intent_id=None, clip_id=None, now=None):
+    """Apply terminal quantity and currency cash evidence in one transaction."""
+    from .leg_cash import record_execution_cash
+    fact = fact_from_result(result, spec, operation_id=operation_id, side=side)
+    with store.tx(con):
+        added = record_fact(con, fact, deal_id=deal_id, intent_id=intent_id,
+                            clip_id=clip_id, now=now)
+        record_execution_cash(con, result, spec, operation_id=operation_id, side=side,
+                              deal_id=deal_id, intent_id=intent_id, clip_id=clip_id, now=now)
+    return added

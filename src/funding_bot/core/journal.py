@@ -25,7 +25,7 @@ class Journal:
         con = self.conns.get()
         if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_meta'").fetchone():
             version = con.execute("SELECT value FROM core_meta WHERE key='schema_version'").fetchone()
-            if version and version[0] not in ('1', '2', '3'):
+            if version and version[0] not in ('1', '2', '3', '4'):
                 raise RpcError('unsupported_core_schema')
         con.executescript(SCHEMA)
         con.execute("INSERT OR IGNORE INTO core_meta VALUES('schema_version','1')")
@@ -98,7 +98,7 @@ class Journal:
         # A new wire event and its rollback reader fence must commit together.
         from ..trade import store
         with store.tx(con):
-            if payload.get('dto_version') in (2, 3):
+            if payload.get('dto_version') in (2, 3, 4):
                 # Old Journal implementations already enforce this gate. A
                 # previous artifact's runner must not boot an unaware core.
                 version = str(payload['dto_version'])
@@ -235,12 +235,17 @@ class Outbox:
 
     def positions_report(self, chat_id, snapshots, *, at, matched, mismatch, sim):
         from dataclasses import asdict
-        from ..ipc.notifications import DTO_VERSION
+        from ..ipc.notifications import DTO_VERSION, GENERIC_POSITION_VERSION
         from ..ipc.reports import PositionView, encode
         if not all(isinstance(s, PositionView) for s in snapshots):
             raise RpcError('invalid_positions_snapshot')
-        return self._emit(dict(kind='positions_report', dto_version=DTO_VERSION, chat_id=chat_id,
-                               snapshots=encode([asdict(s) for s in snapshots]), at=at,
+        generic = any(s.generic_legs is not None for s in snapshots)
+        rows = [asdict(s) for s in snapshots]
+        if not generic:
+            for row in rows:
+                row.pop('generic_legs', None)
+        return self._emit(dict(kind='positions_report', dto_version=GENERIC_POSITION_VERSION if generic else DTO_VERSION,
+                               chat_id=chat_id, snapshots=encode(rows), at=at,
                                matched=matched, mismatch=mismatch, sim=sim))
 
     def restart_report(self, chat_id, snapshot, *, solana=False, check_only=False):

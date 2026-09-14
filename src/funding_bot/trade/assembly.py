@@ -16,7 +16,7 @@ def build_trader_legs(cfg, conns, holder, env, *, build=None, factory=None):
     custom = build is not None
     build = build or build_runtime
     legacy_on = cfg.profile_enabled(owner_mod.LEGACY_PROFILE)
-    sol_on = cfg.profile_enabled(owner_mod.SOL_HL)
+    sol_on = any(cfg.profile_enabled(p) for p in owner_mod.SOL_PROFILES)
     rh_on = cfg.profile_enabled(owner_mod.RH_GATE)
     kw = {} if custom else {'credentials': credentials}
     failure = None
@@ -34,7 +34,7 @@ def build_trader_legs(cfg, conns, holder, env, *, build=None, factory=None):
         rt = build(cfg, conns, holder=holder, environ=env, mode='dry', **kw)
     keys_mode = rt.mode if rt.keys is not None else (cfg.mode if (sol_on or rh_on) else None)
     factories = {}
-    if sol_on:
+    if cfg.profile_enabled(owner_mod.SOL_HL):
         factories[owner_mod.SOL_HL] = (factory or SolFactory)(
             owner_mod.load, conns, keys_mode=keys_mode, environ=env,
             **({} if factory else {'credentials': credentials}))
@@ -58,6 +58,18 @@ def build_trader_legs(cfg, conns, holder, env, *, build=None, factory=None):
         owner_mod.SOL_HL: {
             'spot': SolSpotFactory(owner_mod.load, conns, credentials=credentials, keys_mode=keys_mode, environ=env),
             'perp': HlPerpFactory(owner_mod.load, conns, credentials=credentials, keys_mode=keys_mode),
+        },
+        owner_mod.SOL_GATE: {
+            'spot': SolSpotFactory(owner_mod.load, conns, profile=owner_mod.SOL_GATE,
+                                   credentials=credentials, keys_mode=keys_mode, environ=env),
+            'perp': GatePerpFactory(owner_mod.load, conns, profile=owner_mod.SOL_GATE,
+                                    credentials=credentials, keys_mode=keys_mode),
+        },
+        owner_mod.SOL_ASTER: {
+            'spot': SolSpotFactory(owner_mod.load, conns, profile=owner_mod.SOL_ASTER,
+                                   credentials=credentials, keys_mode=keys_mode, environ=env),
+            'perp': AsterPerpFactory(owner_mod.load, conns, profile=owner_mod.SOL_ASTER,
+                                     credentials=credentials, keys_mode=keys_mode),
         },
         owner_mod.RH_GATE: {
             'spot': EvmSpotFactory(owner_mod.load, conns, holder, profile=owner_mod.RH_GATE,

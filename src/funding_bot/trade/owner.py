@@ -146,9 +146,13 @@ PERP_VENUES = tuple(config.PERP_VENUES)
 
 # --- схема 2: связка «спот Solana × перп Hyperliquid» (ТЗ SOL×HL 13.09) ---------------------------------------------
 SOL_HL = "sol_best_hyperliquid"
+SOL_GATE = "sol_best_gate"
+SOL_ASTER = "sol_best_aster"
+SOL_PROFILES = (SOL_HL, SOL_GATE, SOL_ASTER)
+SOL_PROFILE_VENUES = {SOL_HL: "hyperliquid", SOL_GATE: "gate", SOL_ASTER: "aster"}
 LEGACY_PROFILE = "bsc_okx_aster"
 RH_GATE = "rh_okx_gate"            # спот OKX DEX в сети Robinhood × перп Gate (сделка FATCOIN, владелец 13.09)
-PROFILE_IDS = (LEGACY_PROFILE, SOL_HL, RH_GATE)
+PROFILE_IDS = (LEGACY_PROFILE, *SOL_PROFILES, RH_GATE)
 # EVM-связки прежнего движка (спот OKX DEX × перп): профиль ↔ (сеть спота, площадка перпа)
 EVM_PROFILES = {LEGACY_PROFILE: ("bsc", "aster"), RH_GATE: ("robinhood", "gate")}
 EVM_PROFILE_OF = {v: k for k, v in EVM_PROFILES.items()}
@@ -177,19 +181,33 @@ _MS = dict(lo=Decimal(0), lo_open=True)
 _BPS_CAP = dict(lo=Decimal(0), lo_open=True, hi=Decimal(10000), hi_open=True)   # (0, 10000): 100 % — не допуск
 
 _V1 = "не поддержано первым выпуском"
-_PROFILE_SOL = {
+def _sol_profile(venue: str) -> dict[str, _Spec]:
+    """Schema for one explicit Solana-spot/perp profile.
+
+    The profile name is an owner-facing identity; routing is fixed by this
+    schema and never inferred from a name prefix.
+    """
+    out = {
     "enabled": _Spec("bool"),
     "mode": _Spec("enum", words=MODES),
     "spot_chain": _Spec("enum", words=(SOLANA_MAINNET,)),
     "spot_policy": _Spec("enum", words=("auto", "jupiter", "okx")),
-    "perp_venue": _Spec("enum", words=("hyperliquid",)),
-    "perp_network": _Spec("enum", words=("mainnet",)),
-    "perp_dex": _Spec("text", rx=r"[a-z0-9]{1,16}", hint="имя dex HIP-3 строчными, например para"),
+    "perp_venue": _Spec("enum", words=(venue,)),
     "instrument_registry": _Spec("text", rx=r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\.json",
                                  hint="имя файла *.json в runtime/, без каталогов"),
     "allowed_instruments": _Spec("list", rx=r"[a-z0-9_]{1,64}", hint="instrument_id из instruments.json"),
     "max_active_execution_clips": _Spec("int", lo=Decimal(1), hi=Decimal(1)),       # один активный клип (§6)
-}
+    }
+    if venue == "hyperliquid":
+        out.update({
+            "perp_network": _Spec("enum", words=("mainnet",)),
+            "perp_dex": _Spec("text", rx=r"[a-z0-9]{1,16}",
+                               hint="имя dex HIP-3 строчными, например para"),
+        })
+    return out
+
+
+_PROFILE_SOL = _sol_profile("hyperliquid")
 _WALLETS_SOL_HL = {
     "solana_address": _Spec("sol"),
     "hl_user_address": _Spec("addr"),         # мастер HL
@@ -198,6 +216,7 @@ _WALLETS_SOL_HL = {
     "hl_vault_address": _Spec("addr"),        # субаккаунт при торговле за него; пусто — мастер
     "position_ownership_policy": _Spec("enum", words=("exclusive_market",)),
 }
+_WALLETS_SOLANA = {"solana_address": _Spec("sol")}
 _SPOT_SOLANA = {
     "rpc_primary_env": _Spec("text", rx=_ENV_RX, hint="имя переменной окружения"),
     "rpc_secondary_env": _Spec("text", rx=_ENV_RX, hint="имя переменной окружения"),
@@ -313,15 +332,18 @@ _OBS_SOL = {k: _Spec("bool") for k in ("record_candidate_rejections", "record_so
                                       "emit_state_transition_events")}
 # [группа.имя] — подсекции схемы 2; группа может совпадать со старой секцией ([wallets] и [wallets.sol_hl])
 _GROUPS: dict[str, dict[str, dict[str, _Spec]]] = {
-    "profiles": {SOL_HL: _PROFILE_SOL, LEGACY_PROFILE: {"enabled": _Spec("bool")},
+    "profiles": {**{p: _sol_profile(v) for p, v in ((SOL_HL, "hyperliquid"), (SOL_GATE, "gate"),
+                                                       (SOL_ASTER, "aster"))},
+                 LEGACY_PROFILE: {"enabled": _Spec("bool")},
                  RH_GATE: {"enabled": _Spec("bool"), "mode": _Spec("enum", words=MODES)}},
-    "wallets": {"sol_hl": _WALLETS_SOL_HL, "rh_gate": {"evm_address": _Spec("addr")}},
+    "wallets": {"sol_hl": _WALLETS_SOL_HL, "solana": _WALLETS_SOLANA,
+                "rh_gate": {"evm_address": _Spec("addr")}},
     "spot": {"solana": _SPOT_SOLANA},
     "routing": {"solana": _ROUTING_SOLANA},
     "providers": _PROVIDERS,
-    "limits": {SOL_HL: _LIMITS_SOL},
-    "emergency": {SOL_HL: _EMERGENCY_SOL},
-    "observability": {SOL_HL: _OBS_SOL},
+    "limits": {p: _LIMITS_SOL for p in SOL_PROFILES},
+    "emergency": {p: _EMERGENCY_SOL for p in SOL_PROFILES},
+    "observability": {p: _OBS_SOL for p in SOL_PROFILES},
 }
 _TOP_V2 = {"schema_version": _Spec("int", lo=Decimal(1), hi=Decimal(2))}
 
@@ -722,8 +744,8 @@ class OwnerCfg:
         self._known(key)
         return self.values[key] or SOL_HL_ENV_DEFAULTS[key]
 
-    def _sol_required(self) -> list[str]:
-        pid = SOL_HL
+    def _sol_required(self, pid: str) -> list[str]:
+        venue = SOL_PROFILE_VENUES[pid]
         keys = ["telegram.owner_id"]
         opt = {"wallets.sol_hl.hl_vault_address", f"limits.{pid}.min_route_improvement_usdc",
                f"limits.{pid}.normal_exit_basis_bps", f"limits.{pid}.min_exit_pnl_usdc",
@@ -733,11 +755,13 @@ class OwnerCfg:
         # настройки провайдера нужны, только если его путь выбран в routing.solana.paths (пусто — нужны оба)
         paths = self.values.get("routing.solana.paths") or SOL_PATHS
         used = [p for p, pre in (("jupiter", "jupiter_"), ("okx", "okx_")) if any(x.startswith(pre) for x in paths)]
-        for grp, sub in (("profiles", pid), ("wallets", "sol_hl"), ("spot", "solana"), ("routing", "solana"),
+        wallet = "sol_hl" if pid == SOL_HL else "solana"
+        for grp, sub in (("profiles", pid), ("wallets", wallet), ("spot", "solana"), ("routing", "solana"),
                          *(("providers", p) for p in used), ("limits", pid), ("emergency", pid)):
             keys += [f"{grp}.{sub}.{k}" for k in _GROUPS[grp][sub] if f"{grp}.{sub}.{k}" not in opt]
-        keys += [f"perp.hyperliquid.{k}" for k in _PERP_EXTRA["hyperliquid"] if f"perp.hyperliquid.{k}" not in opt]
-        keys.append("perp.hyperliquid.leverage")
+        if venue in _PERP_EXTRA:
+            keys += [f"perp.{venue}.{k}" for k in _PERP_EXTRA[venue] if f"perp.{venue}.{k}" not in opt]
+        keys.append(f"perp.{venue}.leverage")
         if self.values.get(f"limits.{pid}.normal_exit_policy") == "basis":
             keys += [f"limits.{pid}.normal_exit_basis_bps", f"limits.{pid}.min_exit_pnl_usdc"]
         e = f"emergency.{pid}."
@@ -752,12 +776,14 @@ class OwnerCfg:
         if profile_id in EVM_PROFILES:             # EVM-связки: прежний список ключей по (площадка, сеть)
             chain, venue = EVM_PROFILES[profile_id]
             return self.live_missing(venue, chain)
-        return self.missing(*self._sol_required())
+        return self.missing(*self._sol_required(profile_id))
 
     def profile_unsupported(self, profile_id: str) -> list[str]:
         """Заданное, но не поддержанное первым выпуском — live запрещён с этой причиной (не «поддерживается»)."""
         self._profile(profile_id)
         if profile_id in EVM_PROFILES:
+            return []
+        if profile_id != SOL_HL:
             return []
         v, out = self.values, []
 

@@ -1,5 +1,5 @@
 """Render durable domain notifications at the interface boundary."""
-from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, APPROVAL_REASONS
+from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_POSITION_VERSION, APPROVAL_REASONS
 from ..ipc.protocol import RpcError
 
 
@@ -8,6 +8,8 @@ def present(event, *, transport_health=None):
     if kind in ('send', 'edit', 'answer'):
         return event  # Already queued legacy messages remain deliverable.
     expected = EXECUTION_REPORT_VERSION if kind == 'final_report' else DTO_VERSION
+    if kind == 'positions_report' and event.get('dto_version') == GENERIC_POSITION_VERSION:
+        expected = GENERIC_POSITION_VERSION
     if type(event.get('dto_version')) is not int or event['dto_version'] != expected:
         raise RpcError('unsupported_notification_version')
     from ..tg import views
@@ -44,8 +46,14 @@ def present(event, *, transport_health=None):
     if kind == 'positions_report':
         from ..ipc.reports import decode
         snapshots = [views.PositionView(**r) for r in decode(event['snapshots'])]
+        generic = [r for r in snapshots if r.generic_legs is not None]
+        snapshots = [r for r in snapshots if r.generic_legs is None]
         text = views.positions(snapshots, ts=event['at'], matched=event['matched'],
                                mismatch=event['mismatch'], sim=event['sim'])
+        if generic:
+            from .leg_presenter import render
+            text = ('\n\n'.join([text] if snapshots else []) + '\n\n' +
+                    '\n\n'.join(render(r.generic_legs) for r in generic)).strip()
         return dict(kind='send', chat_id=event['chat_id'], text=text, html=True)
     if kind == 'operator_notice':
         from ..ipc.notifications import validate_notice

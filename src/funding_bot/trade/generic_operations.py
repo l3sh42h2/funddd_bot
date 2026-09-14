@@ -1,0 +1,769 @@
+"""Durable coordinator for a frozen, venue-neutral two-leg :class:`OperationPlan`.
+
+It deliberately does not know a chain, token address, exchange name, or fake
+balance.  Venue work stays behind the existing ``Adapter`` contract.  The
+database protocol is always write-ahead: a shared root reserve and a sent event
+are committed before ``submit``; a later invocation resolves that attempt and
+never submits it again.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
+import hashlib
+import json
+from types import SimpleNamespace
+from typing import Any
+
+from . import store
+from .adapters.contracts import Action, AdapterError, ErrorKind, NativeRef, Prepared, Result, Status
+from .operation_plan import LegBound, OperationPlan
+from .operation_roots import _generic_identity, generic_propose
+from .operations import OperationController
+from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
+
+
+READER = 5
+EVENT_PREPARED = "generic_leg_prepared_v1"
+EVENT_SENT = "generic_leg_sent_v1"
+EVENT_DISPATCH = "generic_leg_dispatch_v1"
+EVENT_RESULT = "generic_leg_result_v1"
+
+
+class _GenericHalt(Exception):
+    """Local callback stop after a durable terminal/pause transition."""
+
+
+def _plan(raw: str) -> OperationPlan:
+    try:
+        return OperationPlan.from_json(raw)
+    except (TypeError, ValueError) as exc:
+        raise store.StoreError(f"frozen generic plan is invalid: {exc}") from None
+
+
+def _raw(quantity: Decimal, decimals: int) -> int:
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity < 0:
+        raise store.StoreError("generic quantity must be a finite non-negative Decimal")
+    value = quantity * (10 ** decimals)
+    if value != value.to_integral_value():
+        raise store.StoreError("generic quantity cannot be represented by its frozen root scale")
+    return int(value)
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _prepared_payload(prepared: Prepared, operation_id: str, leg_id: str) -> dict[str, Any]:
+    action = prepared.quote.action
+    return {"version": 1, "operation_id": operation_id, "leg_id": leg_id,
+            "attempt_id": prepared.attempt_id, "spec_hash": prepared.spec_hash,
+            "quote_hash": prepared.quote.fingerprint, "action_id": action.action_id,
+            "side": action.side, "quantity": str(action.quantity),
+            "reduce_only": action.reduce_only}
+
+
+class EventAttemptJournal:
+    """A NativeAdapter binding journal backed solely by ``exec_events``.
+
+    It is intended for generic CEX and synthetic adapters whose execution does
+    not already have a native attempt table.  It writes public fingerprints,
+    never quote-native payloads or credentials.  ``claim`` is intentionally
+    single-use: a repeated submit must resolve the same durable attempt.
+    """
+
+    def __init__(self, con, *, deal_id: str, intent_id: str, operation_id: str, leg_id: str):
+        self.con = con
+        self.deal_id, self.intent_id = deal_id, intent_id
+        self.operation_id, self.leg_id = operation_id, leg_id
+
+    def _existing(self, kind: str, attempt_id: str) -> dict | None:
+        rows = self.con.execute(
+            "SELECT json FROM exec_events WHERE kind=? AND intent_id=? ORDER BY rowid",
+            (kind, self.intent_id),
+        ).fetchall()
+        for (raw,) in rows:
+            data = json.loads(raw or "{}")
+            if data.get("attempt_id") == attempt_id:
+                return data
+        return None
+
+    def prepare(self, prepared: Prepared) -> None:
+        payload = _prepared_payload(prepared, self.operation_id, self.leg_id)
+        with store.tx(self.con):
+            store.require_reader(self.con, READER)
+            old = self._existing(EVENT_PREPARED, prepared.attempt_id)
+            if old is not None:
+                if _canonical(old) != _canonical(payload):
+                    raise AdapterError(ErrorKind.IDENTITY, "prepared generic attempt differs from durable proof")
+                return
+            store.event(self.con, EVENT_PREPARED, deal_id=self.deal_id, intent_id=self.intent_id, **payload)
+
+    def claim(self, prepared: Prepared) -> None:
+        payload = _prepared_payload(prepared, self.operation_id, self.leg_id)
+        with store.tx(self.con):
+            if self._existing(EVENT_PREPARED, prepared.attempt_id) != payload:
+                raise AdapterError(ErrorKind.IDENTITY, "generic attempt has no matching prepared proof")
+            if self._existing(EVENT_SENT, prepared.attempt_id) is not None:
+                raise AdapterError(ErrorKind.UNKNOWN, "generic attempt was already admitted; resolve it")
+            store.event(self.con, EVENT_SENT, deal_id=self.deal_id, intent_id=self.intent_id, **payload)
+
+
+@dataclass(frozen=True)
+class GenericExecution:
+    operation_id: str
+    intent_id: str
+    leading_result: Result | None
+    hedge_result: Result | None
+    state: str
+
+
+class GenericOperationCoordinator:
+    """Execute one approved immutable two-leg plan through production adapters."""
+
+    def __init__(self, con, registry, context):
+        self.con, self.registry, self.context = con, registry, context
+        self.lifecycle = OperationController(con)
+        self.shared = LifecycleCoordinator(con)
+
+    def propose(self, *, deal, plan: OperationPlan, profile_id: str, chat: int | None = None,
+                operation_id: str | None = None) -> tuple[str, str]:
+        return generic_propose(self.con, deal=deal, plan=plan, profile_id=profile_id,
+                               chat=chat, operation_id=operation_id)
+
+    def approve(self, intent_id: str, nonce: str, *, now: float | None = None) -> bool:
+        return store.approve_intent(self.con, intent_id, nonce, now=now)
+
+    def execute(self, intent_id: str) -> GenericExecution:
+        """Admit an approved plan then run leading result → hedge result once.
+
+        A sent attempt is resolved before any quote or submit.  Therefore the
+        method is safe to call after a process crash; it cannot create a second
+        external attempt with the same durable identity.
+        """
+        run, plan, op = self._load(intent_id, required=store.IntentStatus.APPROVED)
+        if plan.expires_at <= __import__("time").time():
+            raise store.StoreError("generic frozen plan has expired")
+        pair = self.registry.compose(plan.legs[0], plan.legs[1], self.context)
+        self._require_exit_ownership(run, plan)
+        self._activate_deal(run, plan)
+        run.deal = store.get_deal(self.con, run.did)
+        if not self.lifecycle.admit(run):
+            raise store.StoreError("generic operation was not admitted")
+        try:
+            if plan.kind == "rehedge":
+                return self._run_rehedge(run, plan, op, pair)
+            return self._run(run, plan, op, pair)
+        except Exception as exc:
+            self._fail_after_admission(run, f"generic execution refused: {type(exc).__name__}")
+            raise
+
+    def resume(self, intent_id: str) -> GenericExecution:
+        """Resolve a previously sent generic attempt; this method never submits.
+
+        After a resolved partial root has no reserve, a caller must create and
+        approve a new frozen continuation plan.  That deliberately prevents a
+        recovery call from gaining new quote/spend authority.
+        """
+        run, plan, op = self._load(intent_id, required=None)
+        if op["state"] != store.OpState.PAUSED_UNKNOWN or op["reserved_raw"] == "0":
+            raise store.StoreError("generic resume requires a paused unknown reserved root")
+        pair = self.registry.compose(plan.legs[0], plan.legs[1], self.context)
+        sent = self._sent_attempts(run.iid)
+        if not sent:
+            return self._recover_unsent(run, op)
+        by_leg = {leg.leg_id: adapter for leg, adapter in zip(plan.legs, (pair.first, pair.second))}
+        results: dict[str, Result] = {}
+        for leg_id, attempt_id in sent.items():
+            adapter = by_leg.get(leg_id)
+            if adapter is None:
+                raise store.StoreError("generic sent attempt names unknown leg")
+            results[leg_id] = adapter.resolve(attempt_id)
+            self._validate_result(next(leg for leg in plan.legs if leg.leg_id == leg_id),
+                                  self._dispatched_action(run, plan, leg_id, attempt_id), results[leg_id])
+        if any(result.status == Status.UNKNOWN or not result.terminal for result in results.values()):
+            self._pause_unknown(run, "generic result remains unresolved")
+            return GenericExecution(op["id"], run.iid, results.get(plan.leading_leg_id),
+                                    results.get(self._hedge_leg(plan).leg_id), store.OpState.PAUSED_UNKNOWN)
+        return self._recover_resolved(run, plan, op, results)
+
+    def _recover_unsent(self, run, op) -> GenericExecution:
+        """A crash before dispatch has a durable local proof of no external send."""
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN:
+                raise store.StoreError("generic unsent recovery root changed")
+            store.set_operation_state(self.con, op["id"], store.OpState.RUNNING,
+                                      expect=store.OpState.PAUSED_UNKNOWN, reason="generic no dispatch proof")
+            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
+            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
+                                      expect=store.OpState.RUNNING, reason="generic recovery before dispatch")
+        return GenericExecution(op["id"], run.iid, None, None, store.OpState.STOPPED)
+
+    def _recover_resolved(self, run, plan: OperationPlan, op: dict, results: dict[str, Result]) -> GenericExecution:
+        """Apply terminal recovery without reopening the already-ended intent."""
+        leading, hedge = (next(leg for leg in plan.legs if leg.leg_id == plan.leading_leg_id),
+                          self._hedge_leg(plan))
+        lead, hedge_result = results.get(leading.leg_id), results.get(hedge.leg_id)
+        for leg, result in ((leading, lead), (hedge, hedge_result)):
+            if result is not None:
+                self._record_result(run, op, leg, plan.bounds[leg.leg_id].side, result)
+        balanced = (lead is not None and hedge_result is not None and self._proven_execution(lead)
+                    and self._proven_execution(hedge_result)
+                    and self._balanced_book(op["id"], leading, hedge))
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN:
+                raise store.StoreError("generic recovery root changed")
+            executed_raw = 0 if lead is None or lead.executed_quantity is None else _raw(
+                lead.executed_quantity, int(current["target_decimals"]))
+            store.set_operation_state(self.con, op["id"], store.OpState.RUNNING,
+                                      expect=store.OpState.PAUSED_UNKNOWN, reason="generic attempt resolved")
+            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+                                   executed_raw=executed_raw)
+            if balanced:
+                current = store.get_operation(self.con, op["id"])
+                if plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
+                    store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
+                                              expect=store.OpState.RUNNING,
+                                              reason="generic recovered exit leaves parent position")
+                    return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PAUSED_RISK)
+                state = store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN
+                if store.operation_remaining(current) != 0:
+                    state = store.OpState.PARTIAL
+                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING,
+                                          reason="generic recovered terminal result")
+                deal = store.get_deal(self.con, run.did)
+                if deal is not None and state in (store.OpState.OPEN, store.OpState.CLOSED):
+                    target = store.DealState.OPEN if state == store.OpState.OPEN else store.DealState.CLOSED
+                    if deal["state"] != target:
+                        store.set_deal_state(self.con, run.did, target, expect=deal["state"])
+                return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
+            store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
+                                      expect=store.OpState.RUNNING, reason="generic recovery is unbalanced")
+        return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PAUSED_RISK)
+
+    def _load(self, intent_id: str, *, required):
+        intent = store.get_intent(self.con, intent_id)
+        if intent is None:
+            raise LookupError(f"generic intent {intent_id} is missing")
+        if required is not None and intent["status"] != required:
+            raise store.StoreError(f"generic intent {intent_id} is not {required}")
+        spec = json.loads(intent["spec_json"])
+        if spec.get("generic_operation_v1") is not True:
+            raise store.StoreError("intent is not a generic operation")
+        plan = _plan(intent["plan_json"])
+        op = store.operation_of_intent(self.con, intent_id)
+        deal = store.get_deal(self.con, intent["deal_id"])
+        if op is None or deal is None or op["id"] != plan.operation_id:
+            raise store.StoreError("generic intent lost its durable root or deal")
+        if spec.get("plan_fingerprint") != plan.fingerprint or op["inst_hash"] != "generic:" + _generic_identity(plan):
+            raise store.StoreError("generic intent frozen plan identity changed")
+        run = SimpleNamespace(iid=intent_id, did=deal["id"], kind=intent["kind"], it=intent,
+                              deal=deal, op_id=op["id"], legs=SimpleNamespace(sim=bool(deal["sim"])))
+        return run, plan, op
+
+    def _activate_deal(self, run, plan: OperationPlan) -> None:
+        with store.tx(self.con):
+            deal = store.get_deal(self.con, run.did)
+            if deal is None:
+                raise store.StoreError("generic deal disappeared before admission")
+            if plan.kind == "entry" and deal["state"] == store.DealState.DRAFT:
+                store.set_deal_state(self.con, run.did, store.DealState.ENTERING,
+                                     expect=store.DealState.DRAFT)
+            elif plan.kind == "exit" and deal["state"] == store.DealState.OPEN:
+                store.set_deal_state(self.con, run.did, store.DealState.EXITING,
+                                     expect=store.DealState.OPEN)
+
+    def _require_exit_ownership(self, run, plan: OperationPlan) -> None:
+        """Exit only quantities proven for this parent deal, across all roots."""
+        if plan.kind != "exit":
+            return
+        from .leg_accounting import rebuild
+        book = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
+                for row in rebuild(self.con, deal_id=run.did)["legs"]}
+        for leg in plan.legs:
+            quantity = book.get((leg.leg_id, leg.fingerprint), Decimal(0))
+            owned = quantity if leg.direction == "long" else -quantity
+            requested = plan.bounds[leg.leg_id].max_qty * leg.multiplier
+            if owned < requested:
+                raise store.StoreError("generic exit exceeds proven parent-deal position")
+
+    def _run(self, run, plan: OperationPlan, op: dict, pair) -> GenericExecution:
+        """Run the common lead/apply/hedge/apply lifecycle for a generic pair."""
+        leading = next(leg for leg in plan.legs if leg.leg_id == plan.leading_leg_id)
+        hedge = self._hedge_leg(plan)
+        adapters = {leading.leg_id: pair.first if pair.first.describe().leg_id == leading.leg_id else pair.second,
+                    hedge.leg_id: pair.first if pair.first.describe().leg_id == hedge.leg_id else pair.second}
+        lead_action = self._action(run, leading, plan.bounds[leading.leg_id], sequence=1,
+                                   quantity=plan.bounds[leading.leg_id].max_qty)
+        if lead_action.quantity * leading.multiplier > plan.max_unhedged_exposure:
+            raise store.StoreError("generic leading clip exceeds frozen transient unhedged exposure cap")
+        self._authorize_before_first_send(((adapters[leading.leg_id], leading, lead_action),
+                                           (adapters[hedge.leg_id], hedge,
+                                            self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2,
+                                                         quantity=plan.bounds[hedge.leg_id].max_qty))))
+        lead_result: Result | None = None
+        hedge_result: Result | None = None
+        hedge_action: Action | None = None
+
+        def submit_leading():
+            return self._submit_or_resolve(run, op, adapters[leading.leg_id], leading,
+                                           plan.bounds[leading.leg_id], lead_action, reserve=True)
+
+        def apply_leading(native_result):
+            nonlocal lead_result
+            lead_result = native_result
+            self._validate_result(leading, lead_action, lead_result)
+            if self._unknown(lead_result):
+                self._pause_unknown(run, "leading leg outcome is unknown")
+                raise _GenericHalt()
+            self._record_result(run, op, leading, lead_action.side, lead_result)
+            if not self._proven_execution(lead_result):
+                self._finish_no_execution(run, op, lead_result)
+                raise _GenericHalt()
+
+        def submit_hedge():
+            nonlocal hedge_action
+            assert lead_result is not None
+            hedge_qty = self._hedge_quantity(run.did, plan, hedge, leading)
+            hedge_action = self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2, quantity=hedge_qty)
+            try:
+                return self._submit_or_resolve(run, op, adapters[hedge.leg_id], hedge,
+                                               plan.bounds[hedge.leg_id], hedge_action, reserve=False)
+            except Exception:
+                if self._sent_attempts(run.iid).get(hedge.leg_id) == hedge_action.action_id:
+                    self._pause_unknown(run, "generic hedge failed after durable dispatch")
+                else:
+                    self._pause_risk(run, op, lead_result, None, "generic hedge preparation failed")
+                raise _GenericHalt()
+
+        def apply_hedge(native_result):
+            nonlocal hedge_result
+            assert hedge_action is not None
+            hedge_result = native_result
+            self._validate_result(hedge, hedge_action, hedge_result)
+            if self._unknown(hedge_result):
+                self._pause_unknown(run, "hedge leg outcome is unknown")
+                raise _GenericHalt()
+            self._record_result(run, op, hedge, hedge_action.side, hedge_result)
+
+        def finish(_lead, _hedge):
+            assert lead_result is not None
+            self._apply_resolved(run, plan, op, {leading.leg_id: lead_result, hedge.leg_id: hedge_result})
+
+        try:
+            self.shared.run_two_leg(TwoLegProgram(submit_leading, apply_leading, submit_hedge,
+                                                  apply_hedge, finish))
+        except _GenericHalt:
+            current = store.operation_of_intent(self.con, run.iid)
+            return GenericExecution(op["id"], run.iid, lead_result, hedge_result, current["state"])
+        current = store.operation_of_intent(self.con, run.iid)
+        return GenericExecution(op["id"], run.iid, lead_result, hedge_result, current["state"])
+
+    def _run_rehedge(self, run, plan: OperationPlan, op: dict, pair) -> GenericExecution:
+        """One bounded corrective leg from the proven parent book, through shared lifecycle."""
+        leg = next(item for item in plan.legs if item.leg_id == plan.leading_leg_id)
+        adapter = pair.first if pair.first.describe().leg_id == leg.leg_id else pair.second
+        bound = plan.bounds[leg.leg_id]
+        result: Result | None = None
+        action: Action | None = None
+
+        def prepare():
+            nonlocal action
+            delta = self._parent_delta(run.did, plan)
+            tolerance = leg.step * leg.multiplier
+            if abs(delta) <= tolerance:
+                self._stop_without_reserve(run, op, "generic rehedge is already within approved residual")
+                raise _GenericHalt()
+            side = "SELL" if delta > 0 else "BUY"
+            if bound.side != side:
+                raise store.StoreError("generic rehedge leading leg cannot reduce proven parent delta")
+            qty = (abs(delta) / leg.multiplier / leg.step).to_integral_value(rounding=ROUND_DOWN) * leg.step
+            if qty <= 0 or qty < bound.min_qty or qty > bound.max_qty:
+                raise store.StoreError("generic rehedge correction lies outside frozen approved bound")
+            existing = self._leg_parent_qty(run.did, leg)
+            reduces_existing = (side == "BUY" and existing < 0) or (side == "SELL" and existing > 0)
+            if reduces_existing and qty > abs(existing):
+                raise store.StoreError("generic rehedge would cross the proven leg position through zero")
+            increases_direction = (side == "BUY" and existing >= 0) or (side == "SELL" and existing <= 0)
+            if increases_direction and ((side == "BUY" and leg.direction != "long") or
+                                        (side == "SELL" and leg.direction != "short")):
+                raise store.StoreError("generic rehedge would increase an unsupported leg direction")
+            if bound.reduce_only != reduces_existing:
+                raise store.StoreError("generic rehedge reduce-only authorization differs from proven position")
+            action = self._action(run, leg, bound, sequence=1, quantity=qty)
+            self._authorize_before_first_send(((adapter, leg, action),))
+            return HedgeAction(action.side, action.quantity, action.reduce_only)
+
+        def submit(_clip_id, _hedge_action):
+            assert action is not None
+            return self._submit_or_resolve(run, op, adapter, leg, bound, action, reserve=True)
+
+        def apply(_clip_id, _hedge_action, native_result):
+            nonlocal result
+            assert action is not None
+            result = native_result
+            self._validate_result(leg, action, result)
+            if self._unknown(result):
+                self._pause_unknown(run, "generic rehedge outcome is unknown")
+                raise _GenericHalt()
+            self._record_result(run, op, leg, action.side, result)
+            tolerance = leg.step * leg.multiplier
+            if not self._proven_execution(result) or abs(self._parent_delta(run.did, plan)) > tolerance:
+                self._pause_risk(run, op, result, None, "generic rehedge remains outside approved exposure")
+                raise _GenericHalt()
+
+        def verify():
+            return None
+
+        def finish(_action):
+            current = store.get_operation(self.con, op["id"])
+            if result is None or current is None:
+                raise store.StoreError("generic rehedge finished without a result/root")
+            raw = 0 if result.executed_quantity is None else _raw(result.executed_quantity, int(current["target_decimals"]))
+            with store.tx(self.con):
+                current = store.get_operation(self.con, op["id"])
+                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=raw)
+                final = store.get_operation(self.con, op["id"])
+                state = store.OpState.OPEN if store.operation_remaining(final) == 0 else store.OpState.PARTIAL
+                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING,
+                                          reason="generic rehedge applied")
+                self._end_intent_and_deal(run, plan,
+                                          store.IntentStatus.DONE if state == store.OpState.OPEN else store.IntentStatus.PARTIAL,
+                                          state)
+
+        try:
+            self.shared.run_hedge(HedgeProgram(run.iid, prepare, submit, apply, verify, finish))
+        except _GenericHalt:
+            return GenericExecution(op["id"], run.iid, result, None, store.operation_of_intent(self.con, run.iid)["state"])
+        final = store.operation_of_intent(self.con, run.iid)
+        return GenericExecution(op["id"], run.iid, result, None, final["state"])
+
+    @staticmethod
+    def _hedge_leg(plan: OperationPlan):
+        return next(leg for leg in plan.legs if leg.leg_id != plan.leading_leg_id)
+
+    def _action(self, run, leg, bound: LegBound, *, sequence: int, quantity: Decimal) -> Action:
+        if quantity < bound.min_qty or quantity > bound.max_qty:
+            raise store.StoreError("generic action quantity lies outside its frozen leg bounds")
+        action_id = hashlib.sha256(f"{run.op_id}:{run.iid}:{leg.leg_id}:{sequence}".encode()).hexdigest()[:40]
+        return Action(action_id, leg.leg_id, bound.side, quantity, bound.reduce_only)
+
+    def _hedge_quantity(self, deal_id: str, plan: OperationPlan, hedge, leading) -> Decimal:
+        # The accounting projection includes a proven spot base fee.  Deriving
+        # from the Result quantity alone would leave an unhedged inventory.
+        exposure = abs(self._parent_delta(deal_id, plan))
+        if exposure == 0:
+            raise store.StoreError("leading generic result did not create a hedgeable parent delta")
+        raw = (exposure / hedge.multiplier / hedge.step).to_integral_value(rounding=ROUND_DOWN)
+        quantity = raw * hedge.step
+        if quantity <= 0:
+            raise store.StoreError("proven leading exposure is below hedge precision; automatic under-hedge refused")
+        return quantity
+
+    @staticmethod
+    def _authorize_before_first_send(items) -> None:
+        """Check both frozen legs before the leading native request is admitted."""
+        for adapter, leg, action in items:
+            authorize = getattr(getattr(adapter, "bindings", None), "authorize", None)
+            if not callable(authorize):
+                raise store.StoreError("generic adapter lacks pre-submit authorization capability")
+            authorize(leg, action)
+
+    def _leg_parent_qty(self, deal_id: str, leg) -> Decimal:
+        from .leg_accounting import rebuild
+        values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
+                  for row in rebuild(self.con, deal_id=deal_id)["legs"]}
+        return values.get((leg.leg_id, leg.fingerprint), Decimal(0))
+
+    def _parent_delta(self, deal_id: str, plan: OperationPlan) -> Decimal:
+        return sum((self._leg_parent_qty(deal_id, leg) for leg in plan.legs), Decimal(0))
+
+    def _submit_or_resolve(self, run, op, adapter, leg, bound, action, *, reserve: bool) -> Result:
+        sent = self._sent_attempts(run.iid)
+        attempt_id = action.action_id
+        if sent.get(leg.leg_id) == attempt_id:
+            return adapter.resolve(attempt_id)
+        quote = adapter.quote(action, self._bounds(bound))
+        self._validate_quote(quote, action, bound, leg, self._leg_parent_qty(run.did, leg))
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["state"] != store.OpState.RUNNING:
+                raise store.StoreError("generic root is no longer running")
+            if reserve:
+                store.operation_reserve(self.con, op["id"], store.operation_remaining(current))
+        try:
+            prepared = adapter.prepare(attempt_id, quote)
+            if not isinstance(prepared, Prepared) or prepared.attempt_id != attempt_id:
+                raise store.StoreError("adapter returned a different generic prepared attempt")
+        except Exception:
+            if reserve:
+                self._release_unsent(run, op, "generic prepare failed")
+            raise
+        with store.tx(self.con):
+            # Written before submit even for adapters with their own native
+            # journal.  A crash in the tiny window is conservatively resolved.
+            store.event(self.con, EVENT_DISPATCH, deal_id=run.did, intent_id=run.iid,
+                        operation_id=op["id"], leg_id=leg.leg_id, attempt_id=attempt_id,
+                        spec_hash=leg.fingerprint, quote_hash=quote.fingerprint,
+                        quantity=str(action.quantity), side=action.side, reduce_only=action.reduce_only)
+        return adapter.submit(prepared)
+
+    @staticmethod
+    def _bounds(bound: LegBound) -> dict[str, Any]:
+        return {"min_qty": bound.min_qty, "max_qty": bound.max_qty, "max_spend": bound.max_spend,
+                "quote_currency": bound.quote_currency, "reduce_only": bound.reduce_only}
+
+    @staticmethod
+    def _base_currency(leg) -> str:
+        """The exact asset a spot action acquires or spends on this frozen leg."""
+        return leg.instrument if leg.capabilities.venue_kind == "dex" else leg.asset_id
+
+    @classmethod
+    def _validate_quote(cls, quote, action: Action, bound: LegBound, leg, owned_quantity: Decimal) -> None:
+        if quote.action != action:
+            raise store.StoreError("generic quote action differs from frozen action")
+        if quote.expires_at <= __import__("time").time():
+            raise store.StoreError("generic quote has expired")
+        spot = leg.capabilities.market_kind == "spot"
+        base_currency = cls._base_currency(leg) if spot else None
+        if action.side == "BUY":
+            if quote.spend_currency != bound.quote_currency:
+                raise store.StoreError("generic buy quote spend currency differs from frozen quote currency")
+            if quote.max_spend > bound.max_spend:
+                raise store.StoreError("generic quote exceeds approved quote budget")
+            if spot and quote.receive_currency != base_currency:
+                raise store.StoreError("generic buy quote receive asset differs from frozen spot asset")
+            return
+        if action.side != "SELL":
+            raise store.StoreError("generic quote side is invalid")
+        if spot:
+            if quote.spend_currency != base_currency:
+                raise store.StoreError("generic sell quote spend asset differs from frozen spot asset")
+            if quote.max_spend > action.quantity or quote.max_spend > bound.max_qty:
+                raise store.StoreError("generic sell quote exceeds approved base quantity")
+            if owned_quantity < quote.max_spend:
+                raise store.StoreError("generic sell quote exceeds proven parent spot inventory")
+        elif quote.spend_currency == bound.quote_currency and quote.max_spend > bound.max_spend:
+            raise store.StoreError("generic quote exceeds approved quote budget")
+        elif quote.spend_currency != bound.quote_currency:
+            raise store.StoreError("generic buy quote spend currency differs from frozen quote currency")
+        if bound.min_receive_currency is None:
+            raise store.StoreError("generic sell lacks explicit approved minimum proceeds currency")
+        if quote.receive_currency != bound.min_receive_currency or quote.min_receive < bound.min_receive:
+            raise store.StoreError("generic sell quote minimum proceeds exceed approval")
+
+    def _sent_attempts(self, intent_id: str) -> dict[str, str]:
+        rows = self.con.execute("SELECT json FROM exec_events WHERE kind=? AND intent_id=? ORDER BY rowid",
+                                (EVENT_DISPATCH, intent_id)).fetchall()
+        found: dict[str, str] = {}
+        for (raw,) in rows:
+            event = json.loads(raw or "{}")
+            leg_id, attempt_id = event.get("leg_id"), event.get("attempt_id")
+            if not isinstance(leg_id, str) or not isinstance(attempt_id, str):
+                raise store.StoreError("generic sent evidence is malformed")
+            previous = found.setdefault(leg_id, attempt_id)
+            if previous != attempt_id:
+                raise store.StoreError("generic leg has conflicting sent attempts")
+        return found
+
+    def _dispatched_action(self, run, plan: OperationPlan, leg_id: str, attempt_id: str) -> Action:
+        row = self.con.execute("SELECT json FROM exec_events WHERE kind=? AND intent_id=? ORDER BY rowid DESC",
+                               (EVENT_DISPATCH, run.iid)).fetchall()
+        for (raw,) in row:
+            event = json.loads(raw or "{}")
+            if event.get("leg_id") != leg_id or event.get("attempt_id") != attempt_id:
+                continue
+            try:
+                action = Action(attempt_id, leg_id, event["side"], Decimal(event["quantity"]),
+                                bool(event["reduce_only"]))
+            except (KeyError, ValueError, TypeError):
+                raise store.StoreError("generic dispatch evidence has invalid action") from None
+            leg = next(item for item in plan.legs if item.leg_id == leg_id)
+            action.validate(leg)
+            return action
+        raise store.StoreError("generic dispatch evidence has no action")
+
+    @staticmethod
+    def _unknown(result: Result) -> bool:
+        return result.status == Status.UNKNOWN or not result.terminal or result.provisional
+
+    @staticmethod
+    def _proven_execution(result: Result) -> bool:
+        return (result.terminal and not result.provisional and result.executed_quantity is not None and
+                result.executed_quantity > 0 and result.status in {Status.SETTLED, Status.PARTIAL, Status.CANCELLED})
+
+    @staticmethod
+    def _validate_result(leg, action: Action, result: Result) -> None:
+        if result.status == Status.UNKNOWN:
+            return
+        if result.leg_id != leg.leg_id or result.spec_hash != leg.fingerprint or tuple(result.scope or ()) != tuple(leg.scope):
+            raise store.StoreError("generic result identity differs from frozen leg")
+        quantity = result.executed_quantity
+        if quantity is not None and quantity > action.quantity:
+            raise store.StoreError("generic result exceeds submitted frozen quantity")
+
+    def _record_result(self, run, op, leg, side: str, result: Result) -> None:
+        if not result.terminal or result.provisional or result.status == Status.UNKNOWN:
+            raise store.StoreError("unknown result cannot be applied")
+        from .leg_accounting import record_result
+        with store.tx(self.con):
+            record_result(self.con, result, leg, operation_id=op["id"], side=side,
+                          deal_id=run.did, intent_id=run.iid)
+            store.event(self.con, EVENT_RESULT, deal_id=run.did, intent_id=run.iid,
+                        operation_id=op["id"], leg_id=leg.leg_id, attempt_id=result.native_ref.id,
+                        status=str(result.status), executed_quantity=None if result.executed_quantity is None
+                        else str(result.executed_quantity), terminal=True)
+
+    def _apply_resolved(self, run, plan: OperationPlan, op: dict, results: dict[str, Result]) -> GenericExecution:
+        leading = next(leg for leg in plan.legs if leg.leg_id == plan.leading_leg_id)
+        hedge = self._hedge_leg(plan)
+        lead = results.get(leading.leg_id)
+        hedge_result = results.get(hedge.leg_id)
+        if lead is None or self._unknown(lead) or (hedge_result is not None and self._unknown(hedge_result)):
+            self._pause_unknown(run, "generic resolve remains unknown")
+            return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PAUSED_UNKNOWN)
+        # A crash may happen after native finality and before the fact write.
+        # record_result deduplicates by the result native reference, so both the
+        # normal path and recovery can invoke it safely.
+        for leg, result in ((leading, lead), (hedge, hedge_result)):
+            if result is not None:
+                self._record_result(run, op, leg, plan.bounds[leg.leg_id].side, result)
+        if hedge_result is None or not self._proven_execution(lead) or not self._proven_execution(hedge_result):
+            return self._pause_risk(run, op, lead, hedge_result, "generic pair is not proven balanced")
+        if not self._balanced_book(op["id"], leading, hedge):
+            return self._pause_risk(run, op, lead, hedge_result, "generic proven exposures differ")
+        root_scale = int(op["target_decimals"])
+        executed_raw = _raw(lead.executed_quantity, root_scale)
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["reserved_raw"] == "0":
+                raise store.StoreError("generic pair has no reserve to settle")
+            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+                                   executed_raw=executed_raw)
+            final = store.get_operation(self.con, op["id"])
+            if store.operation_remaining(final) == 0:
+                if plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
+                    return self._pause_risk(run, op, lead, hedge_result,
+                                            "generic exit leaves proven parent position")
+                state = store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN
+                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING)
+                self._end_intent_and_deal(run, plan, store.IntentStatus.DONE, state)
+                return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
+            store.set_operation_state(self.con, op["id"], store.OpState.PARTIAL, expect=store.OpState.RUNNING,
+                                      reason="generic partial pair")
+            self._end_intent_and_deal(run, plan, store.IntentStatus.PARTIAL, store.OpState.PARTIAL)
+        return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PARTIAL)
+
+    def _finish_no_execution(self, run, op, result):
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
+            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED, expect=store.OpState.RUNNING,
+                                      reason="generic leading leg did not execute")
+            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
+                                    expect=store.IntentStatus.RUNNING, err="generic leading leg did not execute")
+        return GenericExecution(op["id"], run.iid, result, None, store.OpState.STOPPED)
+
+    def _release_unsent(self, run, op, reason: str) -> None:
+        """Prepare failed before a dispatch event, so releasing this reserve is proven safe."""
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["state"] != store.OpState.RUNNING:
+                return
+            if current["reserved_raw"] != "0":
+                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
+            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
+                                      expect=store.OpState.RUNNING, reason=reason)
+            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
+                                    expect=store.IntentStatus.RUNNING, err=reason)
+            deal = store.get_deal(self.con, run.did)
+            if deal is not None and deal["state"] in (store.DealState.ENTERING, store.DealState.EXITING):
+                store.set_deal_state(self.con, run.did, store.DealState.PAUSED, expect=deal["state"], reason=reason)
+
+    def _fail_after_admission(self, run, reason: str) -> None:
+        """A synchronous refusal cannot leave an admitted root running.
+
+        Once a durable dispatch or reserve exists, the same error is uncertain
+        rather than a safe rollback and recovery must resolve it first.
+        """
+        op = store.operation_of_intent(self.con, run.iid)
+        if op is None or op["state"] != store.OpState.RUNNING:
+            return
+        if op["reserved_raw"] != "0" or self._sent_attempts(run.iid):
+            self._pause_unknown(run, reason)
+            return
+        self._release_unsent(run, op, reason)
+
+    def _stop_without_reserve(self, run, op, reason: str) -> None:
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is None or current["state"] != store.OpState.RUNNING or current["reserved_raw"] != "0":
+                raise store.StoreError("generic no-action root is not safely stoppable")
+            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
+                                      expect=store.OpState.RUNNING, reason=reason)
+            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
+                                    expect=store.IntentStatus.RUNNING, err=reason)
+
+    def _balanced_book(self, operation_id: str, leading, hedge) -> bool:
+        from .leg_accounting import rebuild
+        values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
+                  for row in rebuild(self.con, operation_id=operation_id)["legs"]}
+        lead = values.get((leading.leg_id, leading.fingerprint))
+        paired = values.get((hedge.leg_id, hedge.fingerprint))
+        return lead is not None and paired is not None and lead + paired == 0
+
+    def _parent_is_flat(self, deal_id: str, plan: OperationPlan) -> bool:
+        from .leg_accounting import rebuild
+        values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
+                  for row in rebuild(self.con, deal_id=deal_id)["legs"]}
+        return all(values.get((leg.leg_id, leg.fingerprint), Decimal(0)) == 0 for leg in plan.legs)
+
+    def _pause_unknown(self, run, reason: str) -> None:
+        with store.tx(self.con):
+            op = store.operation_of_intent(self.con, run.iid)
+            if op is not None and op["state"] == store.OpState.RUNNING:
+                store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_UNKNOWN,
+                                          expect=store.OpState.RUNNING, reason=reason)
+            intent = store.get_intent(self.con, run.iid)
+            if intent is not None and intent["status"] == store.IntentStatus.RUNNING:
+                store.set_intent_status(self.con, run.iid, store.IntentStatus.PARTIAL,
+                                        expect=store.IntentStatus.RUNNING, err=reason)
+            deal = store.get_deal(self.con, run.did)
+            if deal is not None and deal["state"] in (store.DealState.ENTERING, store.DealState.EXITING):
+                store.set_deal_state(self.con, run.did, store.DealState.PAUSED, expect=deal["state"], reason=reason)
+
+    def _pause_risk(self, run, op, lead, hedge, reason: str) -> GenericExecution:
+        with store.tx(self.con):
+            current = store.get_operation(self.con, op["id"])
+            if current is not None and current["reserved_raw"] != "0":
+                # Known terminal results may release the admission reserve; the
+                # persisted facts retain the unhedged exposure for manual action.
+                executed_raw = 0 if lead is None or lead.executed_quantity is None else _raw(
+                    lead.executed_quantity, int(current["target_decimals"]))
+                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+                                       executed_raw=executed_raw)
+            store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
+                                      expect=store.OpState.RUNNING, reason=reason)
+            self._end_intent_and_deal(run, _plan(run.it["plan_json"]), store.IntentStatus.PARTIAL,
+                                      store.OpState.PAUSED_RISK, reason=reason)
+        return GenericExecution(op["id"], run.iid, lead, hedge, store.OpState.PAUSED_RISK)
+
+    def _end_intent_and_deal(self, run, plan: OperationPlan, intent_state, root_state, *, reason=None) -> None:
+        intent = store.get_intent(self.con, run.iid)
+        if intent is None or intent["status"] != store.IntentStatus.RUNNING:
+            raise store.StoreError("generic terminal intent changed")
+        if not store.set_intent_status(self.con, run.iid, intent_state, expect=store.IntentStatus.RUNNING, err=reason):
+            raise store.StoreError("generic terminal intent CAS failed")
+        deal = store.get_deal(self.con, run.did)
+        if deal is None:
+            raise store.StoreError("generic deal changed")
+        if root_state == store.OpState.OPEN:
+            target = store.DealState.OPEN
+        elif root_state == store.OpState.CLOSED:
+            target = store.DealState.CLOSED
+        else:
+            target = store.DealState.PAUSED
+        if deal["state"] != target:
+            store.set_deal_state(self.con, run.did, target, expect=deal["state"], reason=reason)

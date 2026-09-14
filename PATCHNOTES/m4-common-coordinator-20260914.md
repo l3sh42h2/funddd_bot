@@ -80,3 +80,40 @@ operation_plan.py и perp_preflight.py — новые пока неподклю�
 OperationPlan roundtrip/deep-frozen authorization/shared identity proof,
 account tampering, exit/reduce-only/currency bounds: 5 passed / 0.04 s.
 Остальная привязка SolDesk к HL этим изменением не устранена.
+
+## Продолжение после согласования Terra/Luna
+
+Владелец согласовал продолжение второго ТЗ с менее дорогими моделями и итоговым ревью Claude.
+Фактически запущены два GPT-5.6 Terra high: legacy lifecycle/SOL decoupling и durable generic plan.
+Основной Codex интегрирует учёт, очередь, read-model и матрицу. Luna на этом срезе не запускалась.
+
+Реализуются generic планы в существующих intents/operations/exec_events, EventAttemptJournal,
+reader floor 5 при первом несовместимом событии. Generic CEX/perp–perp сделки имеют NULL legacy
+chain/token, обе LegSpec заморожены; новые live сочетания не включены.
+Новый generic отчёт позиций имеет DTO 4 и outbox/rollback fence; прежний DTO 2 не получает нового поля.
+
+Учет: terminal Result атомарно сохраняет количество и currency cash; native receipt не может
+зачесться двум операциям. Raw token flows должны подтверждать reported qty. Perp notional не cash debit;
+rent/спонсор/embedded fees различаются, фандинг дедуплицируется по scope/native ID. Полнота исторического
+фандинга и FX/PnL этим не доказаны, в отчёте остаются неизвестными.
+
+Пять исполнимых synthetic adapters вынесены в docs/migration/examples, матрица импортирует именно их.
+Проверяются вход/выход, обе стороны perp/perp, actual Engine queue, duplicate command, ACK loss/reopen,
+base fee, generic startup/positions/dashboard и запрет несовместимых полномочий/лимита экспозиции.
+Native SOL×Gate/Aster acceptance и дальнейшие crash/continuation сценарии ещё дописываются.
+
+Промежуточные результаты: generic matrix + cash 30 passed / 2.47 s; учет/DTO regression 43 passed / 0.35 s.
+Первый расширенный профиль: 609 passed и 1 регрессия HL unifiedAccount; контроль затем восстановлен,
+targeted 14 passed / 0.52 s. Два HTTP-теста кабинета повторены вне sandbox после запрета loopback:
+2 passed / 1.22 s. Итоговый неизменяемый Linux-кандидат ещё не собран.
+
+Статус остается in_progress. Этот срез не является выполненным C1–C5, принятым ревью или выкатом.
+Production этим продолжением не менялся. После ТЗ остаются полный аудит исторического учёта и сквозная
+приёмка миграции; затем отдельный патч добора/сокращения и SL. Полные счётчики токенов/этапного времени недоступны.
+
+Сверенный checkpoint 15.09.2026 00:00 МСК: расширенный профиль M4/SOL C2/legacy engine/M3/preflight/
+shared lifecycle/generic matrix — **649 passed / 18.98 s**. Native SOL×Gate/Aster через actual Desk/Engine
+прошли вход без HL native methods/config; дальнейшие exit/rehedge/restart ещё проверяются.
+Generic normal execution использует общий TwoLegProgram, rehedge — HedgeProgram. Частичный остаток
+продолжает прежний root с неизменной identity обеих ног; plan/approval fingerprint обновляется отдельно.
+После доказанного ACK loss новый вход не повторяется; новая коррекция требует свежего approved плана.

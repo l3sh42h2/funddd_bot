@@ -136,7 +136,8 @@ def sol_spec(deal, native, *, wallet=None):
     """Frozen SOL identity view; no registry refresh during execution/recovery."""
     inst = InstrumentSpec.from_json(deal['inst_json'])
     cfg = owner.OwnerCfg.from_frozen(deal['owner_json'])
-    expected_wallet = cfg.get('wallets.sol_hl.solana_address')
+    expected_wallet = cfg.get('wallets.sol_hl.solana_address') if inst.profile_id == owner.SOL_HL else \
+        cfg.get('wallets.solana.solana_address')
     actual_wallet = wallet or native.wallet
     if (not inst.verified or not inst.identity_hash or inst.chain != 'solana'
             or inst.token != deal['token'] or inst.token_dec != deal['token_dec']

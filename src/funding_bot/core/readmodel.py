@@ -108,6 +108,14 @@ def load_deals(con: sqlite3.Connection, limit: int = DEALS_MAX, now: float | Non
                            "ON i.id = e.intent_id WHERE e.deal_id = ? ORDER BY e.ts DESC, e.rowid DESC LIMIT 1",
                            (d["id"],)).fetchone()
         v = _deal_view(d, opened.get(d["id"]), d["id"] in spot_unknown, d["id"] in perp_unknown, last)
+        if _is_generic(d):
+            from .leg_report import build
+            v['legs'] = build(con, deal_id=d['id'])
+            v['pnl'] = {'final': d['state'] in _TERMINAL, 'total': None, 'incomplete': True,
+                        'reason': 'valuation_not_available'}
+            v['row_key'] = None
+            out.append(v)
+            continue
         if _is_sol(d):
             v["sol"], v["unit"] = _sol_view(con, d), "USDC"
         v["pnl"] = _pnl_view(con, d, now)
@@ -116,6 +124,13 @@ def load_deals(con: sqlite3.Connection, limit: int = DEALS_MAX, now: float | Non
             v["hist"] = None if v["sim"] else funding_history(con, d, now=now)
         out.append(v)
     return {"deals": out, "drafts": drafts}
+
+
+def _is_generic(deal):
+    try:
+        return json.loads(deal.get('inst_json') or '{}').get('generic_position_v1') is True
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _liq_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:

@@ -90,7 +90,7 @@ CREATE TRIGGER IF NOT EXISTS deal_marks_no_update BEFORE UPDATE ON deal_marks BE
 # --- схема 2: версия, ворота, журналы SOL×HL ---------------------------------------------------------------------
 # Версия схемы и ворота (M06): код откажется стартовать, если min_reader БД больше его SCHEMA_VERSION — старый код на
 # БД со сделками, которых он не понимает, выбрал бы не те ноги. min_reader только растёт (require_reader).
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MIN_READER = 2
 
 # состояния trade/solana/journal.AttemptState для частичных индексов (журнал сверяет их с собой при открытии)
@@ -804,6 +804,37 @@ def create_deal(con, *, coin: str, chain: str, token: str, token_dec: int, perp_
     return did
 
 
+def create_generic_deal(con, *, asset_id: str, position_spec: Any, owner_json: str, sim: bool,
+                        deal_id: str | None = None, now: float | None = None) -> str:
+    """Create a generic two-leg deal without fabricating legacy chain/token fields.
+
+    The legacy identifiers are NULL.  A generic-aware reader must select the
+    immutable ``generic_position_v1`` marker in ``inst_json``; legacy deal
+    records are never rewritten.  ``leg_usd=0`` is an unavailable legacy view,
+    not a price or risk observation.
+    """
+    if not isinstance(asset_id, str) or not asset_id:
+        raise ValueError("generic asset identity is required")
+    if not isinstance(position_spec, dict) or position_spec.get("generic_position_v1") is not True:
+        raise ValueError("generic position needs immutable generic_position_v1 specification")
+    if not isinstance(owner_json, str) or not owner_json:
+        raise ValueError("generic owner_json is required")
+    ts = time.time() if now is None else now
+    with tx(con):
+        require_reader(con, 5, now=ts)
+        did = deal_id
+        while did is None:
+            candidate = new_id("D")
+            if con.execute("SELECT 1 FROM deals WHERE id=?", (candidate,)).fetchone() is None:
+                did = candidate
+        con.execute("INSERT INTO deals(id, created, state, reason, coin, chain, token, token_dec, perp_venue, symbol, "
+                    "leg_usd, owner_json, sim, carry, dust, updated, inst_json, perp_scope) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (did, ts, str(DealState.DRAFT), None, asset_id, None, None, None, None, None,
+                     "0", owner_json, 1 if sim else 0, "0", "0", ts, jdump(position_spec), None))
+    return did
+
+
 _SOL_CHAINS = frozenset({"sol", "solana", "solana-mainnet"})
 
 
@@ -1254,7 +1285,13 @@ OP_NEXT: dict[str, frozenset] = {
     OpState.PAUSED_UNKNOWN: frozenset({OpState.RUNNING, OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK}),
 }
 # вид цели по стороне: вход — бюджет котировки (USDC raw), выход — токены к продаже или снимок всей позиции сделки
-OP_TARGETS = {"entry": ("stable_raw_budget",), "exit": ("token_raw_to_sell", "full_position_snapshot")}
+# ``generic_leading_quantity`` is deliberately a quantity of the immutable
+# leading LegSpec, not a chain token or a CEX balance.  It lets the existing
+# operation reserve remain the single admission budget for a two-leg generic
+# operation without inventing a wallet/token identity for CEX legs.
+OP_TARGETS = {"entry": ("stable_raw_budget", "generic_leading_quantity"),
+              "exit": ("token_raw_to_sell", "full_position_snapshot", "generic_leading_quantity"),
+              "rehedge": ("generic_leading_quantity",)}
 OP_MODES = ("dry", "live")
 
 

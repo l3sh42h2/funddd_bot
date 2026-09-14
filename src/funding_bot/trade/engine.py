@@ -33,7 +33,8 @@ from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
 from .ledger_flows import spot_quote_flows, perp_quote_flows
 from .exposure import Exposure
-from .operations import OperationController, SpotSettlement, ClipLifecycle
+from .operations import ClipLifecycle, OperationController, SpotSettlement
+from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator
 from .planner import PlanRefused
 from .runtime import is_sol_deal
 from .store import ClipState, DealState, IntentStatus, PerpOrderState
@@ -721,37 +722,39 @@ class Desk:
         # связка SOL × HL (trade/sol_flow.py): реестр инструментов (runtime/instruments.json) и её предложения. legs —
         # runtime.RuntimeRegistry (или прежний legs(sim): тогда связка «не подключена» — честный отказ)
         self.registry_loader = registry_loader
-        self._sol_desk = None
+        self._sol_desks = {}
 
-    def sol(self):
-        if self._sol_desk is None:
+    def sol(self, profile=None):
+        profile = profile or owner_mod.SOL_HL
+        if profile not in self._sol_desks:
             from .sol_flow import SolDesk
-            self._sol_desk = SolDesk(self)
-        return self._sol_desk
+            self._sol_desks[profile] = SolDesk(self, profile)
+        return self._sol_desks[profile]
 
     def propose_profile_entry(self, cmd, chat: int | None) -> Proposal:
         """Вход связки (tg.parse.ProfileEntry): инструмент — из реестра, не из таблицы коллектора."""
-        return self.sol().propose_entry(cmd, chat)
+        return self.sol(cmd.profile).propose_entry(cmd, chat)
 
     def propose_profile_exit(self, cmd, chat: int | None) -> Proposal:
         """Выход с именем связки или количеством (tg.parse.ProfileExit). Сделка связки — её план выхода (частичный в
         пилоте — честный отказ); сделка BSC — прежний выход только без количества и с именем «bsc», иначе отказ
         с форматом (сумма в токенах у BSC не разбирается)."""
         from ..operator_commands import EXIT_FMT
-        from .owner import SOL_HL
+        from .runtime import profile_of_deal
         deal = self.resolve_deal(cmd.target)
         v = _views()
         if not is_sol_deal(deal):
             if cmd.profile not in (None, owner_mod.LEGACY_PROFILE) or cmd.tokens is not None or cmd.usdc is not None:
                 raise Refused(v.refused(f"сделка {deal['id']} — связки BSC/Aster, формат: {EXIT_FMT}"))
             return self.propose_exit(deal["id"], None, False, chat)
-        if cmd.profile not in (None, SOL_HL):
-            raise Refused(v.refused(f"сделка {deal['id']} — связки Solana × Hyperliquid, а не {cmd.profile}"))
+        profile = profile_of_deal(deal)
+        if cmd.profile not in (None, profile):
+            raise Refused(v.refused(f"сделка {deal['id']} — профиля {profile}, а не {cmd.profile}"))
         if cmd.perp_dex and str(deal["symbol"]).split(":", 1)[0] != cmd.perp_dex:
             raise Refused(v.refused(f"сделка {deal['id']} на {deal['symbol']}, а не на dex {cmd.perp_dex}"))
         if cmd.tokens is not None or cmd.usdc is not None:
             raise Refused(v.refused(f"частичный выход в пилоте выключен — только «выход {deal['id']}» целиком"))
-        return self.sol().propose_exit(deal, None, False, chat)
+        return self.sol(profile).propose_exit(deal, None, False, chat)
 
     # --- общее ---
     def cfg(self) -> OwnerCfg:
@@ -1332,7 +1335,8 @@ class Desk:
     def propose_exit(self, target: str, usd: D | None, perp_only: bool, chat: int | None) -> Proposal:
         deal = self.resolve_deal(target)
         if is_sol_deal(deal):                  # связка SOL × HL: свои ноги и правила (sol_flow)
-            return self.sol().propose_exit(deal, usd, perp_only, chat)
+            from .runtime import profile_of_deal
+            return self.sol(profile_of_deal(deal)).propose_exit(deal, usd, perp_only, chat)
         plan, ctx = self.plan_exit(deal, usd, perp_only)
         cfg = ctx["cfg"]
         inst = ctx["inst"]
@@ -1368,7 +1372,8 @@ class Desk:
         cfg = self.cfg()
         deal = self.resolve_deal(target)
         if is_sol_deal(deal):
-            return self.sol().propose_fix(kind, deal, chat)
+            from .runtime import profile_of_deal
+            return self.sol(profile_of_deal(deal)).propose_fix(kind, deal, chat)
         self._common_checks(cfg, bool(deal["sim"]), "дохедж" if kind == "rehedge" else "откат", *_deal_cv(deal))
         if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
             raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
@@ -1731,7 +1736,8 @@ class Engine:
                  owner_loader: Callable[[], OwnerCfg] = owner_mod.load, keys_mode: str | None = None,
                  holder: CfgHolder | None = None, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], Any] = time.sleep, clip_gap_s: float | D = planner.CLIP_GAP_S,
-                 busy_path=None):
+                 busy_path=None, generic_context_factory: Callable[[Any, Mapping, Mapping, Mapping], Any] | None = None,
+                 generic_registry=None):
         self.conns, self.legs, self.desk = conns, legs, desk
         self.busy_path = busy_path            # tconfig.TRADING_BUSY в боевом процессе; None — без файла (тесты)
         self.hooks = hooks or Hooks()
@@ -1750,6 +1756,11 @@ class Engine:
         self.current: tuple[str, int, int] | None = None      # (намерение, клип, клипов) — для ответа на «стоп»
         self._unwind_due: dict[str, float] = {}
         self._sol_engine = None
+        # Generic plans are opt-in and receive a freshly scoped context after
+        # the immutable intent is loaded.  There is deliberately no default
+        # constructed from live credentials: a missing factory is a refusal.
+        self.generic_context_factory = generic_context_factory
+        self.generic_registry = generic_registry
 
     def _sol(self):
         """Шаги связки SOL × HL (trade/sol_flow.py): тот же поток, те же ворота «стоп»/SIGTERM, свои ноги."""
@@ -1860,6 +1871,8 @@ class Engine:
             return self._fail(iid, "служба останавливается — план не начат, пришлите команду после рестарта")
         deal = store.get_deal(con, it["deal_id"])
         spec = json.loads(it["spec_json"])
+        if spec.get("generic_operation_v1") is True:
+            return self._execute_generic(con, it, deal, spec)
         if is_sol_deal(deal):
             policy = self._sol()
             run = policy.prepare_run(it, deal, spec)
@@ -1871,6 +1884,34 @@ class Engine:
         OperationController(con).run_operation(
             run, lambda: policy.execute_program(run), paused=lambda stop: policy._paused(run, stop),
             refused=lambda text: self._fail(iid, text))
+
+    def _execute_generic(self, con, intent, deal, spec) -> None:
+        """Dispatch a frozen generic plan through the same Engine queue only.
+
+        GenericOperationCoordinator performs its own OperationController.admit;
+        this method must not route the intent through legacy EVM/SOL preparation
+        or fabricate a context from any live global adapter.
+        """
+        factory = self.generic_context_factory
+        registry = self.generic_registry or getattr(self.legs, "adapters", None)
+        if factory is None or registry is None:
+            self._fail(intent["id"], "generic plan has no scoped adapter context — nothing sent")
+            return
+        try:
+            context = factory(con, intent, deal, spec)
+            if context is None:
+                raise ValueError("factory returned no scoped adapter context")
+            from .generic_operations import GenericOperationCoordinator
+            GenericOperationCoordinator(con, registry, context).execute(intent["id"])
+        except Exception as e:
+            # The generic coordinator persists UNKNOWN itself.  A failure before
+            # admission is a normal refusal; after admission it owns the durable
+            # state and Engine only reports the crash at its outer boundary.
+            current = store.get_intent(con, intent["id"])
+            if current is not None and current["status"] == IntentStatus.APPROVED:
+                self._fail(intent["id"], "generic operation not started: " + redact(e))
+                return
+            raise
 
     def execute_program(self, run):
         if run.kind != "undo":
@@ -2705,10 +2746,9 @@ class Engine:
             return amount
         OperationController(self.conns.get()).run_clips(ClipLifecycle(
             intent_id=run.iid, amounts=amounts, progress=progress, guard=lambda: self.guard(run),
-            select_amount=select_amount,
-            prepare=prepare,
+            select_amount=select_amount, prepare=prepare,
             spot=lambda cid, u, ticket: self._dex(run, cid, run.stable if entry else run.token,
-                                                 run.token if entry else run.stable, u),
+                                                   run.token if entry else run.stable, u),
             hedge=lambda cid, last, ticket: self._hedge_clip(run, cid, ticket[2], last_full=full and last),
             settle=settle, next_amounts=next_amounts, finish=lambda: self._finish_main(run)))
 
@@ -2842,11 +2882,23 @@ class Engine:
         if side != run.spec.get("side"):
             raise Pause("changed", "дельта ног сменила знак после плана — пришлите «дохедж» заново")
         qty = min(qty, D(str(run.spec["qty"])))
-        clip_id = store.create_clip(con, run.iid, 1, 0)
-        hr = self._hedge(run, clip_id, side, qty, ro)
-        self._after_hedge(run, clip_id, hr, delta)
-        self._invariant(run)
-        self._settle_fix(run, qty=hr.filled, usd=hr.quote, side=side)
+        def apply(clip_id, action, hr):
+            self._after_hedge(run, clip_id, hr, delta)
+
+        # ``_after_hedge`` can pause on UNKNOWN or a partial/reduce-only
+        # result; then coordinator never verifies or commits a terminal fix.
+        # Preserve the actual filled/quote values for the successful case.
+        result: dict[str, HedgeResult] = {}
+        def submit(clip_id, action):
+            hr = self._hedge(run, clip_id, action.side, action.quantity, action.reduce_only)
+            result['value'] = hr
+            return hr
+        def finish_actual(action):
+            hr = result['value']
+            self._settle_fix(run, qty=hr.filled, usd=hr.quote, side=action.side)
+        LifecycleCoordinator(con).run_hedge(HedgeProgram(
+            intent_id=run.iid, prepare=lambda: HedgeAction(side, qty, ro), submit=submit, apply=apply,
+            verify=lambda: self._invariant(run), finish=finish_actual))
 
     def _undo(self, run: Run) -> None:
         con = self.conns.get()

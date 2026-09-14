@@ -34,6 +34,19 @@ def _invalid_constant(value):
     raise ValueError("nonfinite JSON number")
 
 
+def _json_decimal(value: Any, name: str) -> Decimal:
+    """Canonical plan money is JSON text; accepting float reintroduces drift."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a decimal string")
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{name} must be a decimal string") from None
+    if not result.is_finite():
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 def _unique(items):
     result = {}
     for key, value in items:
@@ -60,6 +73,11 @@ class LegBound:
     quote_currency: str
     max_spend: Decimal
     reduce_only: bool = False
+    # ``max_spend`` is an approved quote-currency budget.  A SELL action is
+    # additionally bounded by max_qty; it must have an explicit minimum quote
+    # receive because a native Quote.max_spend may be denominated in base.
+    min_receive: Decimal = Decimal(0)
+    min_receive_currency: str | None = None
 
     def __post_init__(self):
         if self.side not in {"BUY", "SELL"}:
@@ -71,6 +89,9 @@ class LegBound:
         _d(self.max_spend, "max_spend", nonnegative=True)
         if type(self.reduce_only) is not bool:
             raise ValueError("reduce_only must be bool")
+        _d(self.min_receive, "min_receive", nonnegative=True)
+        if self.min_receive_currency is not None:
+            _text(self.min_receive_currency, "min_receive_currency")
 
 
 @dataclass(frozen=True)
@@ -164,18 +185,22 @@ class OperationPlan:
             item["capabilities"] = Capabilities(**item["capabilities"])
             item["fee_currencies"] = tuple(item["fee_currencies"])
             for key in ("multiplier", "step", "tick"):
-                item[key] = Decimal(item[key])
+                item[key] = _json_decimal(item[key], key)
             legs.append(LegSpec(**item))
         bound_fields = set(LegBound.__dataclass_fields__)
+        legacy_bound_fields = bound_fields - {"min_receive", "min_receive_currency"}
         bounds = {}
         for key, item in data["bounds"].items():
-            if set(item) != bound_fields: raise ValueError("unknown or missing bound fields")
+            if set(item) not in (bound_fields, legacy_bound_fields): raise ValueError("unknown or missing bound fields")
             item = dict(item)
-            for n in ("min_qty", "max_qty", "max_spend"): item[n] = Decimal(item[n])
+            item.setdefault("min_receive", "0")
+            item.setdefault("min_receive_currency", None)
+            for n in ("min_qty", "max_qty", "max_spend", "min_receive"):
+                item[n] = _json_decimal(item[n], n)
             bounds[key] = LegBound(**item)
         return cls(operation_id=data["operation_id"], kind=data["kind"], legs=tuple(legs),
-                   leading_leg_id=data["leading_leg_id"], target_exposure=Decimal(data["target_exposure"]),
-                   max_unhedged_exposure=Decimal(data["max_unhedged_exposure"]), expires_at=data["expires_at"],
+                   leading_leg_id=data["leading_leg_id"], target_exposure=_json_decimal(data["target_exposure"], "target_exposure"),
+                   max_unhedged_exposure=_json_decimal(data["max_unhedged_exposure"], "max_unhedged_exposure"), expires_at=data["expires_at"],
                    rounding_policy=data["rounding_policy"], bounds=bounds, authorization=data["authorization"])
 
     @property

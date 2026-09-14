@@ -22,18 +22,19 @@ UNKNOWN Solana или HL — пауза без новых действий; ис
 from __future__ import annotations
 import json, logging, time
 from dataclasses import dataclass, field, replace
-from decimal import Decimal, ROUND_FLOOR, localcontext
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from typing import Any, Mapping
 from . import hl_rules as R, instruments as I, planner, store, tconfig
 from .engine import (HedgeResult, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book, deal_instrument,
                      dget)
 from .exposure import Exposure
-from .operations import OperationController, SpotSettlement, ClipLifecycle
+from .operations import ClipLifecycle, OperationController, SpotSettlement
+from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator
 from .fees import NATIVE_SOL, native_cash_needed
 from .keys import effective_mode, redact
-from .owner import OwnerCfg, OwnerConfigError, OwnerMissing, OwnerUnsupported, SOL_HL
+from .owner import OwnerCfg, OwnerConfigError, OwnerMissing, OwnerUnsupported, SOL_HL, SOL_PROFILE_VENUES
 from .planner import PlanRefused
-from .runtime import ProfileDown, SolLegs, is_sol_deal, legs_of
+from .runtime import ProfileDown, SolLegs, is_sol_deal, legs_of, profile_of_deal
 from .sol_exec import PresendRefused, SwapOutcome
 from .spot_router import Approval, AssetRef, HedgeContext, PairParams, QuoteRequest, margin_for, reselect_allowed
 from .solana.accounts import ata
@@ -44,7 +45,6 @@ log = logging.getLogger(__name__)
 D = Decimal
 ZERO = D(0)
 BPS = D(10_000)
-LIM = f"limits.{SOL_HL}."
 PREVIEW_COLLECT_S = 10.0      # срок сбора котировок, если collection_deadline_ms не задан (только превью dry: live без
 #                               лимита маршрут не пропустит — limit_missing)
 BOOK_LEVELS = 20
@@ -57,8 +57,8 @@ def _sv():
     return sol_views
 
 
-def _lim(cfg: OwnerCfg, name: str) -> Any:
-    return cfg.get(LIM + name)
+def _lim(cfg: OwnerCfg, name: str, profile: str = SOL_HL) -> Any:
+    return cfg.get(f"limits.{profile}.{name}")
 
 
 def _raw(x: D, dec: int) -> int:
@@ -74,6 +74,49 @@ def _step(perp, symbol) -> D:
     if not isinstance(step, D) or not step.is_finite() or step <= 0:
         raise ValueError("perpetual quantity step is unproven")
     return step
+
+
+def _floor_qty(perp, symbol: str, qty: D) -> D:
+    """Use the native helper when supplied, otherwise the frozen filter step."""
+    native = getattr(perp, "floor_qty", None)
+    if callable(native):
+        out = native(symbol, qty)
+    else:
+        step = _step(perp, symbol)
+        out = (D(qty) / step).to_integral_value(ROUND_FLOOR) * step
+    if not isinstance(out, D) or not out.is_finite() or out < 0:
+        raise ValueError("perpetual quantity rounding is unproven")
+    return out
+
+
+def _cap_px(perp, symbol: str, px: D, side: str) -> D:
+    """Limit-price rounding is a native detail with a safe filter fallback."""
+    native = getattr(perp, "quantize_px", None)
+    if callable(native):
+        out = native(symbol, px, side)
+    else:
+        tick = getattr(perp.filters(symbol), "tick", None)
+        if not isinstance(tick, D) or not tick.is_finite() or tick <= 0:
+            raise ValueError("perpetual price tick is unproven")
+        rounding = ROUND_FLOOR if side == "SELL" else ROUND_CEILING
+        out = (D(px) / tick).to_integral_value(rounding) * tick
+    if not isinstance(out, D) or not out.is_finite() or out <= 0:
+        raise ValueError("perpetual price rounding is unproven")
+    return out
+
+
+def _min_notional(perp, symbol: str) -> D:
+    value = getattr(perp.filters(symbol), "min_notional", None)
+    if not isinstance(value, D) or not value.is_finite() or value < 0:
+        raise ValueError("perpetual minimum notional is unproven")
+    return value
+
+
+def _perp_available(perp) -> D | None:
+    value = perp.available_margin()
+    if value is not None and (not isinstance(value, D) or not value.is_finite() or value < 0):
+        raise ValueError("perpetual available margin is unproven")
+    return value
 
 
 def _tokens_per_step(inst: InstrumentSpec, step: D) -> D:
@@ -97,8 +140,8 @@ def inst_mismatch(deal: Mapping, spec: Mapping, inst: InstrumentSpec) -> str | N
     h = spec.get("inst_hash")
     if not h:
         return "план построен без отпечатка инструмента — пришлите команду заново"
-    if inst.schema < 2 or inst.profile_id != SOL_HL:
-        return f"сделка {did}: спецификация инструмента не связки Solana × Hyperliquid — ничего не отправлено"
+    if inst.schema < 2 or str(inst.chain).lower() not in {"sol", "solana", "solana-mainnet"}:
+        return f"сделка {did}: спецификация инструмента не связки Solana — ничего не отправлено"
     if h != inst.inst_hash():
         return f"инструмент намерения ≠ инструменту сделки {did} — ничего не отправлено"
     have = (str(deal["chain"]), str(deal["token"]), int(deal["token_dec"]), str(deal["perp_venue"]),
@@ -122,7 +165,10 @@ def apply_swap(con, deal_id: str, clip_id: int, op_id: str | None, reserve_raw: 
     from .adapters.outcomes import sol_swap
     from .adapters.contracts import Status
     deal = store.get_deal(con, deal_id)
-    wallet = OwnerCfg.from_frozen(deal['owner_json']).get('wallets.sol_hl.solana_address')
+    inst = deal_instrument(con, deal)
+    cfg = OwnerCfg.from_frozen(deal['owner_json'])
+    wallet = cfg.get('wallets.sol_hl.solana_address') if inst.profile_id == SOL_HL else \
+        cfg.get('wallets.solana.solana_address')
     clip = store.get_clip(con, clip_id)
     intent = store.get_intent(con, clip['intent_id'])
     normalized = sol_swap(out, sol_spec(deal, None, wallet=wallet),
@@ -396,8 +442,9 @@ def check_deal(con, deal: Mapping, legs: SolLegs | None, *, resolve: bool = True
 class SolDesk:
     """Предпроверки и планы связки. Ничего не подписывает и не отправляет."""
 
-    def __init__(self, desk):
+    def __init__(self, desk, profile: str = SOL_HL):
         self.d = desk
+        self.profile = profile
 
     @property
     def con(self):
@@ -406,6 +453,9 @@ class SolDesk:
     def refuse(self, text: str) -> Refused:
         return Refused(_views().refused(text))
 
+    def profile_venue(self) -> str:
+        return SOL_PROFILE_VENUES[self.profile]
+
     def refuse_aborted(self, deal: Mapping) -> None:
         """Сверка только что сняла пустую сделку (recover_deal → _abort_empty): команде по ней делать нечего."""
         if store.get_deal(self.con, deal["id"])["state"] == DealState.ABORTED:
@@ -413,16 +463,16 @@ class SolDesk:
                               "«вход» заново")
 
     def mode(self, cfg: OwnerCfg) -> str:
-        return effective_mode(cfg.profile_mode(SOL_HL), self.d.keys_mode) if self.d.keys_mode else "dry"
+        return effective_mode(cfg.profile_mode(self.profile), self.d.keys_mode) if self.d.keys_mode else "dry"
 
     def legs(self, sim: bool) -> SolLegs:
         fn = getattr(self.d.legs, "for_profile", None)
         if fn is None:
-            raise self.refuse("связка Solana × Hyperliquid не подключена в этом процессе")
+            raise self.refuse(f"связка Solana × {self.profile} не подключена в этом процессе")
         try:
-            lg = fn(SOL_HL, sim)
+            lg = fn(self.profile, sim)
         except ProfileDown as e:
-            raise self.refuse(f"связка Solana × Hyperliquid недоступна: {e.reason}") from None
+            raise self.refuse(f"связка Solana × {self.profile} недоступна: {e.reason}") from None
         if lg is None:
             raise self.refuse("живую сделку в этом режиме не трогаю: ключи связки не загружены (режим в owner.toml и "
                               "перезапуск службы)")
@@ -447,7 +497,7 @@ class SolDesk:
             raise Refused(v.busy(row[0] if row else None))
         if not sim:
             try:
-                cfg.require_profile_live(SOL_HL)
+                cfg.require_profile_live(self.profile)
             except OwnerMissing as e:
                 raise Refused(v.owner_missing(e.keys, action)) from None
             except OwnerUnsupported as e:
@@ -458,15 +508,15 @@ class SolDesk:
         try:
             if fn is not None:
                 return fn(cfg)
-            return I.load_registry(I.registry_path(cfg.get(f"profiles.{SOL_HL}.instrument_registry")))
+            return I.load_registry(I.registry_path(cfg.get(f"profiles.{self.profile}.instrument_registry")))
         except I.RegistryError as e:
             raise self.refuse(f"реестр инструментов: {e}") from None
 
     def resolve(self, cfg: OwnerCfg, text: str, perp_dex: str | None) -> I.InstrumentSpec:
         reg = self.registry(cfg)
-        allowed = tuple(cfg.get(f"profiles.{SOL_HL}.allowed_instruments") or ()) or None
+        allowed = tuple(cfg.get(f"profiles.{self.profile}.allowed_instruments") or ()) or None
         try:
-            return reg.resolve(SOL_HL, text, allowed, perp_dex)
+            return reg.resolve(self.profile, text, allowed, perp_dex)
         except I.RegistryError as e:
             raise self.refuse(str(e)) from None
 
@@ -475,10 +525,10 @@ class SolDesk:
         tok = AssetRef(inst.token, inst.token_program, int(inst.token_dec), str(inst.perp_base_asset or ""))
         q = AssetRef(inst.quote_mint, inst.quote_program, int(inst.quote_dec), "USDC")
         inp, out = (q, tok) if side == "entry" else (tok, q)
-        slip = _lim(cfg, "max_spot_slippage_bps")
+        slip = _lim(cfg, "max_spot_slippage_bps", self.profile)
         if slip is None or D(slip) != D(slip).to_integral_value():
-            raise self.refuse(f"не задан {LIM}max_spot_slippage_bps (целые б.п.) — котировки не запрашиваю")
-        dl = _lim(cfg, "collection_deadline_ms")
+            raise self.refuse(f"не задан limits.{self.profile}.max_spot_slippage_bps (целые б.п.) — котировки не запрашиваю")
+        dl = _lim(cfg, "collection_deadline_ms", self.profile)
         span = float(dl) / 1000 if dl is not None else PREVIEW_COLLECT_S
         rent_out = legs.spot.account_rent(out.mint, out.program, inst.token_extensions if out is tok else ())
         rent_in = legs.spot.account_rent(inp.mint, inp.program, inst.token_extensions if inp is tok else ())
@@ -507,11 +557,11 @@ class SolDesk:
 
         def make() -> HedgeContext:
             step = _step(perp, inst.perp_symbol)
-            lev = cfg.get("perp.hyperliquid.leverage")
+            lev = cfg.get(f"perp.{inst.perp_venue}.leverage")
             params = PairParams(fs=inst.fs, fp=inst.fp, step=step, perp_fee_rate=legs.fee_rate(),
-                                min_notional=R.MIN_NOTIONAL_USD, exit_close_qty=close_qty,
+                                min_notional=_min_notional(perp, inst.perp_symbol), exit_close_qty=close_qty,
                                 leverage=None if lev is None else D(lev),
-                                margin_reserve=_lim(cfg, "min_hl_margin_reserve_usdc"),
+                                margin_reserve=_lim(cfg, "min_hl_margin_reserve_usdc", self.profile),
                                 available_margin=available if side == "entry" else None)
             return HedgeContext(book=perp.book(inst.perp_symbol, BOOK_LEVELS), params=params, now_wall=self.d.clock())
         return make
@@ -585,7 +635,7 @@ class SolDesk:
                     raise self.refuse(f"по {rec.display_symbol} уже есть сделка {d['id']} ({st}) — добор в пилоте "
                                       "выключен")
         for k in ("max_clip_usdc", "max_operation_usdc", "max_total_position_usdc"):
-            v = _lim(cfg, k)
+            v = _lim(cfg, k, self.profile)
             if v is None:
                 notes.append(f"не задан {k}")
             elif usdc > v:
@@ -599,28 +649,23 @@ class SolDesk:
             raise
         except Exception as e:        # noqa
             notes.append(f"mint не прочитан ({type(e).__name__})")
-        perp = legs.perp
+        perp, venue = legs.perp, inst.perp_venue
         try:
-            ref = perp.identity()
+            from .adapters.perp_preflight import inspect, PreflightRequest, PreflightRefused
+            probe = inspect(perp, PreflightRequest(symbol=inst.perp_symbol, quote_currency=inst.quote_asset,
+                            multiplier=inst.m, leverage=cfg.get(f"perp.{venue}.leverage"), capacity=D(1),
+                            fee_rate=legs.fee_rate, reserve=None, expected_position=None, sim=sim),
+                            inst=inst, venue=venue)
+            step, avail = probe.step, probe.margin_available
+        except PreflightRefused as e:
+            raise self.refuse(str(e)) from None
         except Exception as e:        # noqa
-            raise self.refuse(f"мета Hyperliquid не прочитана: {redact(e)}") from None
-        if ref.fullcoin != inst.perp_symbol or ref.dex != inst.perp_dex or ref.is_delisted or (
-                inst.perp_asset_id is not None and ref.asset != inst.perp_asset_id) or (
-                inst.perp_collateral is not None and inst.perp_collateral != f"token:{ref.collateral_token}"):
-            raise self.refuse(f"рынок {inst.perp_symbol} на Hyperliquid не совпадает с реестром (asset {ref.asset}, "
-                              f"delisted {ref.is_delisted}) — нужна новая версия записи")
-        step = R.sz_step(ref.sz_decimals)
-        lev = cfg.get("perp.hyperliquid.leverage")
+            raise self.refuse(f"мета {venue} не прочитана: {redact(e)}") from None
+        lev = cfg.get(f"perp.{venue}.leverage")
         if lev is None:
-            notes.append("не задано плечо perp.hyperliquid.leverage")
-        elif int(lev) > ref.max_leverage:
-            raise self.refuse(f"плечо {lev}x больше допустимого {ref.max_leverage}x на {inst.perp_symbol}")
-        mv = perp.margin()
-        if not mv.trade_supported:    # до свопа, а не после (H03/H09)
-            notes.append(f"режим счёта HL «{mv.mode}» не поддержан первой версией: {mv.reason or ''}".strip())
-        avail = mv.available
+            notes.append(f"не задано плечо perp.{venue}.leverage")
         if avail is None:
-            notes.append(f"маржа HL неизвестна ({mv.source})")
+            notes.append(f"маржа {venue} неизвестна")
         if not sim:
             pos = perp.position(inst.perp_symbol)
             if pos is None:
@@ -628,7 +673,11 @@ class SolDesk:
             if pos != 0:
                 raise self.refuse(f"на счёте HL уже есть позиция {inst.perp_symbol} {pos} (не этой сделки) — вход "
                                   "запрещён")
-            notes += perp.agent_refusals()
+            try:
+                from .adapters.perp_preflight import agent_gate
+                agent_gate(perp, venue=venue, sim=sim, what="вход не начинаю")
+            except PreflightRefused as e:
+                notes.append(str(e))
         amount_raw = _raw(usdc, int(inst.quote_dec))
         req = self.request(legs, inst, "entry", amount_raw, cfg, "entry")
         dec = legs.router.select(req, prices=self.prices(legs), block_height=legs.block_height,
@@ -644,13 +693,13 @@ class SolDesk:
         book = perp.book(inst.perp_symbol, BOOK_LEVELS)
         if not book.bids or not book.asks:
             raise self.refuse(f"стакан {inst.perp_symbol} пуст — объём шорта неизвестен")
-        slip = _lim(cfg, "max_hedge_slippage_bps")
-        cap = perp.quantize_px(inst.perp_symbol, book.bids[0][0] * (1 - D(slip) / BPS), "SELL") if slip is not None \
+        slip = _lim(cfg, "max_hedge_slippage_bps", self.profile)
+        cap = _cap_px(perp, inst.perp_symbol, book.bids[0][0] * (1 - D(slip) / BPS), "SELL") if slip is not None \
             else book.bids[0][0]
         if slip is None:
             notes.append("не задан max_hedge_slippage_bps")
         spot_px = D(amount_raw) / D(winner.expected_out_raw) * D(10) ** (int(inst.token_dec) - int(inst.quote_dec))
-        st_, su_ = _lim(cfg, "max_surplus_tokens"), _lim(cfg, "max_surplus_usdc")
+        st_, su_ = _lim(cfg, "max_surplus_tokens", self.profile), _lim(cfg, "max_surplus_usdc", self.profile)
         surplus = ZERO
         if st_ is None or su_ is None:
             notes.append("не задан предел излишка (max_surplus_tokens / max_surplus_usdc)")
@@ -666,36 +715,37 @@ class SolDesk:
         except PlanRefused as e:
             raise self.refuse(str(e)) from None
         v = _views()
-        mb = _lim(cfg, "min_entry_basis_all_in_bps")
+        mb = _lim(cfg, "min_entry_basis_all_in_bps", self.profile)
         if rc.basis_all_in_bps is None:
             notes.append("курсовой с издержками неизвестен (расход или ставка HL не известны)")
         elif mb is not None and rc.basis_all_in_bps < D(mb):
             notes.append(f"курсовой с издержками {v.pct(rc.basis_all_in_bps / 100, 2, sign=True)} ниже порога "
                          f"{v.pct(D(mb) / 100, 2, sign=True)}")
-        fx = _lim(cfg, "max_external_fees_usdc_per_operation")
+        fx = _lim(cfg, "max_external_fees_usdc_per_operation", self.profile)
         if rc.external is not None and fx is not None and rc.external > D(fx):
             notes.append(f"расходы спота {v.num(rc.external, 4)} USDC больше лимита операции {v.num(fx)}")
-        dt, du = _lim(cfg, "max_delta_tokens"), _lim(cfg, "max_delta_usdc")
+        dt, du = _lim(cfg, "max_delta_tokens", self.profile), _lim(cfg, "max_delta_usdc", self.profile)
         if dt is None or du is None:
             notes.append("не задан предел голой дельты (max_delta_tokens / max_delta_usdc)")
         elif rc.residual_tokens > D(dt) or rc.residual_tokens * spot_px > D(du):
             notes.append(f"остаток без хеджа {v.tok(rc.residual_tokens)} больше предела дельты")
-        if rc.qty_min is not None and rc.qty_min * cap < R.MIN_NOTIONAL_USD:
-            raise self.refuse(f"при минимальном выходе шорт {rc.qty_min} меньше минимального ордера HL "
-                              f"{R.MIN_NOTIONAL_USD} $ — не увеличиваю шорт ради минимума (U17)")
-        reserve = _lim(cfg, "min_hl_margin_reserve_usdc")
+        min_notional = _min_notional(perp, inst.perp_symbol)
+        if rc.qty_min is not None and rc.qty_min * cap < min_notional:
+            raise self.refuse(f"при минимальном выходе шорт {rc.qty_min} меньше минимального ордера {venue} "
+                              f"{min_notional} $ — не увеличиваю шорт ради минимума (U17)")
+        reserve = _lim(cfg, "min_hl_margin_reserve_usdc", self.profile)
         margin_need = None
         if lev is not None and avail is not None and reserve is not None:
             need = margin_for(rc.capacity, book.asks[0][0], D(lev), legs.fee_rate()) + D(reserve)
             margin_need = need
             if need > avail:
-                notes.append(f"маржи HL {v.num(avail)} USDC < нужно {v.num(need)} (шорт с излишком + резерв)")
+                notes.append(f"маржи {venue} {v.num(avail)} USDC < нужно {v.num(need)} (шорт с излишком + резерв)")
         bal = legs.spot.token_balance(inst.quote_mint, inst.quote_program)
         if bal is None:
             notes.append("баланс USDC не прочитан")
         elif bal < amount_raw:
             notes.append(f"USDC в кошельке {v.num(_h(bal, int(inst.quote_dec)))} — меньше {v.num(usdc)}")
-        need_lam = native_cash_needed(winner.fees, legs.wallet, _lim(cfg, "min_sol_reserve_lamports"))
+        need_lam = native_cash_needed(winner.fees, legs.wallet, _lim(cfg, "min_sol_reserve_lamports", self.profile))
         nat = legs.spot.native_balance()
         if need_lam is None:
             notes.append("запас SOL не проверить (резерв владельца или расход сети неизвестны)")
@@ -716,12 +766,12 @@ class SolDesk:
                "decision": dec.status, "n": 1, "clip_usd": usdc, "units_per_contract": inst.m,
                "total_usd": (rc.external or ZERO) + (rc.perp_fee or ZERO), "tokens": rc.tokens}
         plan = Plan(deal_id="", kind="entry", coin=rec.display_symbol, spot="auto·solana",
-                    perp=f"hyperliquid·{inst.perp_dex}", symbol=inst.perp_symbol, leg_usd=usdc,
+                    perp=f"{venue}·{inst.perp_dex or ''}".rstrip("·"), symbol=inst.perp_symbol, leg_usd=usdc,
                     clips=[ClipPlan(seq=1, dex_in_units=amount_raw, children=[list(c) for c in rc.children])], est=est,
                     inputs={"inst_hash": inst.inst_hash(), "filters": {"step": step}, "book_top": {
                         "bid": book.bids[0][0], "ask": book.asks[0][0]}, "fee_taker": legs.fee_rate(),
                         "funding_h": fund},
-                    missing_owner_keys=list(cfg.profile_live_missing(SOL_HL)), expires=now + tconfig.PLAN_TTL_S)
+                    missing_owner_keys=list(cfg.profile_live_missing(self.profile)), expires=now + tconfig.PLAN_TTL_S)
         ctx = dict(sim=sim, cfg=cfg, inst=inst, rec=rec, legs=legs, dec=dec, winner=winner, wr=wr, rc=rc, req=req,
                    notes=notes, funding_h=fund, amount_raw=amount_raw, cap=cap, margin_need=margin_need,
                    margin_avail=avail)
@@ -737,13 +787,15 @@ class SolDesk:
             perp_px=rc.perp_vwap, path=ctx["winner"].path, others=self.others(ctx["dec"], ctx["winner"]),
             basis_bps=rc.basis_all_in_bps, basis_gross_bps=rc.basis_gross_bps, spot_fee_usd=rc.external,
             perp_fee_usd=rc.perp_fee, funding_pct_h=(f * 100) if (f is not None and entry) else None,
-            leverage=ctx["cfg"].get("perp.hyperliquid.leverage") if entry else None,
+            leverage=ctx["cfg"].get(f"perp.{inst.perp_venue}.leverage") if entry else None,
             identity=self.identity_line(inst) if entry else None, notes=tuple(dict.fromkeys(ctx["notes"])),
             missing=tuple(plan.missing_owner_keys) if ctx["sim"] else (), sim=ctx["sim"],
             margin_need=ctx.get("margin_need") if entry else None, margin_avail=ctx.get("margin_avail") if entry else None)
 
     def propose_entry(self, cmd, chat: int | None) -> Proposal:
         """cmd — tg.parse.ProfileEntry (coin, spot_policy, perp_dex, usdc)."""
+        if cmd.profile != self.profile or cmd.perp_venue != self.profile_venue():
+            raise self.refuse("профиль входа не совпадает с замороженной площадкой перпа")
         plan, ctx = self.plan_entry(cmd.coin, cmd.usdc, spot_policy=cmd.spot_policy, perp_dex=cmd.perp_dex)
         con = self.con
         cfg, sim, inst, rec, winner, rc = ctx["cfg"], ctx["sim"], ctx["inst"], ctx["rec"], ctx["winner"], ctx["rc"]
@@ -762,26 +814,26 @@ class SolDesk:
                                 token_dec=int(inst.token_dec), perp_venue=inst.perp_venue, symbol=inst.perp_symbol,
                                 leg_usd=cmd.usdc, owner_json=cfg.frozen_json(), sim=sim, inst=inst, now=self.d.clock())
         plan.deal_id = did
-        fx = _lim(cfg, "max_external_fees_usdc_per_operation")
+        fx = _lim(cfg, "max_external_fees_usdc_per_operation", self.profile)
         # одобренные границы (R13): тот же запрос, политика best, не хуже одобренного минимума и стоимости
         approval = dict(request_hash=ctx["req"].request_hash, side="entry", policy="best", provider_group=winner.group,
                         min_out_raw=int(winner.effective_min_out or 0),
                         max_cost_per_token=str(wr.conservative if (wr and wr.conservative is not None) else
                                                (wr.metric if wr else "")) or None)
-        op_id = store.create_operation(con, deal_id=did, profile_id=SOL_HL, inst_hash=inst.inst_hash(),
+        op_id = store.create_operation(con, deal_id=did, profile_id=self.profile, inst_hash=inst.inst_hash(),
                                        mode="dry" if sim else "live", side="entry", target_kind="stable_raw_budget",
                                        target_asset=inst.quote_mint, target_decimals=int(inst.quote_dec),
                                        target_raw=ctx["amount_raw"],
                                        fee_cap_raw=None if fx is None else _raw(D(fx), int(inst.quote_dec)),
                                        bounds=approval)
         store.append_route_rounds(con, ctx["dec"].records(op_id, 0))
-        spec = {"kind": "entry", "profile": SOL_HL, "coin": rec.display_symbol, "usd": cmd.usdc,
+        spec = {"kind": "entry", "profile": self.profile, "coin": rec.display_symbol, "usd": cmd.usdc,
                 "amount_raw": ctx["amount_raw"], "token": inst.token, "token_dec": int(inst.token_dec),
                 "symbol": inst.perp_symbol, "sim": sim, "owner": cfg.frozen_json(), "funding_h": ctx["funding_h"],
                 "period_h": 1, "instrument": inst.as_dict(), "inst_hash": inst.inst_hash(),
                 "instrument_id": rec.instrument_id, "instrument_version": rec.version, "operation_id": op_id,
                 "approval": approval, "hedge_capacity": rc.capacity, "spot": "auto·solana",
-                "perp": f"hyperliquid·{inst.perp_dex}"}
+                "perp": f"{inst.perp_venue}·{inst.perp_dex}"}
         iid, nonce = store.create_intent(con, deal_id=did, kind="entry", spec=spec, plan=plan, chat=chat)
         store.link_intent(con, op_id, iid)
         store.event(con, "proposed", deal_id=did, intent_id=iid, total_usd=plan.est.get("total_usd"), n=1, sim=sim,
@@ -792,6 +844,8 @@ class SolDesk:
     # --- выход ---
     def plan_exit(self, deal: Mapping, *, cfg: OwnerCfg | None = None, write_checks: bool = True
                   ) -> tuple[Plan, dict]:
+        if profile_of_deal(deal) != self.profile:
+            raise self.refuse(f"сделка {deal['id']} принадлежит другому профилю")
         cfg = cfg or self.d.cfg()
         sim = bool(deal["sim"])
         if write_checks:
@@ -842,10 +896,11 @@ class SolDesk:
             if pos is None:
                 raise self.refuse(f"позиция {inst.perp_symbol} не прочитана — выход не начинаю")
             if pos != -S:             # U18: формула выхода — только к согласованному S
-                raise self.refuse(f"позиция HL {pos} ≠ журнал сделки {-S} — сначала «позиции»")
-            bad = perp.agent_refusals()
-            if bad:                   # продажа спота без откупа шорта оставила бы голый шорт
-                raise self.refuse("; ".join(bad) + " — выход не начинаю")
+                raise self.refuse(f"позиция {inst.perp_venue} {pos} ≠ журнал сделки {-S} — сначала «позиции»")
+            if inst.perp_venue == "hyperliquid":
+                bad = perp.agent_refusals()
+                if bad:               # продажа спота без откупа шорта оставила бы голый шорт
+                    raise self.refuse("; ".join(bad) + " — выход не начинаю")
         units = int(bk.tokens_raw)
         req = self.request(legs, inst, "exit", units, cfg, "exit")
         dec = legs.router.select(req, prices=self.prices(legs), block_height=legs.block_height,
@@ -862,8 +917,8 @@ class SolDesk:
         book = perp.book(inst.perp_symbol, BOOK_LEVELS)
         if not book.asks:
             raise self.refuse(f"аски {inst.perp_symbol} пусты — откуп шорта неизвестен")
-        slip = _lim(cfg, "max_hedge_slippage_bps")
-        cap = perp.quantize_px(inst.perp_symbol, book.asks[0][0] * (1 + D(slip) / BPS), "BUY") if slip is not None \
+        slip = _lim(cfg, "max_hedge_slippage_bps", self.profile)
+        cap = _cap_px(perp, inst.perp_symbol, book.asks[0][0] * (1 + D(slip) / BPS), "BUY") if slip is not None \
             else book.asks[0][0]
         try:
             rc = planner.route_clip(side="exit", amount_in_raw=units, dec_in=dec_t, dec_out=int(inst.quote_dec),
@@ -873,7 +928,7 @@ class SolDesk:
                                     close_qty=S if S > 0 else None)
         except PlanRefused as e:
             raise self.refuse(str(e)) from None
-        fx = _lim(cfg, "max_external_fees_usdc_per_operation")
+        fx = _lim(cfg, "max_external_fees_usdc_per_operation", self.profile)
         if rc.external is not None and fx is not None and rc.external > D(fx):
             notes.append(f"расходы спота {v.num(rc.external, 4)} USDC больше лимита операции {v.num(fx)}")
         if notes and not sim:
@@ -884,12 +939,12 @@ class SolDesk:
                "total_usd": (rc.external or ZERO) + (rc.perp_fee or ZERO), "contracts": S,
                "units_per_contract": inst.m}
         plan = Plan(deal_id=deal["id"], kind="exit", coin=deal["coin"], spot="auto·solana",
-                    perp=f"hyperliquid·{inst.perp_dex}", symbol=inst.perp_symbol, leg_usd=rc.stable,
+                    perp=f"{inst.perp_venue}·{inst.perp_dex or ''}".rstrip("·"), symbol=inst.perp_symbol, leg_usd=rc.stable,
                     clips=[ClipPlan(seq=1, dex_in_units=units, children=[list(c) for c in rc.children])], est=est,
                     inputs={"inst_hash": inst.inst_hash(), "filters": {"step": step}, "book_top": {
                         "bid": book.bids[0][0] if book.bids else None, "ask": book.asks[0][0]},
                         "fee_taker": legs.fee_rate()},
-                    missing_owner_keys=list(cfg.profile_live_missing(SOL_HL)),
+                    missing_owner_keys=list(cfg.profile_live_missing(self.profile)),
                     expires=self.d.clock() + tconfig.PLAN_TTL_S)
         ctx = dict(sim=sim, cfg=cfg, inst=inst, legs=legs, dec=dec, winner=winner, wr=wr, rc=rc, req=req, notes=notes,
                    units=units, book=bk)
@@ -909,7 +964,7 @@ class SolDesk:
                         min_out_raw=int(winner.effective_min_out or 0),
                         min_net_usdc=str(wr.conservative if (wr and wr.conservative is not None) else
                                          (wr.metric if wr else "")) or None)
-        spec = {"kind": "exit", "profile": SOL_HL, "coin": deal["coin"], "usd": None, "units": ctx["units"],
+        spec = {"kind": "exit", "profile": self.profile, "coin": deal["coin"], "usd": None, "units": ctx["units"],
                 "all": True, "perp_only": False, "token": inst.token, "token_dec": int(inst.token_dec),
                 "symbol": inst.perp_symbol,
                 "sim": sim, "owner": cfg.frozen_json(), "period_h": 1, "instrument": inst.as_dict(),
@@ -924,7 +979,7 @@ class SolDesk:
             spec["resume"] = True
         try:
             iid, nonce = propose(con, deal=deal, kind="exit", spec=spec, plan=plan,
-                                 profile_id=SOL_HL, chat=chat, operation_id=operation_id)
+                                 profile_id=self.profile, chat=chat, operation_id=operation_id)
         except store.StoreError as exc:
             raise self.refuse(f"продолжение исходной цели выхода: {exc}") from None
         op_id = store.operation_of_intent(con, iid)["id"]
@@ -971,7 +1026,7 @@ class SolDesk:
             pos = legs.perp.position(inst.perp_symbol)
             if pos is None or pos != -S:
                 raise self.refuse(f"позиция HL {pos} ≠ журнал сделки {-S} — сначала «позиции»")
-        spec = {"kind": "rehedge", "profile": SOL_HL, "coin": deal["coin"], "token": inst.token,
+        spec = {"kind": "rehedge", "profile": self.profile, "coin": deal["coin"], "token": inst.token,
                 "token_dec": int(deal["token_dec"]), "symbol": inst.perp_symbol, "sim": sim, "owner": cfg.frozen_json(),
                 "instrument": inst.as_dict(), "inst_hash": inst.inst_hash(), "side": side, "qty": qty}
         px = None
@@ -982,7 +1037,7 @@ class SolDesk:
         plan = Plan(deal_id=deal["id"], kind="rehedge", coin=deal["coin"], spot="auto·solana",
                     perp=f"hyperliquid·{inst.perp_dex}", symbol=inst.perp_symbol,
                     leg_usd=(abs(d) * px * inst.fs / inst.fp) if px else ZERO, clips=[], est={"delta": d},
-                    inputs={"inst_hash": inst.inst_hash()}, missing_owner_keys=list(cfg.profile_live_missing(SOL_HL)),
+                    inputs={"inst_hash": inst.inst_hash()}, missing_owner_keys=list(cfg.profile_live_missing(self.profile)),
                     expires=self.d.clock() + tconfig.PLAN_TTL_S)
         iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="rehedge", spec=spec, plan=plan, chat=chat)
         superseded = store.supersede_intents(con, deal["id"], keep=iid)
@@ -1068,7 +1123,10 @@ class SolEngine:
 
     def __init__(self, engine):
         self.e = engine
-        self.desk = SolDesk(engine.desk)
+        self._desks: dict[str, SolDesk] = {}
+
+    def desk_for(self, run: SolRun) -> SolDesk:
+        return self._desks.setdefault(run.inst.profile_id, SolDesk(self.e.desk, run.inst.profile_id))
 
     @property
     def con(self):
@@ -1129,6 +1187,7 @@ class SolEngine:
     # --- ворота ---
     def guard(self, run: SolRun, *, entry: bool = False) -> None:
         con = self.con
+        profile = run.inst.profile_id
         if store.is_paused(con) or self.e.pause_evt.is_set():
             raise Pause("stop", "стоп владельца: новое не начинаю")
         if self.e.drain_evt.is_set():
@@ -1140,16 +1199,16 @@ class SolEngine:
         except OwnerConfigError as e:
             raise Pause("owner", f"owner.toml не прочитан: {e}") from None
         if not run.legs.sim:
-            m = effective_mode(cfg.profile_mode(SOL_HL), self.e.keys_mode or "dry")
+            m = effective_mode(cfg.profile_mode(profile), self.e.keys_mode or "dry")
             if m != "live":
                 raise Pause("mode", f"режим {m}: отправки запрещены")
             try:
-                cfg.require_profile_live(SOL_HL)
+                cfg.require_profile_live(profile)
             except (OwnerMissing, OwnerUnsupported) as e:
                 raise Pause("owner_missing", str(e)) from None
         if entry:
             try:
-                rec = self.desk.registry(cfg).get(run.inst.instrument_id, run.inst.instrument_version)
+                rec = self.desk_for(run).registry(cfg).get(run.inst.instrument_id, run.inst.instrument_version)
                 hard = [b for b in I.entry_blockers(rec, now=self.e.clock())
                         if b.startswith(("identity", "единицы", "spot: расширения"))]
             except (Refused, I.RegistryError) as e:
@@ -1158,7 +1217,7 @@ class SolEngine:
                 raise Pause("identity", "; ".join(hard) + " — вход не начинаю")
             usd = dget(run.deal["leg_usd"])
             for k in ("max_clip_usdc", "max_operation_usdc", "max_total_position_usdc"):
-                v = cfg.get(LIM + k)
+                v = _lim(cfg, k, profile)
                 if v is not None and usd is not None and usd > v:
                     raise Pause("limit", f"сумма {usd} USDC больше нового лимита {k} = {v}")
             f0 = dget(run.spec.get("funding_h"))
@@ -1187,20 +1246,24 @@ class SolEngine:
 
     @staticmethod
     def _agent_gate(run: SolRun, what: str) -> None:
-        from .adapters.hl_preflight import agent_gate, PreflightRefused
+        from .adapters.perp_preflight import agent_gate, PreflightRefused
         try:
-            agent_gate(run.legs.perp, sim=run.legs.sim, what=what)
+            agent_gate(run.legs.perp, venue=run.deal["perp_venue"], sim=run.legs.sim, what=what)
         except PreflightRefused as e:
             raise Pause(e.code, str(e)) from None
 
-    def _hl_preflight(self, run: SolRun) -> None:
-        from .adapters.hl_preflight import entry, PreflightRefused
+    def _perp_preflight(self, run: SolRun) -> None:
+        """Use the neutral boundary; HL retains its existing exact validator."""
+        from .adapters.perp_preflight import entry, PreflightRefused, PreflightRequest
         try:
-            entry(run.legs.perp, run.inst, sim=run.legs.sim,
-                  leverage=run.cfg.get("perp.hyperliquid.leverage"),
-                  capacity=D(str(run.spec.get("hedge_capacity") or 0)), fee_rate=run.legs.fee_rate,
-                  reserve=_lim(run.cfg, "min_hl_margin_reserve_usdc"),
-                  expected_short=deal_book(self.con, run.did).short, book_levels=BOOK_LEVELS)
+            venue = run.deal["perp_venue"]
+            entry(run.legs.perp, PreflightRequest(
+                symbol=run.symbol, quote_currency=run.inst.quote_asset, multiplier=run.inst.m,
+                leverage=run.cfg.get(f"perp.{venue}.leverage"),
+                capacity=D(str(run.spec.get("hedge_capacity") or 0)), fee_rate=run.legs.fee_rate,
+                reserve=_lim(run.cfg, "min_hl_margin_reserve_usdc", run.inst.profile_id),
+                expected_position=None if deal_book(self.con, run.did).short is None else -deal_book(self.con, run.did).short,
+                sim=run.legs.sim, book_levels=BOOK_LEVELS), inst=run.inst, venue=venue)
         except PreflightRefused as e:
             raise Pause(e.code, str(e)) from None
 
@@ -1208,24 +1271,25 @@ class SolEngine:
         """Свежий сбор у кнопки (§5.1 п.7): тот же запрос и политика best; победитель — в одобренных границах (R13)."""
         con, legs, cfg, inst = self.con, run.legs, run.cfg, run.inst
         side = run.kind
-        req = self.desk.request(legs, inst, side, amount_raw, cfg, side)
+        desk = self.desk_for(run)
+        req = desk.request(legs, inst, side, amount_raw, cfg, side)
         bk = deal_book(con, run.did)
         avail = None
         if side == "entry":
             try:
-                avail = legs.perp.margin().available
+                avail = legs.perp.available_margin()
             except Exception:         # noqa
                 avail = None
-        dec = legs.router.select(req, prices=self.desk.prices(legs), block_height=legs.block_height,
-                                 hedge=self.desk.hedge_fn(legs, inst, cfg, side, available=avail,
+        dec = legs.router.select(req, prices=desk.prices(legs), block_height=legs.block_height,
+                                 hedge=desk.hedge_fn(legs, inst, cfg, side, available=avail,
                                                           close_qty=bk.short if side == "exit" else None),
-                                 inflight_unknown=self.desk.inflight(con, legs))
+                                 inflight_unknown=desk.inflight(con, legs))
         if run.op_id:
             try:
                 store.append_route_rounds(con, dec.records(run.op_id, 1))
             except store.StoreError as e:
                 log.warning("route_candidates %s: %s", run.op_id, e)
-        w, _wr = self.desk.pick(dec, legs.sim)
+        w, _wr = desk.pick(dec, legs.sim)
         if w is None:
             raise Pause("route", f"нет проверенного маршрута ({'; '.join(dec.reasons) or '—'}) — ничего не отправлено")
         if dec.winner is None:
@@ -1248,7 +1312,7 @@ class SolEngine:
         con, legs, w = self.con, run.legs, dec.winner
         amount = int(w.amount_in_raw)
         if not legs.sim:              # S20: запас SOL после всех обязательных расходов — до свопа
-            need = native_cash_needed(w.fees, legs.wallet, _lim(run.cfg, "min_sol_reserve_lamports"))
+            need = native_cash_needed(w.fees, legs.wallet, _lim(run.cfg, "min_sol_reserve_lamports", run.inst.profile_id))
             have = legs.spot.native_balance()
             if need is None or have is None or have < need:
                 raise Pause("native", f"SOL {have if have is not None else 'не прочитан'} лампортов — меньше расходов "
@@ -1269,11 +1333,14 @@ class SolEngine:
 
         try:
             from .adapters.spot_execution import submit_sol
-            context = self.e._compose_context(run, clip_id, account=legs.account_id,
-                authorize=lambda *_: self._agent_gate(run, "hedge"))
+            # A native adapter may explicitly decline the optional paired
+            # binding; its durable individual bindings still use the same
+            # frozen clip and OperationController lifecycle.
+            context = None if getattr(legs.perp, "compose_with_spot", True) is False else self.e._compose_context(
+                run, clip_id, account=legs.account_id, authorize=lambda *_: self._agent_gate(run, "hedge"))
             out = submit_sol(con, deal=run.deal, clip_id=clip_id, native=legs.spot, router=legs.router,
                              decision=dec, request=req, logical=logical, metadata=meta,
-                             min_validity_heights=_lim(run.cfg, "min_blockhash_validity_heights"), apply=apply,
+                             min_validity_heights=_lim(run.cfg, "min_blockhash_validity_heights", run.inst.profile_id), apply=apply,
                              authorize=lambda leg, action: self.guard(run, entry=run.kind == "entry"),
                              clock=self.e.clock, block_height=legs.block_height, compose_context=context,
                              registry=getattr(self.e.legs, 'adapters', None))
@@ -1301,19 +1368,26 @@ class SolEngine:
             store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
         raise Pause("dex_unknown", f"исход свопа неизвестен: {out.reason} — новых отправок нет")
 
+    def _perp_hedge(self, run: SolRun, clip_id: int, side: str, qty: D, reduce_only: bool) -> HedgeResult:
+        # Compatibility hook for interrupted legacy tests/recovery.  The
+        # implementation below is venue-neutral despite its historic name.
+        return self._hl_hedge(run, clip_id, side, qty, reduce_only)
+
     def _hl_hedge(self, run: SolRun, clip_id: int, side: str, qty: D, reduce_only: bool) -> HedgeResult:
-        """Хедж дочерними IOC по ФАКТУ спота (hedge=True: ставится и на паузе). Кэп — от лучшей цены первой книги с
-        допуском владельца, следующие дочерние не хуже него; округление цены — правилом HL в сторону допуска.
+        """Hedge through the frozen perpetual adapter after the proven spot result.
+
+        Price/quantity precision and minimum notional come from the adapter's
+        filters (or its stricter native helpers), never from the SOL profile.
         Недобор — только разница по новой книге; UNKNOWN — settle_unknown по сохранённому cloid, повтор — только
         после доказанного «не выставлена». Попытки и срок — лимиты владельца."""
         con, perp, cfg, v = self.con, run.legs.perp, run.cfg, _views()
         store.set_clip_state(con, clip_id, ClipState.PERP_SENT)
-        slip = _lim(cfg, "max_hedge_slippage_bps")
+        slip = _lim(cfg, "max_hedge_slippage_bps", run.inst.profile_id)
         if slip is None and not run.legs.sim:
             return HedgeResult(ZERO, ZERO, "deficit", "не задан max_hedge_slippage_bps")
-        tries = _lim(cfg, "max_hedge_attempts")
+        tries = _lim(cfg, "max_hedge_attempts", run.inst.profile_id)
         tries = int(tries) if tries is not None else PERP_ATTEMPTS_MAX
-        ddl = _lim(cfg, "hedge_deadline_ms")
+        ddl = _lim(cfg, "hedge_deadline_ms", run.inst.profile_id)
         end = self.e.clock() + float(ddl) / 1000 if ddl is not None else None
         short0 = deal_book(con, run.did).short or ZERO
         remaining, filled, quote = qty, ZERO, ZERO
@@ -1335,16 +1409,20 @@ class SolEngine:
             best = lv[0][0]
             raw_cap = best * (1 - D(slip) / BPS) if (side == "SELL" and slip is not None) else \
                 best * (1 + D(slip) / BPS) if slip is not None else best
-            cap = perp.quantize_px(run.symbol, raw_cap, side)
+            try:
+                cap = _cap_px(perp, run.symbol, raw_cap, side)
+                q = _floor_qty(perp, run.symbol, remaining)
+                min_notional = _min_notional(perp, run.symbol)
+            except Exception as e:    # no safe rounding means no order
+                return HedgeResult(filled, quote, "deficit", f"правила {perp.venue} не прочитаны: {redact(e)}")
             if cap0 is None:
                 cap0 = cap
             cap = max(cap, cap0) if side == "SELL" else min(cap, cap0)
-            q = perp.floor_qty(run.symbol, remaining)
             if q <= 0:
                 break
-            if not reduce_only and q * cap < R.MIN_NOTIONAL_USD:
-                return HedgeResult(filled, quote, "deficit", f"остаток {v.tok(q)} меньше минимального ордера HL "
-                                                             f"{R.MIN_NOTIONAL_USD} $ — шорт ради минимума не "
+            if not reduce_only and q * cap < min_notional:
+                return HedgeResult(filled, quote, "deficit", f"остаток {v.tok(q)} меньше минимального ордера {perp.venue} "
+                                                             f"{min_notional} $ — шорт ради минимума не "
                                                              "увеличиваю")
             child += 1
             cid = store.client_order_id(run.did, run.letter, clip_id, child, 1)
@@ -1391,7 +1469,7 @@ class SolEngine:
                 kind = getattr(fill, "err_kind", None) or "other"
                 from .adapters.outcomes import rejection
                 st = "reduce_only_reject" if rejection(fill) == "reduce_only" else "deficit"
-                return HedgeResult(filled, quote, st, f"Hyperliquid: {kind} {getattr(fill, 'err_text', '') or ''}"
+                return HedgeResult(filled, quote, st, f"{perp.venue}: {kind} {getattr(fill, 'err_text', '') or ''}"
                                    .strip())
             if remaining > 0:
                 self.e.sleep(float(planner.TAU_P_S))
@@ -1440,7 +1518,7 @@ class SolEngine:
         con = self.con
         self.guard(run, entry=True)
         self._deal_to(run, DealState.ENTERING)
-        self._hl_preflight(run)
+        self._perp_preflight(run)
         amount = int(run.spec["amount_raw"])
         self._run_spot_clips(run, amount, self._entry_hedge)
 
@@ -1484,7 +1562,7 @@ class SolEngine:
         need = decision.quantity
         if need > 0:
             self._progress(run, "hedge", tokens=_h(run.swap.out_raw, run.dec), qty=need)
-            self._after_hedge(run, clip_id, self._hl_hedge(run, clip_id, "SELL", need, False))
+            self._after_hedge(run, clip_id, self._perp_hedge(run, clip_id, "SELL", need, False))
         else:
             store.set_clip_state(con, clip_id, ClipState.BALANCED, perp_qty=ZERO, perp_quote=ZERO)
         if decision.surplus:          # G09: получено больше одобренной ёмкости — продажа излишка в пилоте выключена
@@ -1522,7 +1600,7 @@ class SolEngine:
         if buy > 0:
             self._progress(run, "hedge", tokens=_h(run.swap.in_raw, run.dec), qty=buy)
         if buy > 0:                   # только на S − target по факту списания (возврат роутера — остаток захеджирован)
-            self._after_hedge(run, clip_id, self._hl_hedge(run, clip_id, "BUY", buy, True))
+            self._after_hedge(run, clip_id, self._perp_hedge(run, clip_id, "BUY", buy, True))
         elif decision.deficit:        # U08: недохедж не лечится отрицательным BUY или неявным SELL
             store.set_clip_state(con, clip_id, ClipState.HEDGE_DEFICIT, perp_qty=ZERO, perp_quote=ZERO)
             raise Pause("hedge_deficit", f"после продажи шорт {bk.short} меньше нужного {target} — заявку не шлю")
@@ -1555,11 +1633,18 @@ class SolEngine:
             if pos is None or pos != -bk.short:
                 raise Pause("position_mismatch", f"позиция HL {pos} ≠ журнал сделки {-bk.short}")
         qty = min(qty, D(str(run.spec["qty"])))
-        clip_id = store.create_clip(con, run.iid, 1, 0)
-        hr = self._hl_hedge(run, clip_id, side, qty, side == "BUY")
-        self._after_hedge(run, clip_id, hr)
-        self._invariant(run)
-        self._settle_fix(run, qty=hr.filled, usd=hr.quote, side=side)
+        result: dict[str, HedgeResult] = {}
+        def submit(clip_id, action):
+            hr = self._perp_hedge(run, clip_id, action.side, action.quantity, action.reduce_only)
+            result['value'] = hr
+            return hr
+        def finish(action):
+            hr = result['value']
+            self._settle_fix(run, qty=hr.filled, usd=hr.quote, side=action.side)
+        LifecycleCoordinator(con).run_hedge(HedgeProgram(
+            intent_id=run.iid, prepare=lambda: HedgeAction(side, qty, side == "BUY"), submit=submit,
+            apply=lambda clip_id, action, hr: self._after_hedge(run, clip_id, hr),
+            verify=lambda: self._invariant(run), finish=finish))
 
     def _settle_fix(self, run: SolRun, *, qty: D | None = None, usd: D | None = None, side: str | None = None,
                     noop: str | None = None) -> None:
@@ -1612,7 +1697,7 @@ class SolEngine:
         elif S == 0:                  # остаток меньше шага перпа: закрыть — только в обеих границах пыли владельца
             px = (D(run.swap.out_raw) / D(10) ** int(run.inst.quote_dec)) / (D(run.swap.in_raw) / D(10) ** run.dec) \
                 if (run.swap and run.swap.in_raw) else None
-            mt, mu = _lim(cfg, "max_dust_tokens"), _lim(cfg, "max_dust_usdc")
+            mt, mu = _lim(cfg, "max_dust_tokens", run.inst.profile_id), _lim(cfg, "max_dust_usdc", run.inst.profile_id)
             dust = px is not None and mt is not None and mu is not None and T <= D(mt) and T * px <= D(mu)
             new, op_state = (DealState.CLOSED, OpState.CLOSED) if dust else (DealState.OPEN, OpState.PARTIAL)
         else:                         # роутер вернул часть: остаток сделки захеджирован, сделка открыта
@@ -1630,7 +1715,7 @@ class SolEngine:
         warn = []
         if run.t_swap is not None:
             naked_ms = int((self.e.clock() - run.t_swap) * 1000)
-            lim = _lim(cfg, "max_unhedged_ms")
+            lim = _lim(cfg, "max_unhedged_ms", run.inst.profile_id)
             store.event(con, "unhedged", deal_id=run.did, intent_id=run.iid, ms=naked_ms, limit_ms=lim)
             if lim is not None and naked_ms > int(lim):
                 warn.append(f"нога была без хеджа {_views().dur(naked_ms / 1000)} — дольше лимита "

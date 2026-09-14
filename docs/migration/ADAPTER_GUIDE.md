@@ -1,8 +1,9 @@
-# Подключение торговой ноги (M3, контракт v1)
+# Подключение торговой ноги (M4, LegSpec v1 / Result v2)
 
-M3 предоставляет адаптерный слой. Подключение OperationController к нему и связывание попыток с общим Ledger — M4.
-Production startup уже использует общий assembly/CredentialProvider; исторические engine/SolEngine пока ведут
-старые операции. Новая пара в реестре не означает разрешение live: нужны профиль/лимиты, проверенный instrument,
+Общий план записывается в существующие intents/operations, исполняется очередью Engine через
+GenericOperationCoordinator и AdapterRegistry. Terminal Result атомарно записывает факты количества и денежных
+потоков в exec_events. Generic reader floor — 5, отчёт generic позиций — DTO 4; legacy формат сохранён.
+Миграционная приёмка всего пакета ещё не завершена. Новая пара в реестре не означает разрешение live: нужны профиль/лимиты, проверенный instrument,
 полномочия каждой ноги, журнал и авторизация операции. Реальные новые биржи этим этапом не подключаются.
 
 ## Файлы
@@ -59,6 +60,40 @@ Operation/Action ownership. До этого общие submit-методы не 
 Приватные unsigned кандидаты Solana хранятся только до expiry; после рестарта нужен новый план, не повтор подписи.
 
 ## Результат подключения на фейках
+
+Исполнимые примеры пяти типов:
+
+| Тип | Адаптер | Общая проверка |
+| --- | --- | --- |
+| CEX spot | `examples/cex_spot.py` | вход/выход без wallet, gas, chain/token |
+| CEX futures | `examples/cex_futures.py` | long/short, reduce-only, multiplier |
+| EVM DEX spot | `examples/evm_spot.py` | raw token/cash identity; независимая вторая нога |
+| Solana DEX spot | `examples/solana_spot.py` | регистр mint/network; независимая вторая нога |
+| DEX futures | `examples/dex_futures.py` | perp/perp, отдельные валюты/фандинг |
+
+`tests/common_adapter_fixtures.py` импортирует именно эти файлы. Транспорт подставной; production
+NativeAdapter, registry/context, EventAttemptJournal, OperationController, очередь Engine и read-model
+остаются настоящими. Транспорт создаёт внешний receipt, но не записывает позицию бота.
+`tests/test_generic_adapter_matrix.py` проверяет подключения, повтор команды, восстановление после ACK loss,
+вход/выход, base fee и кабинет; `test_generic_leg_cash.py` — валютные потоки и фандинг.
+
+Для каждого примера diff подключения состоит из собственного файла адаптера и его регистрации через
+`register(registry, key)`, LegSpec/config и теста. Пять регистраций не меняют координатор/учёт/UI.
+Это доказательство архитектурного контракта с fake transport, а не сертификация реального API новой биржи.
+
+Для native контекста передать журнал `EventAttemptJournal(con, deal_id=..., intent_id=...,
+operation_id=..., leg_id=...)` либо согласованный bridge существующего native journal. Не создавать
+второй источник подписи. NativeAdapter.claim разрешён ровно один раз; после dispatch crash — resolve.
+Engine получает `generic_context_factory(con, intent, deal, frozen_spec)` и registry; без них generic
+намерение отклоняется до отправки. Фабрика передаёт каждой ноге только её scoped Bindings.
+
+План хранит обе LegSpec, bounds, ведущую ногу и fingerprint. Выход проверяет количество, принадлежащее
+сделке, по фактам всех её операций. Размер хеджа рассчитывается после доказанного результата с учётом
+комиссии в base. max_unhedged_exposure — временный предел, а не разрешение объявить голую ногу балансом.
+Perp notional не является cash debit. Возвратный rent отделён от комиссий; валюты не складываются без FX.
+Неполная комиссия/отсутствующая оценка PnL остаются неизвестными.
+
+Прежние M3 проверки контракта ниже сохраняются как дополнительный уровень, не заменяют сквозную матрицу.
 
 В test_five_new_adapters_only_registration_changes добавлены пять классов через register() и LegSpec:
 CEX spot, CEX perpetual, DEX EVM spot, DEX Solana spot, DEX perpetual. Проверяются spot/perp и perp/perp,

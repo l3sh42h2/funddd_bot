@@ -440,6 +440,9 @@ class Bot:
         now = self.clock()
         _iid, busy_deal = self._running(con)
         kw = {} if profile is None else {"profile": profile}      # «позиции sol» — сделки одной связки
+        if getattr(getattr(self, 'engine', None), 'generic_context_factory', None) is not None:
+            kw.update(generic_context_factory=self.engine.generic_context_factory,
+                      generic_registry=self.engine.generic_registry or getattr(self.legs, 'adapters', None))
         rows, matched, mism = reconcile.positions(con, self.legs, now=now, busy_deal=busy_deal,
                                                   resolve=not self.engine.busy(), **kw)
         items = [PositionView(**r) for r in rows]
@@ -554,7 +557,11 @@ class Bot:
         now = self.clock()
         backfilled = backfill_instruments(con, now=now)
         prepare_active_accounts(con, self.legs)
-        rep = reconcile.startup(con, self.legs, now=now)
+        generic = {}
+        if getattr(getattr(self, 'engine', None), 'generic_context_factory', None) is not None:
+            generic = dict(generic_context_factory=self.engine.generic_context_factory,
+                           generic_registry=self.engine.generic_registry or getattr(self.legs, 'adapters', None))
+        rep = reconcile.startup(con, self.legs, now=now, **generic)
         rep.inst_backfill[:0] = backfilled
         for iid in rep.expired:
             self._close_plan(iid, "expired")

@@ -217,7 +217,8 @@ def prepare_active_accounts(con, legs_fn):
     failures, candidates, active_evm = [], [], False
     snapshot = store.active_deals(con)
     for deal in snapshot:
-        if deal['sim'] or is_sol_deal(deal):
+        from ..generic_recovery import is_generic
+        if deal['sim'] or is_sol_deal(deal) or is_generic(deal):
             continue
         active_evm = True
         try:

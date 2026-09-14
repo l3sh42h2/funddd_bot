@@ -16,6 +16,7 @@ from typing import Any
 from .. import config
 from . import store, tconfig
 from .store import ClipState, IntentStatus, OpState
+from .operation_plan import OperationPlan
 
 _RESUMABLE = frozenset({OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK})
 _PROVEN_SPOT = frozenset({ClipState.DEX_OK, ClipState.PERP_SENT, ClipState.BALANCED, ClipState.HEDGE_DEFICIT})
@@ -102,6 +103,162 @@ def _target(deal: Mapping, kind: str, spec: Mapping, plan: Any) -> tuple[str, st
     return "stable_raw_budget", asset, int(decimals), raw
 
 
+_GENERIC_MARKER = "generic_operation_v1"
+_GENERIC_READER = 5
+
+
+def _generic_plan(value: Any) -> OperationPlan:
+    """Parse the exact frozen generic plan; accepting loose dicts loses its fingerprint."""
+    if isinstance(value, OperationPlan):
+        return value
+    if not isinstance(value, str):
+        raise store.StoreError("generic operation plan must be canonical JSON")
+    try:
+        return OperationPlan.from_json(value)
+    except (TypeError, ValueError) as exc:
+        raise store.StoreError(f"generic operation plan is invalid: {exc}") from None
+
+
+def _generic_target(plan: OperationPlan) -> tuple[str, int, int]:
+    """Return a neutral root identity and exact raw quantity for the leading leg.
+
+    This is intentionally not an asset/token mapping.  The operation reserve is
+    only a durable admission budget; ledger quantities still come from Results.
+    """
+    leg = next(item for item in plan.legs if item.leg_id == plan.leading_leg_id)
+    bound = plan.bounds[leg.leg_id]
+    exponent = min(bound.max_qty.as_tuple().exponent, leg.step.as_tuple().exponent)
+    decimals = max(0, -exponent)
+    raw_decimal = bound.max_qty * (10 ** decimals)
+    if raw_decimal != raw_decimal.to_integral_value():
+        raise store.StoreError("generic leading quantity is not exactly representable")
+    raw = int(raw_decimal)
+    if raw <= 0:
+        raise store.StoreError("generic leading quantity must be positive")
+    return f"leg:{leg.leg_id}", decimals, raw
+
+
+def _generic_identity(plan: OperationPlan) -> str:
+    """Root identity is immutable leg identity, never a requote/TTL/bound hash."""
+    payload = {leg.leg_id: leg.fingerprint for leg in plan.legs}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _generic_scope(value: Any) -> tuple | None:
+    if not isinstance(value, Mapping):
+        return None
+    keys = ("venue", "network", "account", "subaccount", "instrument")
+    if any(key not in value for key in keys):
+        return None
+    scope = tuple(value[key] for key in keys)
+    return scope if all(item is None or isinstance(item, str) for item in scope) else None
+
+
+def _assert_generic_scopes_available(con, deal_id: str, plan: OperationPlan) -> None:
+    """The legacy NULL indexes cannot protect two independent generic scopes."""
+    wanted = {tuple(leg.scope) for leg in plan.legs}
+    for other in store.active_deals(con):
+        if other["id"] == deal_id:
+            continue
+        try:
+            frozen = json.loads(other.get("inst_json") or "{}")
+        except (TypeError, ValueError):
+            frozen = {}
+        if frozen.get("generic_position_v1") is True:
+            scopes = {_generic_scope(item) for item in frozen.get("legs", ())}
+            if wanted & {scope for scope in scopes if scope is not None}:
+                raise store.StoreError("generic leg scope is already owned by an active deal")
+        # Legacy rows have only one persisted perp scope.  Refuse only when it
+        # is an exact complete scope, never by a guessed account or chain.
+        legacy_scope = frozen.get("perp_scope")
+        if isinstance(legacy_scope, (list, tuple)) and tuple(legacy_scope) in wanted:
+            raise store.StoreError("generic leg scope conflicts with active legacy deal")
+
+
+def generic_propose(con, *, deal: Mapping, plan: OperationPlan, profile_id: str,
+                    chat: int | None, operation_id: str | None = None) -> tuple[str, str]:
+    """Persist a generic two-leg proposal using the existing root/intents tables.
+
+    The floor is raised in the same transaction *before* writing a plan older
+    readers cannot interpret.  The plan fingerprint includes both LegSpecs and
+    both LegBounds and is duplicated in immutable proposal bounds for approval.
+    """
+    if not isinstance(plan, OperationPlan):
+        raise TypeError("plan must be OperationPlan")
+    if not deal.get("sim"):
+        raise store.StoreError("generic live execution is not enabled by this coordinator")
+    op_id = operation_id or plan.operation_id
+    if op_id != plan.operation_id:
+        raise store.StoreError("generic operation id differs from frozen plan")
+    asset, decimals, target = _generic_target(plan)
+    approval = {"generic_plan_fingerprint": plan.fingerprint,
+                "authorization": plan.to_dict()["authorization"]}
+    spec = {"inst_hash": "generic:" + _generic_identity(plan), "approval": approval,
+            "operation_id": op_id, _GENERIC_MARKER: True,
+            "plan_fingerprint": plan.fingerprint, "target_raw": str(target),
+            "leading_leg_id": plan.leading_leg_id}
+    with store.tx(con):
+        store.require_reader(con, _GENERIC_READER)
+        _assert_generic_scopes_available(con, deal["id"], plan)
+        existing = store.get_operation(con, op_id)
+        if existing is None:
+            created = store.create_operation(
+                con, deal_id=deal["id"], profile_id=profile_id, inst_hash=spec["inst_hash"],
+                mode="dry" if deal.get("sim") else "live", side=plan.kind,
+                target_kind="generic_leading_quantity", target_asset=asset,
+                target_decimals=decimals, target_raw=target, bounds=approval, op_id=op_id,
+            )
+            if created != op_id:
+                raise store.StoreError("generic operation id was not preserved")
+        else:
+            expected = (deal["id"], profile_id, spec["inst_hash"], plan.kind,
+                        "generic_leading_quantity", asset, decimals)
+            actual = (existing["deal_id"], existing["profile_id"], existing["inst_hash"], existing["side"],
+                      existing["target_kind"], existing["target_asset"], int(existing["target_decimals"]))
+            if actual != expected or existing["state"] not in _RESUMABLE or existing["reserved_raw"] != "0":
+                raise store.StoreError(f"operation {op_id} cannot accept a generic continuation")
+            if target != store.operation_remaining(existing):
+                raise store.StoreError(f"operation {op_id}: generic plan target differs from remaining budget")
+        iid, nonce = store.create_intent(con, deal_id=deal["id"], kind=plan.kind, spec=spec,
+                                         plan=plan.to_json(), chat=chat)
+        store.link_intent(con, op_id, iid)
+    return iid, nonce
+
+
+def _approve_generic(con, intent: Mapping, op: Mapping, spec: Mapping) -> str:
+    plan = _generic_plan(intent["plan_json"])
+    if plan.kind != intent["kind"] or plan.operation_id != op["id"]:
+        raise store.StoreError("generic plan does not match linked operation")
+    if spec.get("plan_fingerprint") != plan.fingerprint or spec.get("inst_hash") != "generic:" + _generic_identity(plan):
+        raise store.StoreError("generic plan fingerprint differs from frozen proposal")
+    approval = spec.get("approval")
+    if not isinstance(approval, dict) or approval.get("generic_plan_fingerprint") != plan.fingerprint:
+        raise store.StoreError("generic approval is not bound to both legs")
+    asset, decimals, target = _generic_target(plan)
+    if (op["target_kind"], op["target_asset"], int(op["target_decimals"])) != (
+            "generic_leading_quantity", asset, decimals):
+        raise store.StoreError("generic operation target identity differs from plan")
+    if target != store.operation_remaining(op):
+        raise store.StoreError("generic approved target differs from remaining budget")
+    if op["state"] == OpState.PROPOSED:
+        if op["bounds_hash"] != store._json_hash(approval):
+            raise store.StoreError("generic proposed bounds do not match intent")
+        older = store.active_operation(con, op["deal_id"])
+        if older is not None and older["id"] != op["id"]:
+            if older["state"] not in _RESUMABLE or older["reserved_raw"] != "0":
+                raise store.StoreError(f"operation {older['id']}: unresolved active root blocks approval")
+            store.set_operation_state(con, older["id"], OpState.ABANDONED,
+                                      expect=older["state"], reason=f"superseded by approved {op['id']}")
+        store.set_operation_state(con, op["id"], OpState.APPROVED, expect=OpState.PROPOSED)
+    elif op["state"] in _RESUMABLE:
+        if op["reserved_raw"] != "0":
+            raise store.StoreError(f"operation {op['id']}: unresolved reserve blocks approval")
+        store.set_operation_state(con, op["id"], OpState.APPROVED, expect=op["state"], bounds=approval)
+    elif op["state"] != OpState.APPROVED:
+        raise store.StoreError(f"operation {op['id']} in {op['state']} cannot be approved")
+    return op["id"]
+
+
 def _spec(intent: Mapping) -> dict:
     return _dict(intent.get("spec_json"), f"intent {intent.get('id')} spec")
 
@@ -179,6 +336,8 @@ def approve_linked(con, intent: Mapping) -> str | None:
         op, spec = _linked(con, intent)
         if op is None:
             return None
+        if spec.get(_GENERIC_MARKER) is True:
+            return _approve_generic(con, intent, op, spec)
         from .adapters.obligations import require_resolved
         require_resolved(con, store.get_deal(con, intent["deal_id"]))
         planned = _planned_raw(intent["kind"], spec, _plan(intent))

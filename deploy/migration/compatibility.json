@@ -1,14 +1,15 @@
 {
   "format_version": 1,
   "ipc_version": 1,
-  "dto_version": 3,
-  "schema_version": 4,
+  "dto_version": 4,
+  "schema_version": 5,
   "min_reader": 2,
   "compatible_readers": [
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "components": [
     "collector",

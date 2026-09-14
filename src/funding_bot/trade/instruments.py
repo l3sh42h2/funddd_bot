@@ -122,8 +122,16 @@ QUOTE_ASSETS: Mapping[tuple[str, str], tuple[str, int, str]] = {
 
 # --- профили и статусы ----------------------------------------------------------------------------
 SOL_HL = "sol_best_hyperliquid"
+SOL_GATE = "sol_best_gate"
+SOL_ASTER = "sol_best_aster"
 # профиль → (сеть спота, площадка перпа, сети перпа)
-PROFILE_ROUTES: Mapping[str, tuple[str, str, tuple[str, ...]]] = {SOL_HL: (SOLANA_MAINNET, "hyperliquid", ("mainnet",))}
+PROFILE_ROUTES: Mapping[str, tuple[str, str, tuple[str, ...]]] = {
+    SOL_HL: (SOLANA_MAINNET, "hyperliquid", ("mainnet",)),
+    # CEX deployments use a real environment label when the native metadata
+    # has one; it is not a fabricated blockchain network.
+    SOL_GATE: (SOLANA_MAINNET, "gate", ("mainnet",)),
+    SOL_ASTER: (SOLANA_MAINNET, "aster", ("mainnet",)),
+}
 IDENTITY_STATUSES = ("candidate", "pending_underlying_evidence", "verified_source", "reviewed_override", "revoked")
 LIVE_IDENTITY = ("verified_source", "reviewed_override")
 UNITS_STATUSES = ("candidate_pending_mapping_acceptance", "accepted", "revoked")
@@ -196,7 +204,7 @@ class PerpMarket:
 
     @property
     def coin(self) -> str:
-        return self.fullcoin.split(":", 1)[1]
+        return self.fullcoin.split(":", 1)[1] if ":" in self.fullcoin else self.fullcoin.rsplit("_", 1)[0]
 
 
 @dataclass(frozen=True)
@@ -448,11 +456,18 @@ def parse_instrument(d: Any, where: str = "instrument") -> InstrumentSpec:
               "observed_max_leverage", "observed_margin_mode"))
     pnet = _enum(p["network"], f"{where}.perp.network", perp_nets)
     venue = _enum(p["venue"], f"{where}.perp.venue", (venue_want,))
-    dex = _str(p["dex"], f"{where}.perp.dex", _DEX_RE)
-    full = _str(p["fullcoin"], f"{where}.perp.fullcoin")
-    pre, _, coin = full.partition(":")
-    if pre != dex or not _SYMBOL_RE.match(coin):
-        raise RegistryError(f"{where}.perp.fullcoin = {full!r}: нужно «{dex}:МОНЕТА» (регистр монеты как у биржи)")
+    if venue == "hyperliquid":
+        dex = _str(p["dex"], f"{where}.perp.dex", _DEX_RE)
+        full = _str(p["fullcoin"], f"{where}.perp.fullcoin")
+        pre, _, coin = full.partition(":")
+        if pre != dex or not _SYMBOL_RE.match(coin):
+            raise RegistryError(f"{where}.perp.fullcoin = {full!r}: нужно «{dex}:МОНЕТА"
+                                "(регистр монеты как у биржи)")
+    else:
+        if p["dex"] not in (None, ""):
+            raise RegistryError(f"{where}.perp.dex: у {venue} HIP-3 dex не задаётся")
+        dex = ""
+        full = _str(p["fullcoin"], f"{where}.perp.fullcoin", re.compile(r"^[A-Za-z0-9_]{2,64}$"))
     perp = PerpMarket(pnet, venue, dex, full, _str(p["account_id"], f"{where}.perp.account_id", _ACCOUNT_RE, null=True),
                       _int(p.get("collateral_token_id_observed"), f"{where}.perp.collateral_token_id_observed", 0,
                            null=True),
