@@ -2,7 +2,7 @@
 
 Owner: Codex, assigned by project owner. Independent reviewer: Astra xhigh.
 Base: 3bf6896. Branch: codex/migration-m4-m5. Date: 2026-09-14.
-Status: candidate; production acceptance recorded separately after deployment.
+Status: deployed (staged process cutover), 2026-09-14 19:54:34 Moscow. Full M4 acceptance remains open.
 
 This intermediate release switches collector/core/interface while retaining the
 legacy EVM engine and its native recovery for existing positions. It does not
@@ -67,3 +67,9 @@ and gzip remain supported. No latency assertions were loosened.
 Linux focused validation at 100% CPU/Nice10: both original failing tests passed,
 13.54s total; 46,137,502-byte table, 3 clients, 9 downloads, 60 health requests,
 health p95 145.68ms (required <200ms). Local serve/load profile: 5 passed, 1.25s.
+
+Production result: `aa446f216047-a82af1f56cf0`, healthy; full Linux 2649 passed, root DAC 2 passed,
+Mac JS 10 passed. Deployment took 122.475s. All three actual
+processes and public status report the loaded release; current position preserved.
+See docs/migration/MIGRATION_RESULT.md for scope and evidence. This post-deployment
+documentation update does not change the installed code SHA above.
