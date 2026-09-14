@@ -114,7 +114,7 @@ def perpetual(fill, scope, *, spec=None, side=None):
     if has_execution and not complete_execution:
         return Result(Status.UNKNOWN, None, 'incomplete_exchange_execution', True, evidence,
                       error=ErrorKind.UNKNOWN, **_identity(spec, ref))
-    if status == Status.SETTLED and not complete_execution:
+    if status in {Status.SETTLED, Status.PARTIAL} and not complete_execution:
         return Result(Status.UNKNOWN, None, 'incomplete_exchange_execution', True, evidence,
                       error=ErrorKind.UNKNOWN, **_identity(spec, ref))
 

@@ -95,6 +95,10 @@ def test_perpetual_incomplete_settlement_fails_closed_and_unknown_keeps_proven_a
     assert result.trade_notional == QuoteAmount(D(6), 'USDT')
     assert result.native_ref == NativeRef('order', '3')
 
+    impossible_partial = replace(missing_quote, status='PARTIALLY_FILLED', qty=D(0))
+    result = outcomes.perpetual(impossible_partial, spec.scope, spec=spec, side='SELL')
+    assert result.status == Status.UNKNOWN and result.executed_quantity is None
+
 
 def test_two_argument_perpetual_mapping_remains_version_one():
     spec = perp_spec()

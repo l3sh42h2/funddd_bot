@@ -280,9 +280,9 @@ class Result:
                 perp_complete = self.perp_quote is not None and self.trade_notional is not None
                 if not (spot_complete or perp_complete):
                     raise AdapterError(ErrorKind.INVALID, 'v2 execution accounting incomplete')
-            if (self.status == Status.SETTLED and
+            if (self.status in {Status.SETTLED, Status.PARTIAL} and
                     (self.executed_quantity is None or self.executed_quantity <= 0)):
-                raise AdapterError(ErrorKind.INVALID, 'v2 settled execution must be positive')
+                raise AdapterError(ErrorKind.INVALID, 'v2 settled/partial execution must be positive')
 
 
 @dataclass(frozen=True)
