@@ -16,7 +16,7 @@ from funding_bot.trade.generic_operations import (
     GenericOperationCoordinator,
 )
 from funding_bot.trade.operation_plan import LegBound, OperationPlan
-from funding_bot.trade.adapters.contracts import NativeRef
+from funding_bot.trade.adapters.contracts import AdapterError, NativeRef
 from common_adapter_fixtures import Transport, context, spec, registry
 
 
@@ -94,7 +94,7 @@ def test_generic_approval_rejects_changed_second_leg_fingerprint_atomically(tmp_
     changed = p.to_dict()
     changed["legs"][1]["account"] = "different-account"
     con.execute("UPDATE intents SET plan_json=? WHERE id=?", (json.dumps(changed, sort_keys=True, separators=(",", ":")), iid))
-    with pytest.raises(store.StoreError, match="fingerprint"):
+    with pytest.raises(store.StoreError, match="fingerprint|frozen parent"):
         coordinator.approve(iid, nonce)
     assert store.get_intent(con, iid)["status"] == store.IntentStatus.PROPOSED
     assert store.get_operation(con, p.operation_id)["state"] == store.OpState.PROPOSED
@@ -471,3 +471,39 @@ def test_result_event_keeps_dispatch_attempt_separate_from_native_order_id(tmp_p
     assert all((payload["native_ref_kind"], payload["native_ref_id"]) ==
                ("venue_order", "venue-" + dispatch) for payload in payloads)
     assert [row["executions"] for row in leg_accounting.rebuild(con, deal_id=did)["legs"]] == [1, 1]
+
+@pytest.mark.parametrize("case", ("unknown", "stale", "foreign_perp"))
+def test_new_generic_send_requires_fresh_native_book_before_any_submit(tmp_path, case):
+    con, did, p, iid, coordinator, transports, ctx = approved_entry(tmp_path, operation_id="generic-native-book-" + case)
+    if case == "unknown":
+        from funding_bot.trade.adapters.contracts import Observation
+        ctx.for_leg(p.legs[0]).observe = lambda _spec: Observation(None, time.time(), "fixture", "unknown")
+    elif case == "stale":
+        from funding_bot.trade.adapters.contracts import Observation
+        ctx.for_leg(p.legs[1]).observe = lambda _spec: Observation(D(0), time.time() - 61, "fixture", "authoritative")
+    else:
+        transports[1].positions[p.legs[1].scope] = D(5)
+
+    with pytest.raises(store.StoreError, match="native position"):
+        coordinator.execute(iid)
+
+    assert [len(item.sent) for item in transports] == [0, 0]
+    assert store.get_operation(con, p.operation_id)["state"] == store.OpState.STOPPED
+    assert store.get_intent(con, iid)["status"] == store.IntentStatus.FAILED
+
+
+def test_stale_peer_quote_refuses_before_leading_native_send(tmp_path):
+    con, did, p, iid, coordinator, transports, ctx = approved_entry(tmp_path, operation_id="generic-peer-stale-quote")
+    binding = ctx.for_leg(p.legs[1])
+    quote = binding.quote
+
+    def stale_quote(spec_, action, bounds):
+        return replace(quote(spec_, action, bounds), expires_at=time.time() - 1)
+
+    binding.quote = stale_quote
+    with pytest.raises(AdapterError, match="quote expired"):
+        coordinator.execute(iid)
+
+    assert [len(item.sent) for item in transports] == [0, 0]
+    assert store.get_operation(con, p.operation_id)["state"] == store.OpState.STOPPED
+    assert store.get_intent(con, iid)["status"] == store.IntentStatus.FAILED

@@ -68,10 +68,11 @@ def test_two_futures_opposite_directions_distinct_currencies(tmp_path, reverse):
     assert quantities == ([D(-2), D(2)] if reverse else [D(2), D(-2)])
 
 
+@pytest.mark.parametrize('first_kind', ['fixture_cex_perp', 'fixture_cex_spot'])
 @pytest.mark.parametrize('first_multiplier,second_multiplier', [(D(1), D(1000)), (D(1000), D(1))])
 def test_perp_contract_multiplier_preserves_underlying_target_and_native_quantity(
-        tmp_path, first_multiplier, second_multiplier):
-    a = spec('fixture_cex_perp', 'lead', 'long', multiplier=first_multiplier)
+        tmp_path, first_kind, first_multiplier, second_multiplier):
+    a = spec(first_kind, 'lead', 'long', multiplier=first_multiplier)
     b = spec('fixture_dex_perp', 'hedge', 'short', multiplier=second_multiplier)
     con, did, plan, iid, coordinator, transports = setup(tmp_path, a, b)
     assert coordinator.execute(iid).state == store.OpState.OPEN

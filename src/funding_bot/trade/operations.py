@@ -65,7 +65,7 @@ class OperationController:
     def __init__(self, connection):
         self.con = connection
 
-    def admit(self, run):
+    def admit(self, run, *, activate: Callable[[], None] | None = None):
         """One CAS owns admission; both intent and root become running or neither."""
         from .adapters.native_journal import exclusive_transaction
         from .adapters.obligations import require_resolved
@@ -81,6 +81,10 @@ class OperationController:
                                                     'token_dec', 'symbol', 'perp_venue', 'sim'))):
                 raise store.StoreError('admission frozen context changed')
             require_resolved(self.con, deal)
+            # Generic entry/exit activation is part of admission, so a
+            # rejected pre-send check cannot dirty a DRAFT deal.
+            if activate is not None:
+                activate()
             op = store.operation_of_intent(self.con, run.iid)
             if (op['id'] if op else None) != run.op_id:
                 raise store.StoreError('admission root changed')
@@ -95,7 +99,8 @@ class OperationController:
                         intent_kind=run.kind, sim=run.legs.sim)
         return True
 
-    def run_operation(self, run, execute, *, paused, refused, propagate: bool = False):
+    def run_operation(self, run, execute, *, paused, refused, activate: Callable[[], None] | None = None,
+                      propagate: bool = False):
         """The sole outer execution lifecycle. Ports run outside transactions.
 
         Report failures after terminal commit cannot transition money state back
@@ -104,7 +109,7 @@ class OperationController:
         from .engine import Pause
         from .keys import redact
         try:
-            admitted = self.admit(run)
+            admitted = self.admit(run, activate=activate)
         except Exception as exc:
             refused('операция не начата: ' + redact(exc))
             if propagate:

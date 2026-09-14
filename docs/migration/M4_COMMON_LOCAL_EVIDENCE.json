@@ -2,8 +2,8 @@
   "status": "local_candidate_only",
   "baseline_release": "0f9037cf72de-f6e1e96f711e",
   "targeted": {
-    "passed": 703,
-    "seconds": 18.63
+    "passed": 713,
+    "seconds": 19.36
   },
   "mac_javascriptcore": {
     "passed": 8,
@@ -16,16 +16,741 @@
     "fixtures": "/private/tmp/funding-m4-evm-0f9037c",
     "fixtures_sha256": "ac38718a06227cb41d766c65da44e92fffd6de58f791e7333e574455d2a34810",
     "network_allowed": false,
+    "observations": {
+      "baseline": {
+        "evm_entry_partial_full_exit": [
+          {
+            "book": {
+              "short": "4889",
+              "tokens_raw": 4889061295659960976050
+            },
+            "carry": "0.06129565996097605",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "2444",
+              "tokens_raw": 2444073520598836281674
+            },
+            "carry": "0.073520598836281674",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "99985649999999999999",
+                "2445",
+                "100.04940"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2445",
+                "2445",
+                "100.04940",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "token_raw_to_sell",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "0",
+              "tokens_raw": 0
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "99985649999999999999",
+                "2445",
+                "100.04940"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444073520598836281674",
+                "2444073520598836281674",
+                "99948263984376574741",
+                "2444",
+                "100.00848"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2445",
+                "2445",
+                "100.04940",
+                1
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2444",
+                "2444",
+                "100.00848",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "token_raw_to_sell",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "full_position_snapshot",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444073520598836281674",
+                "2444073520598836281674",
+                "0"
+              ]
+            ],
+            "state": "CLOSED"
+          }
+        ],
+        "sol_entry_full_exit": [
+          {
+            "book": {
+              "short": "903",
+              "tokens_raw": 903000000
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "150000000",
+                "150000000",
+                "903000000",
+                "903",
+                "150.57525000"
+              ]
+            ],
+            "dust": "0",
+            "fees": [
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ]
+            ],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "903",
+                "903",
+                "150.57525000",
+                0
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                6,
+                "150000000",
+                "150000000",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "0",
+              "tokens_raw": 0
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "150000000",
+                "150000000",
+                "903000000",
+                "903",
+                "150.57525000"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "903000000",
+                "903000000",
+                "150200000",
+                "903",
+                "150.98160000"
+              ]
+            ],
+            "dust": "0",
+            "fees": [
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ]
+            ],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "903",
+                "903",
+                "150.57525000",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "903",
+                "903",
+                "150.98160000",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                6,
+                "150000000",
+                "150000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "full_position_snapshot",
+                "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+                6,
+                "903000000",
+                "903000000",
+                "0"
+              ]
+            ],
+            "state": "CLOSED"
+          }
+        ]
+      },
+      "candidate": {
+        "evm_entry_partial_full_exit": [
+          {
+            "book": {
+              "short": "4889",
+              "tokens_raw": 4889061295659960976050
+            },
+            "carry": "0.06129565996097605",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "2444",
+              "tokens_raw": 2444073520598836281674
+            },
+            "carry": "0.073520598836281674",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "99985649999999999999",
+                "2445",
+                "100.04940"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2445",
+                "2445",
+                "100.04940",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "token_raw_to_sell",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "0",
+              "tokens_raw": 0
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "200000000000000000000",
+                "200000000000000000000",
+                "4889061295659960976050",
+                "4889",
+                "199.96010"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "99985649999999999999",
+                "2445",
+                "100.04940"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "2444073520598836281674",
+                "2444073520598836281674",
+                "99948263984376574741",
+                "2444",
+                "100.00848"
+              ]
+            ],
+            "dust": "0",
+            "fees": [],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "4889",
+                "4889",
+                "199.96010",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2445",
+                "2445",
+                "100.04940",
+                1
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "2444",
+                "2444",
+                "100.00848",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "0x55d398326f99059ff775485246999027b3197955",
+                18,
+                "200000000000000000000",
+                "200000000000000000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "token_raw_to_sell",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444987775061124694376",
+                "2444987775061124694376",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "full_position_snapshot",
+                "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                18,
+                "2444073520598836281674",
+                "2444073520598836281674",
+                "0"
+              ]
+            ],
+            "state": "CLOSED"
+          }
+        ],
+        "sol_entry_full_exit": [
+          {
+            "book": {
+              "short": "903",
+              "tokens_raw": 903000000
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "150000000",
+                "150000000",
+                "903000000",
+                "903",
+                "150.57525000"
+              ]
+            ],
+            "dust": "0",
+            "fees": [
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ]
+            ],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "903",
+                "903",
+                "150.57525000",
+                0
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                6,
+                "150000000",
+                "150000000",
+                "0"
+              ]
+            ],
+            "state": "OPEN"
+          },
+          {
+            "book": {
+              "short": "0",
+              "tokens_raw": 0
+            },
+            "carry": "0",
+            "clips": [
+              [
+                "entry",
+                "BALANCED",
+                "150000000",
+                "150000000",
+                "903000000",
+                "903",
+                "150.57525000"
+              ],
+              [
+                "exit",
+                "BALANCED",
+                "903000000",
+                "903000000",
+                "150200000",
+                "903",
+                "150.98160000"
+              ]
+            ],
+            "dust": "0",
+            "fees": [
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ],
+              [
+                "network_total",
+                "native:solana",
+                9,
+                "5020",
+                0,
+                0,
+                0,
+                0
+              ]
+            ],
+            "orders": [
+              [
+                "SELL",
+                "FILLED",
+                "903",
+                "903",
+                "150.57525000",
+                0
+              ],
+              [
+                "BUY",
+                "FILLED",
+                "903",
+                "903",
+                "150.98160000",
+                1
+              ]
+            ],
+            "roots": [
+              [
+                "entry",
+                "OPEN",
+                "stable_raw_budget",
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                6,
+                "150000000",
+                "150000000",
+                "0"
+              ],
+              [
+                "exit",
+                "CLOSED",
+                "full_position_snapshot",
+                "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+                6,
+                "903000000",
+                "903000000",
+                "0"
+              ]
+            ],
+            "state": "CLOSED"
+          }
+        ]
+      }
+    },
     "scenarios": [
       "evm_entry_partial_full_exit",
       "sol_entry_full_exit"
     ],
     "source_sha256": {
       "baseline": "4a596a17b81f14e41746fddbc488b9b798b59100cb7199f26c252dd010270ea0",
-      "candidate": "2c235bc3fb3fe639bd10d42591a286dde504cd4521352c7374ee21bdf9aa8ab5"
+      "candidate": "ea78f98fa99f9dd7d0148d184e52891b7d8ebe2556b6bad36932ffdc8fab7c87"
     }
   },
   "independent_review": "Claude assigned by owner; pending",
   "linux_artifact": "pending",
-  "production_changed": false
+  "production_changed": false,
+  "invalidated_candidate": "f64b604: Linux run deliberately stopped; native-position, scope and TTL gates added afterward"
 }

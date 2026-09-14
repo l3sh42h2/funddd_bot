@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 import hashlib
+import math
+import time
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +20,7 @@ from typing import Any
 from . import store
 from .adapters.contracts import Action, AdapterError, ErrorKind, NativeRef, Prepared, Result, Status
 from .operation_plan import LegBound, OperationPlan
-from .operation_roots import _generic_identity, generic_propose
+from .operation_roots import _generic_identity, generic_propose, validate_generic_parent
 from .operations import EndDecision, OperationController
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
 
@@ -142,12 +144,10 @@ class GenericOperationCoordinator:
         external attempt with the same durable identity.
         """
         run, plan, op = self._load(intent_id, required=store.IntentStatus.APPROVED)
-        if plan.expires_at <= __import__("time").time():
+        if plan.expires_at <= time.time():
             raise store.StoreError("generic frozen plan has expired")
         pair = self.registry.compose(plan.legs[0], plan.legs[1], self.context)
         self._require_exit_ownership(run, plan)
-        self._activate_deal(run, plan)
-        run.deal = store.get_deal(self.con, run.did)
         def program():
             if plan.kind == "rehedge":
                 return self._run_rehedge(run, plan, op, pair)
@@ -160,6 +160,7 @@ class GenericOperationCoordinator:
             run, program,
             paused=lambda stop: self._fail_after_admission(run, stop.text),
             refused=lambda _text: None,
+            activate=lambda: self._activate_deal_admitted(run, plan),
             propagate=True,
         )
 
@@ -258,23 +259,26 @@ class GenericOperationCoordinator:
         deal = store.get_deal(self.con, intent["deal_id"])
         if op is None or deal is None or op["id"] != plan.operation_id:
             raise store.StoreError("generic intent lost its durable root or deal")
+        # Recheck the immutable generic parent before every execute/resume;
+        # proposal-time validation cannot protect a later parent rewrite.
+        deal = validate_generic_parent(self.con, deal["id"], plan)
         if spec.get("plan_fingerprint") != plan.fingerprint or op["inst_hash"] != "generic:" + _generic_identity(plan):
             raise store.StoreError("generic intent frozen plan identity changed")
         run = SimpleNamespace(iid=intent_id, did=deal["id"], kind=intent["kind"], it=intent,
                               deal=deal, op_id=op["id"], legs=SimpleNamespace(sim=bool(deal["sim"])))
         return run, plan, op
 
-    def _activate_deal(self, run, plan: OperationPlan) -> None:
-        with store.tx(self.con):
-            deal = store.get_deal(self.con, run.did)
-            if deal is None:
-                raise store.StoreError("generic deal disappeared before admission")
-            if plan.kind == "entry" and deal["state"] == store.DealState.DRAFT:
-                store.set_deal_state(self.con, run.did, store.DealState.ENTERING,
-                                     expect=store.DealState.DRAFT)
-            elif plan.kind == "exit" and deal["state"] == store.DealState.OPEN:
-                store.set_deal_state(self.con, run.did, store.DealState.EXITING,
-                                     expect=store.DealState.OPEN)
+    def _activate_deal_admitted(self, run, plan: OperationPlan) -> None:
+        """Advance entry/exit only inside OperationController's admission txn."""
+        deal = store.get_deal(self.con, run.did)
+        if deal is None:
+            raise store.StoreError("generic deal disappeared before admission")
+        if plan.kind == "entry" and deal["state"] == store.DealState.DRAFT:
+            store.set_deal_state(self.con, run.did, store.DealState.ENTERING,
+                                 expect=store.DealState.DRAFT)
+        elif plan.kind == "exit" and deal["state"] == store.DealState.OPEN:
+            store.set_deal_state(self.con, run.did, store.DealState.EXITING,
+                                 expect=store.DealState.OPEN)
 
     def _require_exit_ownership(self, run, plan: OperationPlan) -> None:
         """Exit only quantities proven for this parent deal, across all roots."""
@@ -300,15 +304,24 @@ class GenericOperationCoordinator:
                                    quantity=plan.bounds[leading.leg_id].max_qty)
         if lead_action.quantity * leading.multiplier > plan.max_unhedged_exposure:
             raise store.StoreError("generic leading clip exceeds frozen transient unhedged exposure cap")
+        planned_hedge = self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2,
+                                     quantity=plan.bounds[hedge.leg_id].max_qty)
+        self._observe_native_book(run.did, plan, adapters)
+        # Quote both maximum approved legs before a leading native request.  A
+        # later quote derives the exact hedge after the proven leading fill.
+        self._preflight_quotes(run.did, ((adapters[leading.leg_id], leading,
+                                          plan.bounds[leading.leg_id], lead_action),
+                                         (adapters[hedge.leg_id], hedge,
+                                          plan.bounds[hedge.leg_id], planned_hedge)))
         self._authorize_before_first_send(((adapters[leading.leg_id], leading, lead_action),
-                                           (adapters[hedge.leg_id], hedge,
-                                            self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2,
-                                                         quantity=plan.bounds[hedge.leg_id].max_qty))))
+                                           (adapters[hedge.leg_id], hedge, planned_hedge)))
         lead_result: Result | None = None
         hedge_result: Result | None = None
         hedge_action: Action | None = None
 
         def submit_leading():
+            if self._sent_attempts(run.iid).get(leading.leg_id) != lead_action.action_id:
+                self._observe_native_book(run.did, plan, adapters)
             return self._submit_or_resolve(run, op, adapters[leading.leg_id], leading,
                                            plan.bounds[leading.leg_id], lead_action, reserve=True)
 
@@ -330,6 +343,8 @@ class GenericOperationCoordinator:
             hedge_qty = self._hedge_quantity(run.did, plan, hedge, leading)
             hedge_action = self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2, quantity=hedge_qty)
             try:
+                if self._sent_attempts(run.iid).get(hedge.leg_id) != hedge_action.action_id:
+                    self._observe_native_book(run.did, plan, adapters)
                 return self._submit_or_resolve(run, op, adapters[hedge.leg_id], hedge,
                                                plan.bounds[hedge.leg_id], hedge_action, reserve=False)
             except Exception:
@@ -365,7 +380,9 @@ class GenericOperationCoordinator:
     def _run_rehedge(self, run, plan: OperationPlan, op: dict, pair) -> GenericExecution:
         """One bounded corrective leg from the proven parent book, through shared lifecycle."""
         leg = next(item for item in plan.legs if item.leg_id == plan.leading_leg_id)
-        adapter = pair.first if pair.first.describe().leg_id == leg.leg_id else pair.second
+        adapters = {item.leg_id: pair.first if pair.first.describe().leg_id == item.leg_id else pair.second
+                    for item in plan.legs}
+        adapter = adapters[leg.leg_id]
         bound = plan.bounds[leg.leg_id]
         result: Result | None = None
         action: Action | None = None
@@ -394,11 +411,14 @@ class GenericOperationCoordinator:
             if bound.reduce_only != reduces_existing:
                 raise store.StoreError("generic rehedge reduce-only authorization differs from proven position")
             action = self._action(run, leg, bound, sequence=1, quantity=qty)
+            self._observe_native_book(run.did, plan, adapters)
             self._authorize_before_first_send(((adapter, leg, action),))
             return HedgeAction(action.side, action.quantity, action.reduce_only)
 
         def submit(_clip_id, _hedge_action):
             assert action is not None
+            if self._sent_attempts(run.iid).get(leg.leg_id) != action.action_id:
+                self._observe_native_book(run.did, plan, adapters)
             return self._submit_or_resolve(run, op, adapter, leg, bound, action, reserve=True)
 
         def apply(_clip_id, _hedge_action, native_result):
@@ -468,6 +488,60 @@ class GenericOperationCoordinator:
             raise store.StoreError("proven leading exposure is below hedge precision; automatic under-hedge refused")
         return quantity
 
+    def _observe_native_book(self, deal_id: str, plan: OperationPlan, adapters: dict[str, Any]) -> dict[str, Any]:
+        """Require fresh authoritative venue inventory before every new send.
+
+        Perpetual scopes cannot contain a personal, unjournaled position, so
+        their native quantity is exact.  A spot wallet can contain independent
+        assets; it must at least cover the parent-deal quantity, while all
+        generic sell sizing remains bounded by the journal-owned quantity.
+        """
+        now = time.time()
+        observations: dict[str, Any] = {}
+        for leg in plan.legs:
+            adapter = adapters.get(leg.leg_id)
+            if adapter is None:
+                raise store.StoreError("generic adapter map misses frozen leg")
+            try:
+                observation = adapter.observe()
+            except Exception as exc:
+                raise store.StoreError("generic native position observation is unavailable") from exc
+            quantity = getattr(observation, "quantity", None)
+            as_of = getattr(observation, "as_of", None)
+            quality = getattr(observation, "quality", None)
+            if (not isinstance(quantity, Decimal) or not quantity.is_finite() or
+                    isinstance(as_of, bool) or not isinstance(as_of, (int, float)) or not math.isfinite(as_of) or
+                    abs(now - as_of) > 60 or quality not in {"authoritative", "confirmed", "finalized"}):
+                raise store.StoreError("generic native position observation is not fresh authoritative proof")
+            expected = self._leg_parent_qty(deal_id, leg)
+            if not expected.is_finite():
+                raise store.StoreError("generic parent inventory is not finite")
+            if leg.capabilities.market_kind == "perpetual":
+                if quantity * leg.multiplier != expected:
+                    raise store.StoreError("generic perpetual native position differs from parent journal")
+            else:
+                if expected < 0 or quantity * leg.multiplier < expected:
+                    raise store.StoreError("generic spot balance does not cover parent journal inventory")
+            observations[leg.leg_id] = observation
+        return observations
+
+    def _preflight_quotes(self, deal_id: str, items) -> None:
+        """Validate both maximum frozen actions before the leading send.
+
+        ``Observation.available`` has no unit/initial-margin semantics for
+        perpetuals, so this method never treats notional as margin.  Native
+        authorization remains the authoritative margin policy.  Spot cash is
+        compared only where its observation states the exact spend currency.
+        """
+        for adapter, leg, bound, action in items:
+            quote = adapter.quote(action, self._bounds(bound))
+            self._validate_quote(quote, action, bound, leg, self._leg_parent_qty(deal_id, leg))
+            observation = adapter.observe()
+            available, currency = observation.available, observation.currency
+            if leg.capabilities.market_kind == "spot" and available is not None and currency == quote.spend_currency:
+                if not isinstance(available, Decimal) or not available.is_finite() or available < quote.max_spend:
+                    raise store.StoreError("generic spot available balance does not cover frozen quote spend")
+
     @staticmethod
     def _authorize_before_first_send(items) -> None:
         """Check both frozen legs before the leading native request is admitted."""
@@ -493,6 +567,7 @@ class GenericOperationCoordinator:
             return adapter.resolve(attempt_id)
         quote = adapter.quote(action, self._bounds(bound))
         self._validate_quote(quote, action, bound, leg, self._leg_parent_qty(run.did, leg))
+        self._first_dispatch_deadline(run, reserve)
         with store.tx(self.con):
             current = store.get_operation(self.con, op["id"])
             if current is None or current["state"] != store.OpState.RUNNING:
@@ -503,6 +578,7 @@ class GenericOperationCoordinator:
             prepared = adapter.prepare(attempt_id, quote)
             if not isinstance(prepared, Prepared) or prepared.attempt_id != attempt_id:
                 raise store.StoreError("adapter returned a different generic prepared attempt")
+            self._first_dispatch_deadline(run, reserve)
         except Exception:
             if reserve:
                 self._release_unsent(run, op, "generic prepare failed")
@@ -515,6 +591,14 @@ class GenericOperationCoordinator:
                         spec_hash=leg.fingerprint, quote_hash=quote.fingerprint,
                         quantity=str(action.quantity), side=action.side, reduce_only=action.reduce_only)
         return adapter.submit(prepared)
+
+    @staticmethod
+    def _first_dispatch_deadline(run, first: bool) -> None:
+        # A fresh venue quote cannot extend the owner's plan authorization.
+        # Once the leading action was committed, the bounded hedge is still
+        # needed to reduce the exposure even if the entry deadline has passed.
+        if first and _plan(run.it['plan_json']).expires_at <= time.time():
+            raise store.StoreError('generic first dispatch approval expired during preflight')
 
     @staticmethod
     def _bounds(bound: LegBound) -> dict[str, Any]:
@@ -549,7 +633,7 @@ class GenericOperationCoordinator:
                 raise store.StoreError("generic sell quote spend asset differs from frozen spot asset")
             if quote.max_spend > action.quantity or quote.max_spend > bound.max_qty:
                 raise store.StoreError("generic sell quote exceeds approved base quantity")
-            if owned_quantity < quote.max_spend:
+            if owned_quantity / leg.multiplier < quote.max_spend:
                 raise store.StoreError("generic sell quote exceeds proven parent spot inventory")
         elif quote.spend_currency == bound.quote_currency and quote.max_spend > bound.max_spend:
             raise store.StoreError("generic quote exceeds approved quote budget")

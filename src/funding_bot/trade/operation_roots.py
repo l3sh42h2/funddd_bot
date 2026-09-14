@@ -154,10 +154,32 @@ def _generic_scope(value: Any) -> tuple | None:
     return scope if all(item is None or isinstance(item, str) for item in scope) else None
 
 
+def validate_generic_parent(con, deal_id: str, plan: OperationPlan) -> dict:
+    """The plan cannot silently change either frozen leg of its parent deal."""
+    current = store.get_deal(con, deal_id)
+    if current is None or not current.get('sim'):
+        raise store.StoreError('generic parent is missing or live execution is not enabled')
+    try:
+        frozen = json.loads(current.get('inst_json') or '{}')
+    except (TypeError, ValueError):
+        raise store.StoreError('generic parent frozen identity is malformed') from None
+    if (frozen.get('generic_position_v1') is not True or
+            store._json_hash(frozen.get('legs')) != store._json_hash(plan.to_dict()['legs'])):
+        raise store.StoreError('generic plan differs from frozen parent legs')
+    return current
+
+
 def _assert_generic_scopes_available(con, deal_id: str, plan: OperationPlan) -> None:
     """The legacy NULL indexes cannot protect two independent generic scopes."""
     wanted = {tuple(leg.scope) for leg in plan.legs}
-    for other in store.active_deals(con):
+    # An approved DRAFT already owns its scopes even before the worker starts.
+    # Recheck under approval/admission transactions, not only at proposal time.
+    peers = con.execute(
+        "SELECT d.* FROM deals d WHERE d.state NOT IN ('CLOSED','ABORTED','DRAFT') OR "
+        "(d.state='DRAFT' AND EXISTS (SELECT 1 FROM intents i WHERE i.deal_id=d.id "
+        "AND i.status IN ('approved','running')))").fetchall()
+    for row in peers:
+        other = dict(row)
         if other["id"] == deal_id:
             continue
         try:
@@ -198,6 +220,7 @@ def generic_propose(con, *, deal: Mapping, plan: OperationPlan, profile_id: str,
             "plan_fingerprint": plan.fingerprint, "target_raw": str(target),
             "leading_leg_id": plan.leading_leg_id}
     with store.tx(con):
+        validate_generic_parent(con, deal['id'], plan)
         store.require_reader(con, _GENERIC_READER)
         _assert_generic_scopes_available(con, deal["id"], plan)
         existing = store.get_operation(con, op_id)
@@ -227,6 +250,8 @@ def generic_propose(con, *, deal: Mapping, plan: OperationPlan, profile_id: str,
 
 def _approve_generic(con, intent: Mapping, op: Mapping, spec: Mapping) -> str:
     plan = _generic_plan(intent["plan_json"])
+    validate_generic_parent(con, intent['deal_id'], plan)
+    _assert_generic_scopes_available(con, intent['deal_id'], plan)
     if plan.kind != intent["kind"] or plan.operation_id != op["id"]:
         raise store.StoreError("generic plan does not match linked operation")
     if spec.get("plan_fingerprint") != plan.fingerprint or spec.get("inst_hash") != "generic:" + _generic_identity(plan):
@@ -374,9 +399,13 @@ def approve_linked(con, intent: Mapping) -> str | None:
 def start_linked(con, intent: Mapping) -> str | None:
     """Advance an approved linked root immediately before native execution."""
     with store.tx(con):
-        op, _ = _linked(con, intent)
+        op, spec = _linked(con, intent)
         if op is None:
             return None
+        if spec.get(_GENERIC_MARKER) is True:
+            plan = _generic_plan(intent['plan_json'])
+            validate_generic_parent(con, intent['deal_id'], plan)
+            _assert_generic_scopes_available(con, intent['deal_id'], plan)
         if op["state"] != OpState.APPROVED:
             raise store.StoreError(f"operation {op['id']} in {op['state']} cannot start")
         store.set_operation_state(con, op["id"], OpState.RUNNING, expect=OpState.APPROVED)

@@ -143,3 +143,15 @@ USDC/USDT не приравниваются; SOL legacy policy с несовме
 основной Codex — интеграция, leg cash/DTO/recovery, матрица и проверка совместимости.
 Точные суммарные затраты токенов и время всей реализации недоступны. Ревью Claude
 владельцем назначено, результат не получен; этот патчноут не означает приёмку/выкат.
+
+## Final admission hardening (15.09.2026)
+
+Кандидат f64b604 не выпускать: его Linux-прогон остановлен после обнаружения
+недостающей проверки фактической позиции. Перед первым send обе ноги получают
+свежие authoritative observations и ограниченные котировки; чужая perp-позиция
+блокирует вход. Spot units учитывают multiplier. Parent LegSpec/account scope
+сверяется на proposal/approval/admission; уже занятый scope нельзя занять старым
+DRAFT. Активация сделки атомарна с admission. TTL проверяется после preflight и
+prepare перед первым dispatch; resolve и необходимый hedge уже начатой операции
+сохраняются. Профиль: 713 passed / 19.36 s. Offline legacy differential равен
+базе на обоих сценариях; сеть запрещена. Linux receipt и Claude review pending.
