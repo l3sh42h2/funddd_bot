@@ -683,7 +683,10 @@ def _health_identity(value, manifest, pid, component):
         raise DeployFailure(f'{component} health stale')
 
 
-def wait_components(paths, commands, manifest, *, timeout=180, sleep=time.sleep):
+def wait_components(paths, commands, manifest, *, collector_manifest=None, interface_manifest=None,
+                    timeout=180, sleep=time.sleep):
+    collector_manifest = collector_manifest or manifest
+    interface_manifest = interface_manifest or manifest
     deadline = time.monotonic() + timeout
     last = 'not checked'
     while time.monotonic() < deadline:
@@ -702,9 +705,9 @@ def wait_components(paths, commands, manifest, *, timeout=180, sleep=time.sleep)
             if len(public_body) > 16 * 1024:
                 raise DeployFailure('public status exceeds 16 KiB')
             public = json.loads(public_body)
-            _health_identity(collector, manifest, cp, 'collector')
-            _health_identity(interface, manifest, ip, 'interface')
-            _health_identity(public, manifest, cp, 'public collector status')
+            _health_identity(collector, collector_manifest, cp, 'collector')
+            _health_identity(interface, interface_manifest, ip, 'interface')
+            _health_identity(public, collector_manifest, cp, 'public collector status')
             return {'collector': collector, 'interface': interface}
         except (OSError, ValueError, json.JSONDecodeError, DeployFailure, subprocess.SubprocessError) as e:
             last = str(e)
@@ -747,6 +750,13 @@ def resume_legacy(paths, commands):
 def restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
                           *, drain_release_id=None):
     install_units(previous_release, commands)
+    commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
+    commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
+    commands.run(['systemctl', 'stop', 'funding_bot-core.service'], check=False)
+    _wait_inactive(commands, 'funding_bot-core.service')
+    _wait_inactive(commands, 'funding_bot-collector.service')
+    execution_lock_free(paths.execution_lock)
+    commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
     commands.run(['systemctl', 'start', 'funding_bot-core.service'])
     health = wait_core_ready(client_factory(), previous_manifest, commands=commands,
                              drain_release_id=drain_release_id)
@@ -758,6 +768,7 @@ def restore_before_switch(paths, commands, client_factory, previous_release, pre
     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
     wait_components(paths, commands, previous_manifest)
     end_drain_verified(client_factory, previous_manifest, epoch, drain_release_id=owner)
+    return {name: previous_manifest['release_id'] for name in ('collector', 'core', 'interface')}
 
 
 def restore_ui_before_switch(commands, previous_release):
@@ -777,16 +788,19 @@ def restore_activation_failure(paths, commands, client_factory, previous_release
                                previous_manifest, *, ui_update, switched, drain_release_id=None):
     if ui_update and switched:
         rollback_ui(paths, commands, previous_release, previous_manifest)
+        return None
     elif ui_update:
         restore_ui_before_switch(commands, previous_release)
         commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+        return None
     elif switched:
         rollback_release(paths, commands, client_factory, previous_release, previous_manifest)
+        return {name: previous_manifest['release_id'] for name in ('collector', 'core', 'interface')}
     else:
         # Link replacement failed after the old services were stopped. The old
         # code is still selected, so restore that compatible owner in place.
-        restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
-                              drain_release_id=drain_release_id)
+        return restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
+                                     drain_release_id=drain_release_id)
 
 
 def rollback_release(paths, commands, client_factory, previous_release, previous_manifest):
@@ -836,7 +850,7 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
     end_drain_verified(client_factory, previous_manifest, old_epoch, drain_release_id=drain_owner)
 
 
-def release_state(previous, manifest, *, components, status, drain, report):
+def release_state(previous, manifest, *, components, status, drain, report, operation_id=None):
     return {
         'format_version': 1, 'generation': int((previous or {}).get('generation', 0)) + 1,
         'release_id': manifest['release_id'], 'source_revision': manifest['source_revision'],
@@ -846,7 +860,7 @@ def release_state(previous, manifest, *, components, status, drain, report):
         'components': components, 'ipc_version': manifest['ipc_version'], 'dto_version': manifest['dto_version'],
         'schema_version': manifest['schema_version'], 'min_reader': manifest['min_reader'],
         'active_epoch': uuid.uuid4().hex, 'status': status, 'drain': drain,
-        'installed_at': time.time(), 'report': str(report),
+        'installed_at': time.time(), 'report': str(report), 'operation_id': operation_id,
     }
 
 
@@ -867,7 +881,7 @@ def observed_drain(paths, client_factory, manifest):
             return None
 
 
-def record_failed_selection(paths, client_factory, previous_state, manifest, failed_path):
+def record_failed_selection(paths, client_factory, previous_state, manifest, failed_path, *, operation_id=None):
     selected = None
     if paths.current.is_symlink():
         try:
@@ -880,12 +894,26 @@ def record_failed_selection(paths, client_factory, previous_state, manifest, fai
         af.atomic_json(paths.release_state, release_state(
             previous_state, manifest, components=components,
             status='drained_failure' if drain is True else 'execution_state_unknown',
-            drain=drain, report=failed_path))
+            drain=drain, report=failed_path, operation_id=operation_id))
     elif previous_state is not None and selected == previous_state['release_id']:
         old_failure = dict(previous_state, status='rollback_incomplete', drain=None,
                            report=str(failed_path), installed_at=time.time())
         af.atomic_json(paths.release_state, old_failure)
     return selected
+
+
+def component_manifest(paths, state, role, fallback):
+    release_id = state.get('components', {}).get(role, fallback['release_id'])
+    if release_id == fallback['release_id']:
+        return fallback
+    return _json(paths.releases / release_id / 'release-manifest.json')
+
+
+def reconciled_previous(previous, components=None):
+    value = dict(previous, status='healthy', drain=False, installed_at=time.time())
+    if components is not None:
+        value['components'] = components
+    return value
 
 
 def recover_transition(paths, commands, client_factory, transition):
@@ -899,6 +927,7 @@ def recover_transition(paths, commands, client_factory, transition):
     actual_target = paths.current.is_symlink() and paths.current.resolve(strict=True).name == target_id
     committed = _json(paths.release_state) if paths.release_state.exists() else None
     if (actual_target and committed and committed.get('release_id') == target_id
+            and committed.get('operation_id') == transition.get('operation_id')
             and committed.get('status') == 'healthy'):
         # The last atomic state write completed and only journal cleanup was
         # interrupted. The committed release is the exact base.
@@ -918,14 +947,23 @@ def recover_transition(paths, commands, client_factory, transition):
             if active:
                 health = client_factory().call('get_status', {})
                 if health.get('drain') is True:
-                    restore_before_switch(paths, commands, client_factory, previous_release,
-                                          previous_manifest, drain_release_id=target_id)
+                    components = restore_before_switch(paths, commands, client_factory, previous_release,
+                                                       previous_manifest, drain_release_id=target_id)
+                    previous = reconciled_previous(previous, components)
                 else:
-                    health_matches(health, previous_manifest, require_drain=False,
+                    core_manifest = (component_manifest(paths, previous, 'core', previous_manifest)
+                                     if transition.get('phase') == 'prepared' or transition.get('ui_only')
+                                     else previous_manifest)
+                    health_matches(health, core_manifest, require_drain=False,
                                    require_recovery=False)
                     commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
-                    wait_components(paths, commands, previous_manifest)
+                    if transition.get('phase') == 'prepared' or transition.get('ui_only'):
+                        wait_components(paths, commands, previous_manifest,
+                                        collector_manifest=component_manifest(paths, previous, 'collector', previous_manifest),
+                                        interface_manifest=component_manifest(paths, previous, 'interface', previous_manifest))
+                    else:
+                        wait_components(paths, commands, previous_manifest)
             else:
                 if previous.get('status') != 'healthy':
                     prove_inactive_offline_fence(paths, commands, previous)
@@ -939,9 +977,13 @@ def recover_transition(paths, commands, client_factory, transition):
                         wait_core_live_ready(client_factory(), previous_manifest, commands=commands)
                         commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
                         wait_components(paths, commands, previous_manifest)
+                        previous = reconciled_previous(
+                            previous, {name: previous_manifest['release_id']
+                                       for name in ('collector', 'core', 'interface')})
                     else:
-                        restore_before_switch(paths, commands, client_factory, previous_release,
-                                              previous_manifest, drain_release_id=target_id)
+                        components = restore_before_switch(paths, commands, client_factory, previous_release,
+                                                           previous_manifest, drain_release_id=target_id)
+                        previous = reconciled_previous(previous, components)
         if previous is not None:
             af.atomic_json(paths.release_state, previous)
         clear_transition(paths)
@@ -954,6 +996,8 @@ def recover_transition(paths, commands, client_factory, transition):
             rollback_ui(paths, commands, previous_release, previous_manifest)
         else:
             rollback_release(paths, commands, client_factory, previous_release, previous_manifest)
+            previous = reconciled_previous(
+                previous, {name: previous_manifest['release_id'] for name in ('collector', 'core', 'interface')})
         af.atomic_json(paths.release_state, previous)
         clear_transition(paths)
         raise DeployFailure('TRANSITION_ROLLED_BACK_RESNAPSHOT_REQUIRED')
@@ -989,7 +1033,8 @@ def recover_transition(paths, commands, client_factory, transition):
     components = {name: target_id for name in ('collector', 'core', 'interface')}
     af.atomic_json(paths.release_state, release_state(None, target_manifest, components=components,
                                                       status='drained_interrupted', drain=True,
-                                                      report=report_path))
+                                                      report=report_path,
+                                                      operation_id=transition.get('operation_id')))
     clear_transition(paths)
     raise DeployFailure('TRANSITION_FENCED_RESNAPSHOT_REQUIRED')
 
@@ -1091,8 +1136,10 @@ class Job:
                     elif is_ui:
                         restore_ui_before_switch(self.commands, old_release)
                     else:
-                        restore_before_switch(p, self.commands, self.client_factory, old_release, previous_manifest,
-                                              drain_release_id=template['release_id'])
+                        restored = restore_before_switch(
+                            p, self.commands, self.client_factory, old_release, previous_manifest,
+                            drain_release_id=template['release_id'])
+                        af.atomic_json(p.release_state, reconciled_previous(previous_state, restored))
                     report['rollback'] = 'pre_switch_owner_restored'
                     if previous_manifest is None and p.state.exists():
                         shutil.rmtree(p.state)
@@ -1146,9 +1193,12 @@ class Job:
                 rollback_ok = False
                 if previous_manifest is not None:
                     try:
-                        restore_activation_failure(p, self.commands, self.client_factory, old_release,
-                                                   previous_manifest, ui_update=is_ui, switched=switched,
-                                                   drain_release_id=template['release_id'])
+                        restored_components = restore_activation_failure(
+                            p, self.commands, self.client_factory, old_release, previous_manifest,
+                            ui_update=is_ui, switched=switched,
+                            drain_release_id=template['release_id'])
+                        restored_state = reconciled_previous(previous_state, restored_components)
+                        af.atomic_json(p.release_state, restored_state)
                         report['rollback'] = 'code_only_succeeded'
                         rollback_ok = True
                     except BaseException as rollback_failure:
@@ -1169,7 +1219,8 @@ class Job:
                 failed_path = failure_reports / (template['release_id'] + '-failed.json')
                 report['completed_at'] = time.time(); af.atomic_json(failed_path, report)
                 if not rollback_ok:
-                    record_failed_selection(p, self.client_factory, previous_state, manifest, failed_path)
+                    record_failed_selection(p, self.client_factory, previous_state, manifest, failed_path,
+                                            operation_id=transition['operation_id'])
                     # Keep the journal on every partial/failed rollback. A retry
                     # reports the actual link and reconciles it under flock.
                 if rollback_ok:
@@ -1181,7 +1232,8 @@ class Job:
             report_path = p.reports / (template['release_id'] + '.json')
             af.atomic_json(report_path, report)
             af.atomic_json(p.release_state, release_state(previous_state, manifest, components=components,
-                                                          status='healthy', drain=drain, report=report_path))
+                                                          status='healthy', drain=drain, report=report_path,
+                                                          operation_id=transition['operation_id']))
             clear_transition(p)
             return report
 

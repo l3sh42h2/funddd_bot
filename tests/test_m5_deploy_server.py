@@ -245,7 +245,7 @@ def test_committed_healthy_target_wins_over_leftover_transition(tmp_path, monkey
     paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
     target = paths.releases / 'release-new'; target.mkdir(parents=True)
     paths.current.symlink_to(target)
-    committed = {'release_id': 'release-new', 'status': 'healthy'}
+    committed = {'release_id': 'release-new', 'status': 'healthy', 'operation_id': 'op'}
     af.atomic_json(paths.release_state, committed)
     transition = {'operation_id': 'op', 'phase': 'switched', 'target_release_id': 'release-new',
                   'db_authority': 'state', 'previous_state': {'release_id': 'release-old'}, 'ui_only': False}
@@ -254,6 +254,82 @@ def test_committed_healthy_target_wins_over_leftover_transition(tmp_path, monkey
     with pytest.raises(job.DeployFailure, match='FINALIZED_RESNAPSHOT'):
         job.recover_transition(paths, object(), object(), transition)
     assert not paths.transition.exists() and json.loads(paths.release_state.read_text()) == committed
+
+
+def test_same_release_prior_state_cannot_finalize_new_transition_operation(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release = paths.releases / 'release-same'; release.mkdir(parents=True)
+    manifest = release_manifest('release-same')
+    af.atomic_json(release / 'release-manifest.json', manifest)
+    paths.current.symlink_to(release)
+    previous = {'release_id': 'release-same', 'status': 'healthy', 'operation_id': 'old-op'}
+    af.atomic_json(paths.release_state, previous)
+    transition = {'operation_id': 'new-op', 'phase': 'switching', 'target_release_id': 'release-same',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': True}
+    af.atomic_json(paths.transition, transition)
+    rolled = []
+    monkeypatch.setattr(job, 'rollback_ui', lambda *a: rolled.append(True))
+    with pytest.raises(job.DeployFailure, match='ROLLED_BACK_RESNAPSHOT'):
+        job.recover_transition(paths, object(), object(), transition)
+    assert rolled == [True] and not paths.transition.exists()
+
+
+def test_mixed_ui_components_are_used_for_prepared_full_recovery(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release_a = paths.releases / 'release-A'; release_a.mkdir(parents=True)
+    release_b = paths.releases / 'release-B'; release_b.mkdir(parents=True)
+    manifest_a, manifest_b = release_manifest('release-A'), release_manifest('release-B')
+    af.atomic_json(release_a / 'release-manifest.json', manifest_a)
+    af.atomic_json(release_b / 'release-manifest.json', manifest_b)
+    paths.current.symlink_to(release_b)
+    previous = {'release_id': 'release-B', 'status': 'healthy', 'drain': False,
+                'components': {'core': 'release-A', 'collector': 'release-A', 'interface': 'release-B'}}
+    af.atomic_json(paths.release_state, previous)
+    transition = {'operation_id': 'op-C', 'phase': 'prepared', 'target_release_id': 'release-C',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    class Client:
+        def call(self, method, payload):
+            assert method == 'get_status'
+            return {'ready': True, 'release_id': 'release-A',
+                    'source_sha256': manifest_a['source_sha256'],
+                    'artifact_sha256': manifest_a['artifact_sha256'], 'ipc_version': 1,
+                    'schema_version': 2, 'drain': False, 'drain_epoch': 'epoch-A',
+                    'recovery_complete': True, 'execution_lock_held': True}
+    class Commands:
+        def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 0, '')
+    checked = []
+    def check_components(paths_arg, commands, fallback, **kwargs):
+        checked.append((kwargs['collector_manifest']['release_id'],
+                        kwargs['interface_manifest']['release_id']))
+    monkeypatch.setattr(job, 'wait_components', check_components)
+    with pytest.raises(job.DeployFailure, match='RECOVERED_RESNAPSHOT'):
+        job.recover_transition(paths, Commands(), Client, transition)
+    assert checked == [('release-A', 'release-B')]
+    assert json.loads(paths.release_state.read_text())['components'] == previous['components']
+
+
+def test_mixed_ui_components_normalize_after_drained_full_restore(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release_b = paths.releases / 'release-B'; release_b.mkdir(parents=True)
+    manifest_b = release_manifest('release-B')
+    af.atomic_json(release_b / 'release-manifest.json', manifest_b)
+    paths.current.symlink_to(release_b)
+    previous = {'release_id': 'release-B', 'status': 'healthy', 'drain': False,
+                'components': {'core': 'release-A', 'collector': 'release-A', 'interface': 'release-B'}}
+    af.atomic_json(paths.release_state, previous)
+    transition = {'operation_id': 'op-C', 'phase': 'fenced', 'target_release_id': 'release-C',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    class Commands:
+        def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 0, '')
+    class Client:
+        def call(self, method, payload): return {'drain': True}
+    normalized = {name: 'release-B' for name in ('collector', 'core', 'interface')}
+    monkeypatch.setattr(job, 'restore_before_switch', lambda *a, **k: normalized)
+    with pytest.raises(job.DeployFailure, match='RECOVERED_RESNAPSHOT'):
+        job.recover_transition(paths, Commands(), Client, transition)
+    assert json.loads(paths.release_state.read_text())['components'] == normalized
 
 
 def test_inactive_first_target_without_core_meta_is_fenced_by_start_config_and_lock(tmp_path):
@@ -337,8 +413,15 @@ def test_restore_before_switch_restarts_and_verifies_both_readers_before_end(tmp
                 state['ended'] = True; return {'drain': False}
             raise AssertionError(method)
     class Commands:
+        def __init__(self): self.inactive = set()
         def run(self, argv, **kwargs):
             events.append(' '.join(map(str, argv)))
+            if argv[:2] == ['systemctl', 'stop']:
+                self.inactive.add(argv[2]); return subprocess.CompletedProcess(argv, 0, '')
+            if argv[:2] == ['systemctl', 'start']:
+                self.inactive.discard(argv[2]); return subprocess.CompletedProcess(argv, 0, '')
+            if argv[:3] == ['systemctl', 'is-active', '--quiet']:
+                return subprocess.CompletedProcess(argv, 3 if argv[3] in self.inactive else 0, '')
             if argv[:3] == ['systemctl', 'show', '-p']:
                 return subprocess.CompletedProcess(argv, 0, '41\n' if 'collector' in argv[-1] else '42\n')
             if argv[0] == 'curl': return subprocess.CompletedProcess(argv, 0, json.dumps(collector))
