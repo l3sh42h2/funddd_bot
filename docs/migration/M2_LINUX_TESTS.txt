@@ -1,5 +1,6 @@
-Archive SHA256: 243026a5e9fbbff1c5e3ffc6c90c4386afdc1fdd3c06dde4b9ce50e9230297cd
-............................                                             [100%]
-28 passed in 6.56s
+Archive SHA256: 3a1105fa330e85473c57a80d56e437d6c4326d19d8bde47e67df1a064c5599f7
+Load test excluded on VPS (only local Mac).
+..............................                                           [100%]
+30 passed, 1 deselected in 8.13s
 .                                                                        [100%]
-1 passed in 0.06s
+1 passed in 0.07s
