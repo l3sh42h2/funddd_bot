@@ -1,6 +1,7 @@
 """Native exchange states translated at the adapter boundary, never in the coordinator."""
 from decimal import Decimal as D
 
+from ..fees import FeeComponent
 from ..keys import redact
 from .contracts import (AdapterError, ErrorKind, NativeRef, QuoteAmount, RawAmount,
                         Result, Status)
@@ -30,6 +31,18 @@ def _decimal(value):
 
 def _raw(value):
     return value if type(value) is int and value >= 0 else None
+
+
+def _fees_complete(fees):
+    """A receipt is complete only when every applicable native fee is exact."""
+    if not fees or any(not isinstance(fee, FeeComponent) for fee in fees):
+        return False
+    applicable = tuple(fee for fee in fees if not fee.superseded)
+    if not applicable:
+        return False
+    network = tuple(fee for fee in applicable if fee.kind == 'network_total')
+    return (bool(network) and all(fee.amount_raw is not None and not fee.estimated and fee.payer is not None
+                                  for fee in applicable))
 
 
 def _perp_ref(fill):
@@ -201,7 +214,8 @@ def sol_swap(result, spec, side):
     if amounts is not None and (status != Status.UNKNOWN or usable):
         incoming, outgoing, qty, avg = amounts
         fields = dict(spot_input_raw=incoming, spot_output_raw=outgoing, avg_price=avg)
-    fees_complete = bool(final and result.receipt in {'new', 'same', 'finality'})
+    fees_complete = bool(final and result.receipt in {'new', 'same', 'finality'} and
+                         _fees_complete(result.fees))
     return Result(status, qty, result.commitment or ('not_sent' if terminal else 'unresolved'), not terminal,
                   evidence, fees=result.fees, terminal=terminal,
                   error=ErrorKind.UNKNOWN if status == Status.UNKNOWN else

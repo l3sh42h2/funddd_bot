@@ -10,6 +10,7 @@ from funding_bot.trade.adapters.contracts import (Action, AdapterError, Capabili
                                                   LegSpec, NativeRef, Prepared, Quote, QuoteAmount,
                                                   RawAmount, Result, Status)
 from funding_bot.trade.adapters.native import Bindings, FuturesAdapter
+from funding_bot.trade import fees as native_fees, sol_exec
 from funding_bot.trade.sol_exec import SwapOutcome
 from funding_bot.trade.types import PerpFill, SwapResult
 
@@ -141,7 +142,7 @@ def test_evm_settled_without_both_positive_amounts_becomes_unknown_not_zero():
 
 def test_solana_v2_final_receipt_preserves_raw_flows_fee_completeness_and_price():
     spec = spot_spec('solana', decimals=6)
-    fee = NS(kind='network', amount=D('.000005'), currency='SOL')
+    fee, = native_fees.receipt_components(fee_lamports=5000, fee_payer='wallet:solana')
     native = SwapOutcome('ok', 'attempt-1', 'signature-1', 2_000_000, 1_000_000, 'finalized',
                          fees=(fee,), receipt='new', slot=123)
 
@@ -152,6 +153,26 @@ def test_solana_v2_final_receipt_preserves_raw_flows_fee_completeness_and_price(
     assert result.spot_output_raw == RawAmount('asset:TOKEN', 1_000_000, 6)
     assert result.executed_quantity == D(1) and result.avg_price == QuoteAmount(D(2), 'USDC')
     assert result.fees == (fee,) and result.fees_complete
+
+
+def test_solana_fee_completeness_requires_exact_network_total_and_all_known_components():
+    spec = spot_spec('solana', decimals=6)
+    base = dict(state='ok', attempt_id='attempt-1', signature='signature-1', in_raw=2_000_000,
+                out_raw=1_000_000, commitment='finalized', receipt='new')
+
+    unknown_external = sol_exec._fees(
+        {'in_mint': 'usdc', 'out_mint': 'token'}, wallet='wallet:solana', fee=5000, tip=0,
+        deposit=0, refund=0, external=None, source='receipt',
+    )
+    assert any(f.kind == 'rent_nonrefundable' and f.amount_raw is None for f in unknown_external)
+    assert not outcomes.sol_swap(SwapOutcome(fees=unknown_external, **base), spec, 'BUY').fees_complete
+    assert not outcomes.sol_swap(SwapOutcome(fees=(), **base), spec, 'BUY').fees_complete
+
+    estimated = native_fees.FeeComponent(
+        kind='network_total', asset=native_fees.NATIVE_SOL, decimals=9, amount_raw=5000,
+        payer='wallet:solana', included_in_input_output=False, estimated=True, source='estimate',
+    )
+    assert not outcomes.sol_swap(SwapOutcome(fees=(estimated,), **base), spec, 'BUY').fees_complete
 
 
 def test_solana_provisional_receipt_stays_unknown_but_keeps_actual_raw_amounts():
