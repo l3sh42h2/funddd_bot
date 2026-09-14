@@ -108,3 +108,8 @@ Checkpoint общего lifecycle и корневых операций (2026-09-
   отсутствующем owner. Эти ветки больше не логируют тело сообщения; synthetic secret regression проверяет обе.
   Последний целевой notification profile: 22 passed. Canonical report dataclasses перенесены в ipc/reports,
   Telegram re-exports сохранены для старых callers; core.commands больше напрямую не зависит от tg package.
+
+- Независимое расширенное ревью Astra завершено: P2 логирования закрыт, новых blocking findings не подтверждено.
+  AST трёх report dataclass идентичен прежнему; 28 differential stop/resume/positions сценариев сохранили
+  сообщения, durable pause/event state и параметры reconciliation. Reviewer profile: 175 passed, 2.88s.
+  Проверенный code checkpoint: 6e0c50f; это публикация ветки, не выкат и не завершение M4/M5.
