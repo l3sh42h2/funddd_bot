@@ -243,3 +243,18 @@ def test_known_value_difference_remains_actionable_mismatch() -> None:
     assert rs._flatten_diff(old, new) == [
         {"path": "accounting.fees", "baseline": "1", "target": "1.1"}
     ]
+
+
+def test_frozen_baseline_export_works_without_git(tmp_path, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise AssertionError("baseline must not require Git in an immutable artifact")
+    monkeypatch.setattr(rs.subprocess, 'run', unavailable)
+    rs._export_ref(ROOT, rs.BASELINE_REF, tmp_path / 'baseline')
+    assert (tmp_path / 'baseline/src/funding_bot/trade/engine.py').is_file()
+
+
+def test_frozen_baseline_tampering_is_refused(tmp_path):
+    fixture = tmp_path / 'tests/replay_fixtures/baseline-95354c4.tar.gz'
+    fixture.parent.mkdir(parents=True); fixture.write_bytes(b'tampered')
+    with pytest.raises(rs.SnapshotError, match='hash mismatch'):
+        rs._export_ref(tmp_path, rs.BASELINE_REF, tmp_path / 'baseline')

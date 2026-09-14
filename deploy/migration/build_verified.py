@@ -170,11 +170,12 @@ def build(root, output, *, profile_path, compatibility_path, patchnote, python=s
         env = os.environ.copy()
         env.update(profile.get('environment') or {})
         env['PYTHONPATH'] = str(exact / 'src')
-        result = subprocess.run([str(test_py), *profile['argv']], cwd=exact, env=env,
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         evidence = output.with_suffix(output.suffix + '.tests.txt')
-        evidence.write_text(result.stdout)
-        match = re.search(r'(?m)(\d+) passed(?:,| in)', result.stdout)
+        with evidence.open('w') as log:
+            result = subprocess.run([str(test_py), *profile['argv']], cwd=exact, env=env,
+                                    text=True, stdout=log, stderr=subprocess.STDOUT)
+        result_text = evidence.read_text()
+        match = re.search(r'(?m)(\d+) passed(?:,| in)', result_text)
         passed = int(match.group(1)) if match else 0
         ident = af.verification_identity(artifact=output, sources=source, dependencies=deps,
                                          runtime=runtime, profile=profile_fp)

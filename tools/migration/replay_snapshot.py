@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import importlib.util
 import json
 import os
 import socket
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 BASELINE_REF = "95354c4"
+BASELINE_REVISION = "95354c4ca74b6efc208ae406ec411559c0726076"
+BASELINE_ARCHIVE_SHA256 = "0d0ebdfd8485b87bd7056f643bb91c61e6f0f9b6863f9f0a5dd68121176acc04"
 SNAPSHOT_VERSION = 1
 
 COMMON_COLUMNS = {
@@ -541,15 +544,22 @@ def _run_revision(root: Path, snapshot: Path, work: Path) -> dict[str, Any]:
 
 def _export_ref(repo: Path, ref: str, destination: Path) -> None:
     try:
-        archive = subprocess.run(["git", "archive", "--format=tar", ref, "src/funding_bot"], cwd=repo,
-                                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tf:
-            for member in tf.getmembers():
-                target = (destination / member.name).resolve()
-                if destination.resolve() not in target.parents and target != destination.resolve():
-                    raise SnapshotError("unsafe path in git archive")
-            tf.extractall(destination, filter="data")
-    except (OSError, subprocess.CalledProcessError, tarfile.TarError) as exc:
+        frozen = repo / "tests/replay_fixtures/baseline-95354c4.tar.gz"
+        if ref in (BASELINE_REF, BASELINE_REVISION) and frozen.is_file():
+            archive = frozen.read_bytes()
+            if hashlib.sha256(archive).hexdigest() != BASELINE_ARCHIVE_SHA256:
+                raise SnapshotError("frozen baseline archive hash mismatch")
+        else:
+            archive = subprocess.run(["git", "archive", "--format=tar", ref, "src/funding_bot"], cwd=repo,
+                                     check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        # Same extractor as the immutable build; supported on target Python 3.11.2.
+        helper = Path(__file__).resolve().parents[2] / "deploy/migration/artifacts.py"
+        spec = importlib.util.spec_from_file_location("_snapshot_artifacts", helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tf:
+            module.extract_regular_files(tf, destination)
+    except (OSError, subprocess.CalledProcessError, tarfile.TarError, RuntimeError) as exc:
         raise SnapshotError(f"cannot export baseline {ref}: {exc}") from exc
 
 

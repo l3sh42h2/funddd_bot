@@ -41,3 +41,17 @@ creation, symlink/traversal refusal and sanitized executable permissions; archiv
 ownership and setuid bits are never applied. Regression forbids extractall use.
 Updated deploy profile: 50 passed, 1 skipped. The failed preliminary build did not
 produce an accepted receipt and did not stop or switch the production bot.
+
+The exact artifact intentionally has no Git database. Snapshot replay tests now
+carry a frozen source-only baseline from 95354c4ca74b6efc208ae406ec411559c0726076,
+with a pinned archive hash and tamper refusal. Other requested revisions still
+use explicit Git export. Replay uses the Python-3.11.2-compatible extractor.
+The baseline contains source files only, no runtime/configuration/private data.
+Independent Astra review confirmed byte-for-byte Git archive provenance and all
+15 snapshot tests passing in a copy without .git and with an empty PATH.
+Build test output is written while tests run, and the full profile now records
+its ten slowest tests and skip reasons. No tests are omitted for speed.
+Combined local profile: 65 passed, 1 skipped. Exact-value scanning ran wholly on
+VPS, including decompressed baseline sources: passed. Public DEX_EVM_ADDRESS and
+ASTER_USER literals were excluded only when matching a strict EVM address format;
+secret values and hashes were not exported by that scanner.
