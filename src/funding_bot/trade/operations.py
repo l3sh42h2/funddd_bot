@@ -17,6 +17,8 @@ class SpotSettlement:
     output_raw: int = 0
 
     def __post_init__(self):
+        if type(self.executed) is not bool:
+            raise ValueError('settlement requires an explicit proven execution verdict')
         for value in (self.input_raw, self.output_raw):
             if type(value) is not int or value < 0:
                 raise ValueError('settlement quantities must be nonnegative raw integers')

@@ -96,8 +96,10 @@ class CoreService:
             with self._drain_lock:
                 if method == 'begin_drain':
                     self.drain = True
-                n = self.conns.get().execute("SELECT count(*) FROM core_requests WHERE state IN ('queued','running')").fetchone()[0]
-                return dict(drain=self.drain, pending_requests=n, busy=self.engine.busy(), ready=self.ready,
+                from .preflight import inventory
+                state = inventory(self.conns.get())
+                return dict(drain=self.drain, pending_requests=state['pending'].get('requests', 0),
+                            busy=self.engine.busy(), ready=self.ready, journal=state,
                             safe_to_switch=False, switch_gate='M5_full_recovery_and_schema_gate_required')
         if uid != self.ui_uid:
             if method == 'get_status':

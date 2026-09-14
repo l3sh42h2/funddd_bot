@@ -115,3 +115,27 @@ def test_wrong_operation_and_zero_flow_proof(journal):
     assert c.settle_spot(cid, SpotSettlement(False), operation_id=oid, reserve_raw=100)
     assert store.operation_remaining(store.get_operation(con, oid)) == 100
     assert not c.settle_spot(cid, SpotSettlement(False), operation_id=oid, reserve_raw=100)
+
+
+def test_cash_flow_projection_partial_fill_and_unknown_amount(journal):
+    from funding_bot.trade.ledger_flows import spot_quote_flows, perp_quote_flows
+    con, oid, cid = journal
+    c = OperationController(con)
+    c.begin_spot(cid, operation_id=oid, reserve_raw=100)
+    c.settle_spot(cid, SpotSettlement(True, 60, 57), operation_id=oid, reserve_raw=100)
+    did = store.get_operation(con, oid)['deal_id']
+    flows = spot_quote_flows(con, did, 6)
+    assert flows.net == D('-.000060') and not flows.missing
+    con.execute('INSERT INTO perp_orders(client_id,side,state,executed_qty,cum_quote) VALUES(?,?,?,?,?)',
+                (f'fb-{did}-e01-c1-a1', 'SELL', 'PARTIALLY_FILLED', '2', '10'))
+    # Distinct native order: only the proven partial quantity/quote is included.
+    con.execute('INSERT INTO perp_orders(client_id,side,state,executed_qty,cum_quote) VALUES(?,?,?,?,?)',
+                (f'fb-{did}-x01-c1-a1', 'BUY', 'FILLED', '1', '4'))
+    assert perp_quote_flows(con, did).net == D(6)
+    # Same prefix substring in another deal cannot pollute this deal.
+    con.execute('INSERT INTO perp_orders(client_id,side,state,cum_quote) VALUES(?,?,?,?)',
+                (f'fb-{did}OTHER-x01-c1-a1', 'BUY', 'FILLED', '9000'))
+    assert perp_quote_flows(con, did).net == D(6)
+    con.execute('UPDATE perp_orders SET cum_quote=NULL WHERE client_id=?', (f'fb-{did}-x01-c1-a1',))
+    assert perp_quote_flows(con, did).net is None
+    assert perp_quote_flows(con, did).legacy_net == D(10)

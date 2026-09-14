@@ -24,6 +24,7 @@ import json, logging, time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable
+from .ledger_flows import perp_quote_flows
 from .operations import OperationController, SpotSettlement
 from .. import config
 from . import marks, report, store, tconfig
@@ -779,13 +780,8 @@ def _upnl(con, deal_id: str, short: D | None, mark: D | None) -> D | None:
     """PnL шорта по журналу заявок: продано − откуплено − шорт × марк (без комиссий и фандинга)."""
     if short is None or mark is None:
         return None
-    prefix = f"fb-{deal_id}-"
-    sell = buy = ZERO
-    for o in con.execute("SELECT side, cum_quote FROM perp_orders WHERE substr(client_id,1,?)=? AND state IN "
-                         "('FILLED','PARTIALLY_FILLED')", (len(prefix), prefix)):
-        q = dget(o["cum_quote"]) or ZERO
-        sell, buy = (sell + q, buy) if o["side"] == "SELL" else (sell, buy + q)
-    return sell - buy - short * mark
+    return perp_quote_flows(con, deal_id).legacy_net - short * mark
+
 
 
 # --- проверки «статус» / trade-check ------------------------------------------------------------------------

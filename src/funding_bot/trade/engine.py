@@ -31,6 +31,7 @@ from ..symbols import norm_symbol_factor
 from . import owner as owner_mod, planner, report, store, tconfig
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
+from .ledger_flows import spot_quote_flows, perp_quote_flows
 from .exposure import Exposure
 from .operations import OperationController, SpotSettlement
 from .planner import PlanRefused
@@ -2803,21 +2804,9 @@ class Engine:
         """Итог закрытой сделки: спот (выручка выходов − стоимость входов), перп (продано − откуплено − комиссии),
         фандинг (income с открытия; в симуляции не начисляется — «—»)."""
         con = self.conns.get()
-        ent = ext = ZERO
-        for c in con.execute("SELECT c.dex_in, c.dex_out, i.kind FROM clips c JOIN intents i ON c.intent_id=i.id "
-                             "WHERE i.deal_id=? AND c.state IN ('DEX_OK','PERP_SENT','BALANCED','HEDGE_DEFICIT')",
-                             (run.did,)):
-            if c["kind"] == "entry":
-                ent += D(int(c["dex_in"] or 0)) / D(10) ** run.sdec
-            elif c["kind"] in ("exit", "undo"):
-                ext += D(int(c["dex_out"] or 0)) / D(10) ** run.sdec
-        spot = ext - ent
-        prefix = f"fb-{run.did}-"
-        sell = buy = ZERO
-        for o in con.execute("SELECT side, cum_quote FROM perp_orders WHERE substr(client_id,1,?)=? AND state IN "
-                             "('FILLED','PARTIALLY_FILLED')", (len(prefix), prefix)):
-            q = dget(o["cum_quote"]) or ZERO
-            sell, buy = (sell + q, buy) if o["side"] == "SELL" else (sell, buy + q)
+        spot = spot_quote_flows(con, run.did, run.sdec).legacy_net
+        perps = perp_quote_flows(con, run.did)
+        sell, buy = perps.credit, perps.debit
         fills = deal_fills(con, run.did)
         perp = (sell - buy - sum((abs(dget(f["commission_abs"]) or ZERO) for f in fills), ZERO)) if fills else None
         fund = None

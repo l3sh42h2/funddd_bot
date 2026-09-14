@@ -26,6 +26,7 @@ import json, logging, time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping
+from .ledger_flows import spot_quote_flows, filled_orders
 from . import store
 from .keys import redact
 
@@ -191,13 +192,8 @@ def ledger(con, deal: Mapping, *, fee_rate: D | None) -> Ledger:
     qdec = int(inst.get("quote_dec") or 6)
     wallet = None
     L = Ledger(quote_dec=qdec, sim=bool(d.get("sim")))
-    qs = ",".join("?" * len(FLOW_CLIPS))
-    for r in con.execute(f"SELECT c.id, c.dex_in, c.dex_out, i.kind FROM clips c JOIN intents i ON c.intent_id = i.id "
-                         f"WHERE i.deal_id=? AND c.state IN ({qs}) ORDER BY c.id", (did, *FLOW_CLIPS)):
-        if r[3] == "entry":
-            L.spot_in += D(int(r[1] or 0)) / D(10) ** qdec
-        elif r[3] == "exit":
-            L.spot_out += D(int(r[2] or 0)) / D(10) ** qdec
+    flows = spot_quote_flows(con, did, qdec, exit_kinds=("exit",))
+    L.spot_in, L.spot_out = flows.debit, flows.credit
     try:
         L.routes = tuple(p for (p,) in con.execute(
             "SELECT a.path FROM sol_tx_attempts a JOIN clips c ON a.clip_ref = CAST(c.id AS TEXT) JOIN intents i ON "
@@ -229,8 +225,7 @@ def ledger(con, deal: Mapping, *, fee_rate: D | None) -> Ledger:
             fills = {}
     prefix = f"fb-{did}-"
     fee_total: D | None = ZERO
-    for o in con.execute("SELECT client_id, side, cum_quote, executed_qty FROM perp_orders WHERE substr(client_id, 1, ?)=? "
-                         "AND state IN (?,?)", (len(prefix), prefix, *FILLED)):
+    for o in filled_orders(con, did):
         q = _dv(o["cum_quote"]) or ZERO
         if o["side"] == "SELL":
             L.perp_sell += q

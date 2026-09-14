@@ -1,0 +1,8 @@
+Archive SHA256: d1562e3cd1cda367185b680127eb8280f823e113c59f87e356e176ebbe18a21a
+Checkpoint only, not M4/M5 acceptance. Synthetic functional tests in temporary directory; no production DB, keys, services, or load tests.
+........................................................................ [ 45%]
+........................................................................ [ 91%]
+..............                                                           [100%]
+158 passed in 82.12s (0:01:22)
+.                                                                        [100%]
+1 passed in 0.05s

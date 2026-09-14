@@ -17,3 +17,12 @@ Scope: OperationController, Ledger/recovery/replay, архитектурные �
 - VPS read-only baseline: исходные src/deploy/tests/pyproject совпадают с M0; quick_check=ok,
   одна OPEN, одна ABORTED, approved/running intents и незавершённые отправки не обнаружены.
   Это снимок журналов, не внешняя сверка биржевых балансов. Боевых изменений нет.
+
+Следующий checkpoint:
+- Общие проекции quote-потоков подключены к EVM PnL, оценке шорта и SOL ledger.
+- Подготовлены read-only preflight и primitives verified artifact/flock/STALE_BASE/SQLite backup.
+  Deploy-only drain status показывает журналы, но переключение по-прежнему запрещено.
+- Полный локальный набор: 2219 passed, 3 skipped, 148.03s; последующие preflight guards — 8 passed, 0.07s.
+- Подробный статус и оставшиеся обязательные работы: docs/migration/M4_M5_PROGRESS.md.
+- M4/M5 НЕ завершены, production НЕ изменён. Полный lifecycle, replay, независимое ревью и переключение впереди.
+- Linux checkpoint: 158 passed / 82.12s, DAC 1 passed / 0.05s, без live-данных и нагрузочного теста.
