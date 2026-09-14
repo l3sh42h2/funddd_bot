@@ -92,8 +92,9 @@ def _even(e, did, m=1):
 def test_forged_hash_on_entry_fails_before_anything(tmp_path):
     e = fx.live_env(tmp_path)
     p = _propose(e)
+    assert store.approve_intent(e.con,p.intent_id,p.nonce)  # corrupt after the new approval barrier
     _set_spec(e, p.intent_id, inst_hash="0" * 16)
-    fx.run_approved(e, p)
+    e.engine.execute(p.intent_id)
     assert _snap(e) == ZERO_SNAP
     _failed(e, p.intent_id, HASH_TEXT)
     assert _state(e, p.deal_id) == DealState.ABORTED
@@ -113,9 +114,10 @@ def test_forged_hash_on_open_deal_fails_for_every_intent_kind(tmp_path, kind):
             "exit_perp": lambda: e.desk.propose_exit(p.deal_id, None, True, chat=fx.OWNER),
             "rehedge": lambda: e.desk.propose_fix("rehedge", p.deal_id, chat=fx.OWNER),
             "undo": lambda: e.desk.propose_fix("undo", p.deal_id, chat=fx.OWNER)}[kind]()
+    assert store.approve_intent(e.con,prop.intent_id,prop.nonce)
     _set_spec(e, prop.intent_id, inst_hash="0" * 16)
     before = _snap(e)
-    fx.run_approved(e, prop)
+    e.engine.execute(prop.intent_id)
     assert _snap(e) == before
     _failed(e, prop.intent_id, HASH_TEXT)
     assert _state(e, p.deal_id) == DealState.OPEN, "открытая сделка не тронута"
@@ -141,9 +143,10 @@ def test_deal_column_changed_after_plan_sends_nothing(tmp_path, col, val):
     e = fx.live_env(tmp_path)
     p = _open(e)
     x = e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER)
+    assert store.approve_intent(e.con,x.intent_id,x.nonce)
     e.con.execute(f"UPDATE deals SET {col}=? WHERE id=?", (val, p.deal_id))
     before = _snap(e)
-    fx.run_approved(e, x)
+    e.engine.execute(x.intent_id)
     assert _snap(e) == before
     _failed(e, x.intent_id, "расходятся")
     # и новый план по такой сделке — отказ у Desk, а не у кнопки
@@ -165,9 +168,10 @@ def test_intent_without_fingerprint_asks_to_resend(tmp_path, kind):
             prop = e.desk.propose_fix("rehedge", p.deal_id, chat=fx.OWNER)
         else:
             prop = e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER)
+    assert store.approve_intent(e.con,prop.intent_id,prop.nonce)
     _set_spec(e, prop.intent_id, inst_hash=None, instrument=None)
     before = _snap(e)
-    fx.run_approved(e, prop)
+    e.engine.execute(prop.intent_id)
     assert _snap(e) == before
     _failed(e, prop.intent_id, RESEND)
     assert RESEND in e.hooks.reports[-1]
@@ -440,8 +444,9 @@ def test_dqa9q_exit_after_update_uses_frozen_instrument(tmp_path, started):
     e.desk.table_loader = _no_table
     # намерение прежнего кода (без отпечатка), одобренное до выката: старт его гасит, а если нет — не исполняется
     x0 = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
+    assert store.approve_intent(e.con,x0.intent_id,x0.nonce)
     _set_spec(e, x0.intent_id, inst_hash=None, instrument=None)
-    fx.run_approved(e, x0)
+    e.engine.execute(x0.intent_id)
     _failed(e, x0.intent_id, RESEND)
     assert fx.sends(e) == (0, 0) and _state(e, "DQA9Q") == DealState.OPEN
     # частичный и полный выход — по инструменту сделки (бэкфилл или вердикт на лету: тот же отпечаток)

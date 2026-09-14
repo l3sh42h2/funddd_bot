@@ -221,18 +221,19 @@ def test_unresolved_old_root_blocks_new_approval_and_rolls_back(con, old_state, 
     assert store.operation_of_intent(con, iid)["state"] == OpState.PROPOSED
 
 
-def test_exit_target_is_exact_single_approved_snapshot(con):
+@pytest.mark.parametrize('amounts', [(123,), (60,63)])
+def test_exit_target_is_exact_approved_snapshot(con,amounts):
     d = deal(con)
     approval = {"side": "exit", "target_raw": 123, "min_receive": 90}
     iid, _ = roots.propose(
         con, deal=d, kind="exit", spec=spec("exit", approval, units=123, all=True, perp_only=False),
-        plan=plan(d["id"], "exit", 123), profile_id="bsc_okx_aster", chat=None,
+        plan=plan(d["id"], "exit", *amounts), profile_id="bsc_okx_aster", chat=None,
     )
     op = store.operation_of_intent(con, iid)
     assert (op["target_kind"], op["target_asset"], op["target_decimals"], op["target_raw"]) == (
         "full_position_snapshot", d["token"], d["token_dec"], "123",
     )
-    with pytest.raises(store.StoreError, match="single spot clip"):
+    with pytest.raises(store.StoreError, match="sum of its spot clips"):
         roots.propose(
             con, deal=d, kind="exit", spec=spec("exit", approval, units=123, all=False, perp_only=False),
             plan=plan(d["id"], "exit", 100), profile_id="bsc_okx_aster", chat=None,

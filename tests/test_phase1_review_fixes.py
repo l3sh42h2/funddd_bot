@@ -255,19 +255,20 @@ def test_partial_exit_plan_shows_the_contracts_the_executor_buys(tmp_path):
 
 @pytest.mark.parametrize("second_layer", [False, True])
 def test_approved_partial_exit_is_not_turned_into_a_full_one_at_the_button(tmp_path, monkeypatch, second_layer):
-    """Одобрен частичный; к кнопке цель такова, что исполнитель откупил бы весь шорт (здесь цель раздута правкой spec):
+    """После одобрения частичного цель изменена так, что исполнитель откупил бы весь шорт (правкой spec):
     перекотировка отказывает, а если её обойти — сам исполнитель, до любой отправки."""
     e = t12.mult_env(tmp_path)
     did = t12.enter(e).deal_id
     x = e.desk.propose_exit(did, D(50), False, chat=fx.OWNER)             # 1 222 токена — частичный
     assert t11._spec_of(e.con, x.intent_id)["all"] is False
     big = int(D(1500) * fx.E18)
+    assert store.approve_intent(e.con,x.intent_id,x.nonce)  # second/executor-layer probe after approval
     tr._set_spec(e, x.intent_id, units=big)
     if second_layer:
         fake = replace(x.plan, clips=[ClipPlan(seq=1, dex_in_units=big, children=x.plan.clips[0].children)])
         monkeypatch.setattr(e.desk, "replan", lambda it, deal: fake)
     before, appr = fx.sends(e), list(e.spot.approvals)
-    fx.run_approved(e, x)
+    e.engine.execute(x.intent_id)
     assert fx.sends(e) == before and e.spot.approvals == appr
     assert store.get_intent(e.con, x.intent_id)["status"] == IntentStatus.FAILED
     if second_layer:

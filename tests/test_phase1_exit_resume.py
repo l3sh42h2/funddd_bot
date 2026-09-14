@@ -162,21 +162,22 @@ def test_resume_of_large_partial_exit_does_not_turn_into_full_exit(tmp_path):
     assert _sold(e, x1.intent_id) + _sold(e, r.intent_id) == _spec(e, x1.intent_id)["units"]
 
 
-def test_rest_above_position_sells_what_is_there_and_stays_partial_in_texts(tmp_path):
-    """Край: остаток цели больше спота сделки (цепочка сама к этому не приходит — цель ≤ позиции; здесь цель раздута
-    правкой spec). Продаётся весь спот, намерение остаётся частичным (all False) — шапка сообщения та же, что у кнопки
-    и строки закрытия (не «всё»); хедж по чеку откупает весь шорт, сделка закрывается штатно."""
+def test_mutated_legacy_spec_cannot_increase_durable_root_target(tmp_path):
+    """M4: редактирование прежнего spec не увеличивает уже одобренную корневую цель."""
     e = fx.live_env(tmp_path, clip="50")
     p = _open(e)
     x1 = _interrupted(e, p.deal_id, 100)
+    approved=_spec(e,x1.intent_id)['units']
+    remaining=approved-_sold(e,x1.intent_id)
     _set_spec(e, x1.intent_id, units=_spec(e, x1.intent_id)["units"] * 10)
     r = e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
     s = _spec(e, r.intent_id)
-    assert s["all"] is False and s["units"] == eng.deal_book(e.con, p.deal_id).tokens_raw
+    assert s["all"] is False and s["units"] == remaining < eng.deal_book(e.con,p.deal_id).tokens_raw
     head = views.intent_head(store.get_intent(e.con, r.intent_id), store.get_deal(e.con, p.deal_id))
     assert f"<b>{head.title}</b>" in r.html and "всё" not in head.title, (head.title, r.html)
     fx.run_approved(e, r)
-    assert _state(e, p.deal_id) == DealState.CLOSED and e.perp.pos == 0 and e.spot.bal[fx.TOKEN] == 0
+    assert _sold(e,x1.intent_id)+_sold(e,r.intent_id)==approved
+    assert _state(e,p.deal_id)==DealState.OPEN and e.perp.pos < 0 and e.spot.bal[fx.TOKEN] > 0
 
 
 # ==== 4. цена пула сдвинулась между стопом и «продолжить» — остаток в токенах тот же ==================================
@@ -331,7 +332,9 @@ def test_resume_of_full_exit_still_sells_everything(tmp_path):
     assert _status(e, x.intent_id) == IntentStatus.PARTIAL
     r = e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
     s = _spec(e, r.intent_id)
-    assert s["all"] is True and not s.get("resume") and s["usd"] is None
+    assert s["all"] is True and s.get("resume") is True
+    assert s['units']==store.operation_remaining(store.operation_of_intent(e.con,r.intent_id))
+    assert store.operation_of_intent(e.con,r.intent_id)['id']==store.operation_of_intent(e.con,x.intent_id)['id']
     fx.run_approved(e, r)
     assert _state(e, p.deal_id) == DealState.CLOSED and e.perp.pos == 0 and e.spot.bal[fx.TOKEN] == 0
 

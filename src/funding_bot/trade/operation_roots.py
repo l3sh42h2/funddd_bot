@@ -76,8 +76,9 @@ def _planned_raw(kind: str, spec: Mapping, plan: Any) -> int:
         if spec.get("perp_only"):
             raise store.StoreError("perp-only intent has no spot root target")
         approved = _raw(spec.get("units"), "exit approved token snapshot", positive=True)
-        if len(clips) != 1 or _raw(clips[0].get("dex_in_units"), "exit clip input", positive=True) != approved:
-            raise store.StoreError("exit approved token snapshot does not match its single spot clip")
+        amounts = [_raw(c.get("dex_in_units"), "exit clip input", positive=True) for c in clips]
+        if not amounts or sum(amounts) != approved:
+            raise store.StoreError("exit approved token snapshot does not match the sum of its spot clips")
         return approved
     raise store.StoreError(f"intent kind {kind!r} has no spot root target")
 
