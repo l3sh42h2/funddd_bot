@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 import sqlite3
 import os
+import tempfile
 
 import pytest
 
@@ -454,29 +455,30 @@ def test_existing_release_revalidates_complete_installed_identity(tmp_path, monk
 
 @pytest.mark.skipif(sys.platform != 'linux' or os.geteuid() != 0,
                     reason='isolated Linux root DAC fixture')
-def test_shared_pace_dac_allows_two_uids_but_denies_private_controls(tmp_path):
+def test_shared_pace_dac_allows_two_uids_but_denies_private_controls():
     gid, uid1, uid2 = 61001, 61002, 61003
-    os.chmod(tmp_path, 0o755)
-    shared = tmp_path / 'shared'; shared.mkdir(mode=0o770)
-    pace = shared / 'okxdex.pace'; pace.write_text('0\n')
-    private = tmp_path / 'core.env'; private.write_text('TOKEN=fixture\n')
-    os.chown(shared, 0, gid); os.chown(pace, 0, gid); os.chmod(pace, 0o660)
-    os.chown(private, 0, 0); os.chmod(private, 0o600)
-    for uid in (uid1, uid2):
-        pid = os.fork()
-        if pid == 0:
-            try:
-                os.setgroups([gid]); os.setgid(gid); os.setuid(uid)
-                fd = os.open(pace, os.O_RDWR); os.close(fd)
+    with tempfile.TemporaryDirectory(prefix='funding-m5-dac-', dir='/tmp') as raw:
+        root = Path(raw); os.chmod(root, 0o755)
+        shared = root / 'shared'; shared.mkdir(mode=0o770)
+        pace = shared / 'okxdex.pace'; pace.write_text('0\n')
+        private = root / 'core.env'; private.write_text('TOKEN=fixture\n')
+        os.chown(shared, 0, gid); os.chown(pace, 0, gid); os.chmod(pace, 0o660)
+        os.chown(private, 0, 0); os.chmod(private, 0o600)
+        for uid in (uid1, uid2):
+            pid = os.fork()
+            if pid == 0:
                 try:
-                    os.open(private, os.O_RDONLY)
-                except PermissionError:
-                    os._exit(0)
-                os._exit(2)
-            except BaseException:
-                os._exit(3)
-        _, status = os.waitpid(pid, 0)
-        assert os.waitstatus_to_exitcode(status) == 0
+                    os.setgroups([gid]); os.setgid(gid); os.setuid(uid)
+                    fd = os.open(pace, os.O_RDWR); os.close(fd)
+                    try:
+                        os.open(private, os.O_RDONLY)
+                    except PermissionError:
+                        os._exit(0)
+                    os._exit(2)
+                except BaseException:
+                    os._exit(3)
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
 
 
 def test_ui_only_requires_identical_core_collector_runtime_and_protocol():
