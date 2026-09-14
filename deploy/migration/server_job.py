@@ -709,7 +709,7 @@ def switch_link(paths, release):
     os.replace(tmp, paths.current)
 
 
-def health_matches(value, manifest, *, require_drain=True, require_recovery=True):
+def health_matches(value, manifest, *, require_drain=True, require_recovery=True, database=None):
     if not isinstance(value, dict) or value.get('ready') is not True:
         raise DeployFailure('core readiness false')
     if value.get('release_id') != manifest['release_id'] or value.get('source_sha256') != manifest['source_sha256']:
@@ -718,6 +718,9 @@ def health_matches(value, manifest, *, require_drain=True, require_recovery=True
         raise DeployFailure('core build identity mismatch')
     if value.get('schema_version') != manifest['schema_version']:
         raise DeployFailure('core schema version mismatch')
+    if database is not None and (value.get('min_reader') != database['min_reader'] or
+                                 value.get('schema_version') != database['schema_version']):
+        raise DeployFailure('core reader floor differs from authoritative database')
     if require_drain and (value.get('drain') is not True or not value.get('drain_epoch')):
         raise DeployFailure('new core did not retain drain')
     if require_recovery and value.get('recovery_complete') is not True:
@@ -1309,6 +1312,8 @@ class Job:
                     self.commands.run(['systemctl', 'start', 'funding_bot-core.service'])
                     health = wait_core_ready(self.client_factory(), manifest, commands=self.commands,
                                              drain_release_id=drain_owner_release)
+                    if manifest['schema_version'] >= 4:
+                        health_matches(health, manifest, database=database_info(p.state / 'core/trade.db'))
                     epoch = health['drain_epoch']
                     validate_drain(self.client_factory().call('get_drain_state', {'drain_epoch': epoch}),
                                    release_id=drain_owner_release, epoch=epoch, require_safe=True)

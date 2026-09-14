@@ -253,3 +253,27 @@ def test_missing_owner_logs_never_include_escaped_message_bodies(caplog):
     assert len(caplog.records) == 2
     assert secret not in caplog.text and escape(secret) not in caplog.text
     assert 'Synthetic' not in caplog.text and 'не доставлено' in caplog.text
+
+
+def test_health_reports_reader_floor_activated_after_service_construction(tmp_path):
+    from funding_bot.core.service import CoreService
+    cfg = SimpleNamespace(owner_id=42, mode='dry', get=lambda *a: None,
+                          profile_enabled=lambda *a: False, live_missing=lambda *a: [])
+    engine = SimpleNamespace(pause_evt=threading.Event(), busy=lambda: False)
+    conns = Conns(tmp_path/'trade.db')
+    service = CoreService(conns, SimpleNamespace(), engine, lambda *a: None, owner_loader=lambda: cfg)
+    assert service.health()['min_reader'] == 2
+    store.require_reader(conns.get(), 4)
+    assert service.health()['min_reader'] == store.schema_info(conns.get())['min_reader'] == 4
+
+
+def test_deploy_readiness_rejects_stale_runtime_reader_floor():
+    manifest = dict(release_id='candidate', source_sha256='s', artifact_sha256='a', ipc_version=1,
+                    schema_version=4)
+    health = dict(manifest, ready=True, drain=True, drain_epoch='e', recovery_complete=True,
+                  execution_lock_held=True, min_reader=2)
+    db = dict(schema_version=4, min_reader=4)
+    with pytest.raises(job.DeployFailure, match='reader floor'):
+        job.health_matches(health, manifest, database=db)
+    health['min_reader'] = 4
+    assert job.health_matches(health, manifest, database=db) == health

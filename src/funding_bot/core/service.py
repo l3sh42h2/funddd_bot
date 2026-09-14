@@ -103,6 +103,12 @@ class CoreService:
         self.bot.say('♻️ Торговое ядро запущено. Прерванные команды автоматически не повторяются; нужен свежий план.')
 
     def health(self):
+        # Reader floor can rise on startup or the first incompatible execution.
+        # Report the authoritative current value, not the constructor snapshot.
+        row = self.conns.get().execute('SELECT version,min_reader FROM schema_version WHERE id=1').fetchone()
+        if row is None:
+            raise ValueError('missing trading schema version')
+        self.schema_version, self.min_reader = int(row[0]), int(row[1])
         ready = (self.ready and not self.stop.is_set() and 0 <= time.time()-self.last_loop < 5
                  and all(t.is_alive() for t in self.workers))
         return dict(ipc_version=VERSION, schema_version=self.schema_version, min_reader=self.min_reader,

@@ -34,3 +34,9 @@ Genuine unverified legacy — activation blocker; текущий провере�
 только DQA9Q OPEN с verified units. Перед установкой срез проверяется заново.
 Ни scoped accounting attribution, ни frozen IDs/JSON, ни исторический PnL не менялись.
 Второй пакет общего координатора пока не реализован; production остаётся aa446f2.
+
+Дополнительная проверка запуска: captured startup time, health читает actual reader floor,
+installer schema4 сверяет его с БД перед undrain; conflicting scoped account блокирует
+legacy adoption. Actual core startup → full/partial DQA9Q exit: passed без реальной сети.
+Профили: 83 passed/1 skipped (scope, notifications, installer), локальные IPC/process
+20 passed/4.88 s вне socket sandbox; ранее внутри sandbox были два запрещённых bind.

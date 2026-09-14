@@ -256,7 +256,7 @@ from funding_bot.core import commands
 cfg=SimpleNamespace(owner_id=71234, profile_enabled=lambda _:False, frozen=lambda:{})
 bootstrap.owner.load=lambda:cfg
 bootstrap.build_trader_legs=lambda *a,**k:(SimpleNamespace(mode='dry'),lambda _:None,None,'dry',False)
-commands.reconcile.startup=lambda *a,**k:SimpleNamespace(expired=[],deals=[],wallet_problems=[])
+commands.reconcile.startup=lambda *a,**k:SimpleNamespace(expired=[],deals=[],wallet_problems=[],inst_backfill=[])
 raise SystemExit(bootstrap.run_core())
 ''')
         env=dict(os.environ,FUNDING_BOT_RUNTIME=str(root),FUNDING_CORE_SOCKET=str(root/'core.sock'),

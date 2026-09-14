@@ -16,6 +16,10 @@ from ..types import InstrumentSpec
 KIND = 'execution_account_binding_v1'
 
 
+class MissingExecutionBinding(AdapterError):
+    """Only absent evidence may trigger legacy adoption; contradictions may not."""
+
+
 def _saved(con, deal):
     rows = con.execute('SELECT json FROM exec_events WHERE deal_id=? AND kind=?',
                        (deal['id'], KIND)).fetchall()
@@ -63,7 +67,9 @@ def account_for(con, deal, native):
                               scoped and scoped.account_scope) if x]
     if scoped and (scoped.venue != deal['perp_venue'] or scoped.symbol != deal['symbol']):
         raise AdapterError(ErrorKind.IDENTITY, 'accounting proof differs from execution leg')
-    if not candidates or any(x != current for x in candidates):
+    if not candidates:
+        raise MissingExecutionBinding(ErrorKind.IDENTITY, 'frozen execution account is absent; binding required')
+    if any(x != current for x in candidates):
         raise AdapterError(ErrorKind.IDENTITY, 'frozen execution account is absent or differs; binding required')
     return current
 
@@ -153,6 +159,10 @@ def _legacy_candidate(con, deal, native):
     inst = InstrumentSpec.from_json(deal['inst_json'])
     if not inst.verified:
         raise AdapterError(ErrorKind.IDENTITY, 'legacy instrument is unverified')
+    try:
+        account_for(con, deal, native)
+    except MissingExecutionBinding:
+        pass
     account = native_account(native, sim=False)
     original = store.get_deal(con, deal['id'])
     if original != deal or native.venue != deal['perp_venue']:
@@ -224,7 +234,7 @@ def prepare_active_accounts(con, legs_fn):
                 raise AdapterError(ErrorKind.IDENTITY, 'active frozen wallet/network differs')
             try:
                 account_for(con, deal, legs.perp)
-            except AdapterError:
+            except MissingExecutionBinding:
                 candidates.append(_legacy_candidate(con, deal, legs.perp))
         except Exception as error:
             failures.append(deal['id'] + ':' + type(error).__name__)

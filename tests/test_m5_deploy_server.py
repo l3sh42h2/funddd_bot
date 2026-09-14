@@ -820,3 +820,15 @@ def test_migration_refuses_missing_mandatory_environment_without_live_fallback(t
     with pytest.raises(job.DeployFailure, match='mandatory legacy environment'):
         job.migrate_legacy_runtime(paths, None, 'release-12345678', expected_configuration=expected)
     assert not paths.state.exists()
+
+
+def test_evm_floor4_refuses_legacy_rollback_before_stopping_or_switching(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path/'opt', tmp_path/'state', tmp_path/'legacy')
+    manifest = dict(schema_version=3, compatible_readers=[1, 2, 3])
+    monkeypatch.setattr(job, 'database_info', lambda _: dict(schema_version=4, min_reader=4))
+    class Commands:
+        def run(self, *a, **kw):
+            pytest.fail('incompatible rollback must not stop current owner')
+    monkeypatch.setattr(job, 'switch_link', lambda *a: pytest.fail('must not switch incompatible reader'))
+    with pytest.raises(job.DeployFailure, match='ROLLBACK_READER_INCOMPATIBLE'):
+        job.rollback_release(paths, Commands(), lambda: pytest.fail('no IPC mutation'), tmp_path/'old', manifest)

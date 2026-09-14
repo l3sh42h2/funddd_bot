@@ -188,11 +188,13 @@ def test_existing_scoped_account_also_activates_reader_floor(tmp_path):
     assert not con.execute('SELECT 1 FROM exec_events WHERE kind=?', (KIND,)).fetchone()
 
 
-def test_core_startup_calls_real_migration_gate_and_preserves_backfill(tmp_path):
+@pytest.mark.parametrize('exit_usd', [None, D(100)])
+def test_core_startup_calls_real_migration_gate_and_preserves_backfill(tmp_path, exit_usd):
     from funding_bot.core.commands import Bot
     from test_phase1_instrument import _dqa9q_env
     import test_marks as tm
-    from test_trade_engine import sends
+    from test_trade_engine import sends, run_approved, OWNER
+    from funding_bot.trade.engine import deal_book
     e = _dqa9q_env(tmp_path)
     bot = object.__new__(Bot)
     bot.conns, bot.legs, bot.clock = e.conns, e.legs, lambda: tm.NOW
@@ -203,3 +205,65 @@ def test_core_startup_calls_real_migration_gate_and_preserves_backfill(tmp_path)
     assert store.schema_info(e.con)['min_reader'] == 4
     assert store.get_deal(e.con, 'DQA9Q')['state'] == 'OPEN'
     assert bot.startup().inst_backfill == []
+    frozen = store.get_deal(e.con, 'DQA9Q')['inst_json']
+    book = deal_book(e.con, 'DQA9Q')
+    bot.startup()
+    assert deal_book(e.con, 'DQA9Q') == book
+    proposal = e.desk.propose_exit('DQA9Q', exit_usd, False, chat=OWNER)
+    run_approved(e, proposal)
+    expected = 'CLOSED' if exit_usd is None else 'OPEN'
+    assert store.get_deal(e.con, 'DQA9Q')['state'] == expected
+    assert store.get_deal(e.con, 'DQA9Q')['inst_json'] == frozen
+    before = sends(e)
+    e.engine.execute(proposal.intent_id)
+    assert sends(e) == before
+
+
+def test_conflicting_scoped_account_cannot_be_adopted_by_current_credentials(tmp_path):
+    from funding_bot.trade import scoped_accounting as scoped
+    from funding_bot.trade.adapters.execution_scope import prepare_active_accounts, KIND
+    con, first, second, legs, reads = active_legacy_set(tmp_path)
+    con.execute("UPDATE deals SET state='CLOSED' WHERE id=?", (second,))
+    scoped.migrate(con)
+    scoped.bind_deal(con, first['id'], scoped.ProvenScope('acct:v1:aster:wrong', 'aster',
+                     first['symbol'], 'migration_manifest', 'fixture:old-account'))
+    before = store.schema_info(con)
+    with pytest.raises(AdapterError, match=first['id']):
+        prepare_active_accounts(con, lambda sim: legs)
+    assert not reads
+    assert store.schema_info(con) == before
+    assert not con.execute('SELECT 1 FROM exec_events WHERE kind=?', (KIND,)).fetchone()
+
+
+def test_second_snapshot_change_rolls_back_first_binding_and_floor(tmp_path, monkeypatch):
+    from funding_bot.trade.adapters import execution_scope as scope
+    con, first, second, legs, reads = active_legacy_set(tmp_path)
+    iid, _ = store.create_intent(con, deal_id=second, kind='entry', spec={}, plan={})
+    cid = store.create_clip(con, iid, 1, 100)
+    client = store.client_order_id(second, 'e', cid, 1, 1)
+    store.perp_order_intent(con, clip_id=cid, client_id=client, venue='aster', symbol='SECONDUSDT',
+                            side='SELL', reduce_only=False, tif='IOC', price=D(3), qty=D(2))
+    store.perp_order_sent(con, client, sign_nonce=1)
+    def get(method, path, params, what):
+        assert method == 'GET' and not con.in_transaction
+        r = store.get_perp_order(con, params['origClientOrderId'])
+        return dict(clientOrderId=r['client_id'], symbol=r['symbol'], side=r['side'], origQty=r['qty'],
+                    price=r['price'], reduceOnly=bool(r['reduce_only']), orderId=123,
+                    executedQty='0', cumQuote='0')
+    legs.perp._signed_ok = get
+    original = scope._install_legacy
+    installed = []
+    def install(connection, candidate):
+        result = original(connection, candidate)
+        installed.append(candidate[0]['id'])
+        if len(installed) == 1:
+            con.execute("UPDATE perp_orders SET price='4' WHERE client_id=?", (client,))
+        return result
+    monkeypatch.setattr(scope, '_install_legacy', install)
+    before = store.schema_info(con)
+    with pytest.raises(AdapterError, match='snapshot changed'):
+        scope.prepare_active_accounts(con, lambda sim: legs)
+    assert len(installed) == 1
+    assert store.schema_info(con) == before
+    assert not con.execute('SELECT 1 FROM exec_events WHERE kind=?', (scope.KIND,)).fetchone()
+    assert store.get_perp_order(con, client)['price'] == '3'
