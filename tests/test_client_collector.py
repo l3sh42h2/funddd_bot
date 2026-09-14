@@ -247,8 +247,11 @@ def test_disk_low_stops_snapshots_not_history(tmp_path, monkeypatch):
     assert db.count_funding_events(col.con) > 0
 
 
-def test_schedule_respects_cadences(tmp_path):
-    w = make_world(); col, t = _collector(tmp_path, w)
+def test_schedule_respects_cadences(tmp_path, monkeypatch):
+    # Isolate periodic scheduling from the host clock and settlement boundaries.
+    now = 1_700_001_234.0
+    w = make_world(int(now * 1000)); col, t = _collector(tmp_path, w, now=now)
+    monkeypatch.setattr(time, 'time', lambda: t[0])
     cnt = lambda path, nosym=False: sum(1 for p, q in w["aster"].calls if p == path and (not nosym or "symbol" not in q))
     col.once()
     assert (cnt("/fapi/v1/exchangeInfo"), cnt("/fapi/v1/fundingInfo"), cnt("/fapi/v1/fundingRate", True)) == (1, 1, 1)

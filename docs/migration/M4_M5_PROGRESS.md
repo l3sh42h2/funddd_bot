@@ -187,3 +187,37 @@ Linux checkpoint выполнен после последних code-право�
   Независимый профиль 161 passed, 2.25s; дополнительный persisted EXPIRED400 → PARTIALLY_FILLED + FILLED503
   сохранил native EXPIRED и exact cash flow 150.57525000. Локальный финальный профиль: 166 passed, 2.13s.
   Это closure конкретной границы, не полная приёмка M4/M5; production cutover не выполнялся.
+
+### Scoped accounting integration — e5559fa
+
+- Опубликован проверенный пакет scoped history/cursors, reader3 binding, source-revision cache invalidation
+  для EVM engine/marks/reconcile/core readmodel. Исторические сделки автоматически не связываются с кошельком.
+- Native strict Aster/Gate readers отказывают при неполноте/конфликте вместо декларации полного окна.
+  FundingWindow требует отдельного доказательства; стандартные native HTTP readers его пока не выдают.
+- Неизвестные fees/funding/receipt costs остаются неизвестными. Confirmed order quantity в итоговом отчёте
+  не пропадает при задержке fills. Проверены гонки read snapshots и cost revisions, сохранение старых marks,
+  корректные nonce replacements и необратимый reader floor после binding.
+- Итоговый профиль: 281 passed, 1 Linux-only skipped, 10.65 s. Независимое Astra xhigh closure: 117 passed,
+  плюс отдельные WAL/nonce probes. Exact-value secret scan пройден; commit опубликован в рабочей ветке.
+- Ограничения gas proof и positive cancellation проекций: PATCHNOTES/m4-accounting-integration-20260914.md.
+  Это ещё не полное execution→receipt coverage, не завершение AC17/20 и не общая приёмка M4/M5.
+- VPS/службы не менялись. Продолжается перенос оставшихся presenters; generic EVM/spot ports,
+  полная replay/приёмка и выкат остаются обязательными работами.
+
+### Итоги операций и исправление корневой цели
+
+- EVM/Solana FinalView snapshots перенесены в ipc/reports без изменений формул/полей; core кладёт данные
+  в outbox, interface форматирует итог. Новый DTO3 event поднимает reader floor атомарно и монотонно.
+  Старый trader имеет локальную совместимую реализацию final_report; старые queued сообщения доставляются.
+- Независимое Astra review закрыто для обоих вариантов, включая AST equivalence, delivery retry и reader gate.
+- Полный локальный набор выявил прежний root bug: exit требовал один клип. Теперь сумма положительных raw
+  клипов точно равна approved units; новый барьер не даёт увеличить цель редактированием legacy spec.
+  Astra закрыл исправление и проверил сохранение executor corruption tests после нового approval barrier.
+- Проверки и ограничения перечислены в отдельных PATCHNOTES/m4-final-report-boundary-20260914.md,
+  m4-exit-root-clip-total-20260914.md, m4-collector-cadence-fixture-20260914.md.
+- Полная Linux-приёмка и production cutover ещё не выполнены. Остальные presentation dependencies и
+  generic EVM/spot execution integration остаются; M4/M5 не приняты.
+- Финальная локальная проверка текущего кода: **2547 passed, 4 skipped, 155.88 s**, без ошибок.
+  Предыдущие полные попытки: 157.74 s (39 failures, root/устаревшие ожидания), 156.17 s (один нестабильный
+  cadence test). Исправления и профильные повторы перечислены в патчноутах. Полное время подготовки/ревью
+  и счётчики токенов не измерены; эти длительности — только pytest, не весь этап разработки.
