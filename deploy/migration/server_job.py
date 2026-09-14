@@ -44,9 +44,11 @@ class Paths:
         self.opt, self.state, self.legacy = map(Path, (opt, state, legacy))
         self.releases = self.opt / 'releases'
         self.current = self.opt / 'current'
+        self.transition = self.opt / '.deploy-transition.json'
         self.release_state = self.state / 'deploy/release-state.json'
         self.lock = Path('/run/lock/funding-bot-deploy.lock')
         self.reports = self.state / 'deploy/reports'
+        self.bootstrap_reports = self.opt / 'deploy-reports'
         self.backups = self.state / 'backups'
         self.execution_lock = self.state / 'core/execution.lock'
         self.core_socket = Path('/run/funding-bot/core.sock')
@@ -128,9 +130,39 @@ def legacy_identity(paths):
 
 
 def current_identity(paths):
+    if paths.transition.exists():
+        transition = _json(paths.transition)
+        current = None
+        if paths.current.is_symlink():
+            try:
+                current = paths.current.resolve(strict=True).name
+            except OSError:
+                current = 'BROKEN'
+        return {'kind': 'transition', 'operation_id': transition.get('operation_id'),
+                'phase': transition.get('phase'), 'target_release_id': transition.get('target_release_id'),
+                'db_authority': transition.get('db_authority'), 'current_release_id': current,
+                'previous_identity': transition.get('previous_identity')}
     if paths.release_state.exists():
         return state_identity(_json(paths.release_state))
     return legacy_identity(paths)
+
+
+def write_transition(paths, transition, phase, *, db_authority=None):
+    value = dict(transition, phase=phase, updated_at=time.time())
+    if db_authority is not None:
+        value['db_authority'] = db_authority
+    paths.opt.mkdir(parents=True, exist_ok=True)
+    af.atomic_json(paths.transition, value)
+    transition.clear(); transition.update(value)
+
+
+def clear_transition(paths):
+    paths.transition.unlink(missing_ok=True)
+    fd = os.open(paths.opt, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_template(artifact):
@@ -159,9 +191,10 @@ def verify_bundle(artifact, receipt_path):
     for key in ('release_id', 'source_revision', 'source_sha256', 'patchnote'):
         if receipt.get(key) != template.get(key):
             raise DeployFailure(f'receipt {key} mismatch')
-    own = template['sources'].get('deploy/migration/server_job.py')
-    if own != af.digest(__file__):
-        raise DeployFailure('server runner differs from verified artifact')
+    for name in ('server_job.py', 'artifacts.py', 'deploy_ipc.py', 'prepare_layout.py'):
+        source_name = 'deploy/migration/' + name
+        if template['sources'].get(source_name) != af.digest(HERE / name):
+            raise DeployFailure(f'server runner dependency differs from verified artifact: {name}')
     return receipt, template
 
 
@@ -207,6 +240,7 @@ def ui_only(previous, new):
     return (previous.get('component_hashes', {}).get('core') == new['component_hashes']['core']
             and previous.get('component_hashes', {}).get('collector') == new['component_hashes']['collector']
             and previous.get('dependencies') == new['dependencies']
+            and previous.get('runtime') == new.get('runtime')
             and all(previous.get(k) == new.get(k) for k in ('ipc_version', 'dto_version', 'schema_version', 'min_reader')))
 
 
@@ -251,6 +285,37 @@ def wait_drain(client, release_id, epoch, *, sleep=time.sleep):
         sleep(2)
 
 
+def end_drain_verified(client_factory, manifest, epoch, *, attempts=6, sleep=time.sleep):
+    """Refresh drain evidence after UI ACK writes and prove the final state.
+
+    A lost reply is retried with the same epoch/release id.  We accept success
+    only after a fresh status from the expected loaded release says undrained.
+    """
+    last = 'not attempted'
+    for _ in range(attempts):
+        client = client_factory()
+        try:
+            health = health_matches(client.call('get_status', {}), manifest,
+                                    require_drain=False, require_recovery=False)
+            if health.get('drain') is False:
+                return health
+            if health.get('drain_epoch') != epoch:
+                raise DeployFailure('drain epoch changed before release')
+            wait_drain(client, manifest['release_id'], epoch, sleep=sleep)
+            ended = client.call('end_drain', {'drain_epoch': epoch,
+                                'expected_release_id': manifest['release_id']})
+            if ended.get('drain') is not False:
+                last = 'end_drain did not report false'
+            else:
+                # Loop once more: the reply itself is not durable proof if the
+                # transport can fail immediately after execution.
+                last = 'awaiting post-end status proof'
+        except (IpcRefused, DeployFailure) as e:
+            last = str(e)
+        sleep(1)
+    raise DeployFailure('end_drain outcome unknown: ' + last)
+
+
 def provision_accounts(commands):
     for group in ('funding-ipc', 'funding-market', 'funding-pace'):
         commands.run(['groupadd', '--system', '--force', group])
@@ -293,7 +358,8 @@ def migrate_legacy_runtime(paths, commands, release_id):
             if (legacy_runtime / name).is_file():
                 _copy_private(legacy_runtime / name, stage_state / 'shared' / name)
             else:
-                fd = os.open(stage_state / 'shared' / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660)
+                mode = 0o660 if name == 'okxdex.pace' else 0o640
+                fd = os.open(stage_state / 'shared' / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
                 os.close(fd)
         # Keypair file locations are secrets carried by env indirection. Copy the
         # bytes privately and rewrite only their path, never their value/content.
@@ -341,8 +407,9 @@ def migrate_legacy_runtime(paths, commands, release_id):
         commands.run(['chown', '-R', 'funding-interface:funding-interface', stage_state / 'interface'])
         commands.run(['chown', '-R', 'root:root', stage_state / 'secrets'])
         commands.run(['chown', '-R', 'root:funding-pace', stage_state / 'shared'])
-        for name in shared_names:
-            os.chmod(stage_state / 'shared' / name, 0o660)
+        os.chmod(stage_state / 'shared/okxdex.pace', 0o660)
+        commands.run(['chown', 'funding-core:funding-pace', stage_state / 'shared/trading.busy'])
+        os.chmod(stage_state / 'shared/trading.busy', 0o640)
         os.chmod(stage_state, 0o755)
         os.chmod(stage_state / 'core', 0o700)
         os.chmod(stage_state / 'collector', 0o710)
@@ -370,13 +437,59 @@ def clear_first_start_drain(path):
         Path(tmp).unlink(missing_ok=True)
 
 
+def installed_tree_sha256(root):
+    values = {}
+    for path in sorted(Path(root).rglob('*')):
+        name = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            values[name] = {'symlink': os.readlink(path)}
+        elif path.is_file():
+            values[name] = {'sha256': af.digest(path)}
+        elif path.is_dir():
+            values[name] = {'directory': True}
+        else:
+            raise DeployFailure('special file in installed environment')
+    return af.value_digest(values)
+
+
+def verify_installed_release(release, artifact, receipt, template, manifest, commands):
+    for key, value in template.items():
+        if manifest.get(key) != value:
+            raise DeployFailure(f'installed release {key} differs')
+    if manifest.get('artifact_sha256') != af.digest(artifact):
+        raise DeployFailure('release id already has different artifact bytes')
+    if manifest.get('verification_identity_sha256') != af.value_digest(receipt['identity']):
+        raise DeployFailure('installed verification identity differs')
+    exact_source_check(release, template['sources'])
+    dependency_bytes = af.dependency_fingerprint(release / 'deploy/requirements.lock', release / 'wheelhouse')
+    for key in ('lock_sha256', 'wheels', 'wheelset_sha256'):
+        if dependency_bytes[key] != template['dependencies'].get(key):
+            raise DeployFailure('installed dependency bytes differ')
+    py = release / '.venv/bin/python'
+    if not py.is_file():
+        raise DeployFailure('installed Python missing')
+    commands.run([py, '-m', 'pip', 'check'])
+    runtime_code = ("import json,platform,sqlite3,sys,hashlib; p=sys.executable; "
+                    "print(json.dumps({'python':list(sys.version_info[:3]),'implementation':platform.python_implementation(),"
+                    "'platform':sys.platform,'machine':platform.machine(),'libc':list(platform.libc_ver()),"
+                    "'sqlite':sqlite3.sqlite_version,'executable_hash':hashlib.sha256(open(p,'rb').read()).hexdigest()},sort_keys=True))")
+    runtime = json.loads(commands.run([py, '-c', runtime_code]).stdout)
+    if runtime != template['runtime']:
+        raise DeployFailure('server Linux runtime differs from verified runtime')
+    packages = sorted(x.strip() for x in commands.run([py, '-m', 'pip', 'freeze', '--all']).stdout.splitlines() if x.strip())
+    installed = {'packages': packages, 'sha256': af.value_digest(packages)}
+    if installed != template['dependencies'].get('installed'):
+        raise DeployFailure('server installed dependencies differ from verified environment')
+    if manifest.get('installed_venv_sha256') != installed_tree_sha256(release / '.venv'):
+        raise DeployFailure('installed environment bytes differ')
+
+
 def install_release(paths, artifact, receipt, template, commands):
     paths.releases.mkdir(parents=True, exist_ok=True)
     final = paths.releases / template['release_id']
     if final.exists():
         existing = _json(final / 'release-manifest.json')
-        if existing.get('artifact_sha256') != af.digest(artifact):
-            raise DeployFailure('release id already has different bytes')
+        verify_installed_release(final, artifact, receipt, template, existing, commands)
         return final, existing
     stage = paths.releases / ('.staging-' + template['release_id'] + '-' + uuid.uuid4().hex)
     stage.mkdir()
@@ -407,7 +520,8 @@ def install_release(paths, artifact, receipt, template, commands):
         if installed != template['dependencies'].get('installed'):
             raise DeployFailure('server installed dependencies differ from verified environment')
         manifest = dict(template, artifact_sha256=af.digest(artifact),
-                        verification_identity_sha256=af.value_digest(receipt['identity']))
+                        verification_identity_sha256=af.value_digest(receipt['identity']),
+                        installed_venv_sha256=installed_tree_sha256(stage / '.venv'))
         af.atomic_json(stage / 'release-manifest.json', manifest)
         freeze_release(stage)
         os.replace(stage, final)
@@ -580,10 +694,7 @@ def restore_before_switch(paths, commands, client_factory, previous_release, pre
     epoch = health['drain_epoch']
     validate_drain(client_factory().call('get_drain_state', {'drain_epoch': epoch}),
                    release_id=previous_manifest['release_id'], epoch=epoch, require_safe=True)
-    ended = client_factory().call('end_drain', {'drain_epoch': epoch,
-                                  'expected_release_id': previous_manifest['release_id']})
-    if ended.get('drain') is not False:
-        raise DeployFailure('old core did not leave pre-switch drain')
+    end_drain_verified(client_factory, previous_manifest, epoch)
 
 
 def restore_ui_before_switch(commands, previous_release):
@@ -597,6 +708,21 @@ def rollback_ui(paths, commands, previous_release, previous_manifest):
     switch_link(paths, previous_release)
     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
     wait_interface(paths, commands, previous_manifest)
+
+
+def restore_activation_failure(paths, commands, client_factory, previous_release,
+                               previous_manifest, *, ui_update, switched):
+    if ui_update and switched:
+        rollback_ui(paths, commands, previous_release, previous_manifest)
+    elif ui_update:
+        restore_ui_before_switch(commands, previous_release)
+        commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+    elif switched:
+        rollback_release(paths, commands, client_factory, previous_release, previous_manifest)
+    else:
+        # Link replacement failed after the old services were stopped. The old
+        # code is still selected, so restore that compatible owner in place.
+        restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest)
 
 
 def rollback_release(paths, commands, client_factory, previous_release, previous_manifest):
@@ -637,10 +763,7 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
                    release_id=previous_manifest['release_id'], epoch=old_epoch, require_safe=True)
     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
     wait_components(paths, commands, previous_manifest)
-    ended = client_factory().call('end_drain', {'drain_epoch': old_epoch,
-                                  'expected_release_id': previous_manifest['release_id']})
-    if ended.get('drain') is not False:
-        raise DeployFailure('rollback core did not leave drain')
+    end_drain_verified(client_factory, previous_manifest, old_epoch)
 
 
 def release_state(previous, manifest, *, components, status, drain, report):
@@ -655,6 +778,86 @@ def release_state(previous, manifest, *, components, status, drain, report):
         'active_epoch': uuid.uuid4().hex, 'status': status, 'drain': drain,
         'installed_at': time.time(), 'report': str(report),
     }
+
+
+def observed_drain(paths, client_factory, manifest):
+    try:
+        value = health_matches(client_factory().call('get_status', {}), manifest,
+                               require_drain=False, require_recovery=False)
+        return value.get('drain') if isinstance(value.get('drain'), bool) else None
+    except (OSError, IpcRefused, DeployFailure, KeyError):
+        try:
+            durable_drain(paths.state / 'core/trade.db')
+            return True
+        except (OSError, DeployFailure):
+            return None
+
+
+def recover_transition(paths, commands, client_factory, transition):
+    """Reconcile a crash-recorded cutover before requiring a new base snapshot."""
+    target_id = transition.get('target_release_id')
+    if not isinstance(target_id, str):
+        raise DeployFailure('transition target missing')
+    previous = transition.get('previous_state')
+    previous_manifest = None
+    previous_release = None
+    if previous:
+        previous_release = paths.releases / previous['release_id']
+        previous_manifest = _json(previous_release / 'release-manifest.json')
+    actual_target = paths.current.is_symlink() and paths.current.resolve(strict=True).name == target_id
+    if not actual_target:
+        if previous_manifest is None:
+            resume_legacy(paths, commands)
+            if str(transition.get('db_authority', '')).startswith('legacy') and paths.state.exists():
+                shutil.rmtree(paths.state)
+        elif transition.get('ui_only'):
+            restore_ui_before_switch(commands, previous_release)
+            commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+        else:
+            restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest)
+        clear_transition(paths)
+        raise DeployFailure('TRANSITION_RECOVERED_RESNAPSHOT_REQUIRED')
+
+    target_release = paths.releases / target_id
+    target_manifest = _json(target_release / 'release-manifest.json')
+    if previous_manifest is not None:
+        if transition.get('ui_only'):
+            rollback_ui(paths, commands, previous_release, previous_manifest)
+        else:
+            rollback_release(paths, commands, client_factory, previous_release, previous_manifest)
+        clear_transition(paths)
+        raise DeployFailure('TRANSITION_ROLLED_BACK_RESNAPSHOT_REQUIRED')
+
+    # There is no lock-compatible legacy rollback after the current DB became
+    # authoritative. Fence the new core and record the exact loaded code with an
+    # explicit unknown/drained status; never overwrite it with the legacy DB.
+    active = commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'], check=False).returncode == 0
+    if active:
+        client = client_factory()
+        health = client.call('get_status', {})
+        if health.get('drain') is not True or not health.get('drain_epoch'):
+            begun = validate_drain(client.call('begin_drain', {
+                'release_id': target_id, 'expected_state_revision': health['state_revision'],
+                'reason': 'recover_interrupted_deploy'}), release_id=target_id)
+            epoch = begun['drain_epoch']
+        else:
+            epoch = health['drain_epoch']
+        wait_drain(client, target_id, epoch)
+        commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
+        _wait_inactive(commands, 'funding_bot-core.service')
+    else:
+        durable_drain(paths.state / 'core/trade.db')
+    execution_lock_free(paths.execution_lock)
+    paths.reports.mkdir(parents=True, exist_ok=True)
+    report_path = paths.reports / (target_id + '-interrupted.json')
+    af.atomic_json(report_path, {'release_id': target_id, 'status': 'interrupted_recovered',
+                                 'completed_at': time.time(), 'transition': transition})
+    components = {name: target_id for name in ('collector', 'core', 'interface')}
+    af.atomic_json(paths.release_state, release_state(None, target_manifest, components=components,
+                                                      status='drained_interrupted', drain=True,
+                                                      report=report_path))
+    clear_transition(paths)
+    raise DeployFailure('TRANSITION_FENCED_RESNAPSHOT_REQUIRED')
 
 
 class Job:
@@ -674,6 +877,8 @@ class Job:
             # state, service, DB, credential or unit mutation precedes it.
             af.require_base(current_identity(p), expected)
             report['stages'].append('base_verified')
+            if p.transition.exists():
+                recover_transition(p, self.commands, self.client_factory, _json(p.transition))
             previous_state = _json(p.release_state) if p.release_state.exists() else None
             previous_manifest = None
             old_release = None
@@ -686,6 +891,14 @@ class Job:
             if not compatible_reader(template, db_before):
                 raise DeployFailure('new release cannot read current trade.db')
 
+            transition = {
+                'format_version': 1, 'operation_id': uuid.uuid4().hex,
+                'target_release_id': template['release_id'], 'previous_state': previous_state,
+                'previous_identity': expected, 'ui_only': is_ui,
+                'db_authority': 'state' if previous_state else 'legacy',
+            }
+            write_transition(p, transition, 'prepared')
+
             old_epoch = None
             if previous_state and not is_ui:
                 client = self.client_factory()
@@ -694,17 +907,20 @@ class Job:
                                        'reason': 'deploy'}), release_id=template['release_id'])
                 old_epoch = begun['drain_epoch']
                 wait_drain(client, template['release_id'], old_epoch)
+                write_transition(p, transition, 'fenced')
                 report['stages'].append('drained')
                 self.commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
                 _wait_inactive(self.commands, 'funding_bot-core.service')
             elif not previous_state:
                 fence_legacy(self.commands)
+                write_transition(p, transition, 'fenced')
                 report['stages'].append('legacy_fenced')
 
             try:
                 provision_accounts(self.commands)
                 if not previous_state:
                     db_before, backup = migrate_legacy_runtime(p, self.commands, template['release_id'])
+                    write_transition(p, transition, 'state_ready', db_authority='legacy_copied')
                     report['backup'] = {'path': str(backup), 'sha256': af.digest(backup)}
                 else:
                     p.backups.mkdir(parents=True, exist_ok=True)
@@ -730,17 +946,23 @@ class Job:
                     else:
                         restore_before_switch(p, self.commands, self.client_factory, old_release, previous_manifest)
                     report['rollback'] = 'pre_switch_owner_restored'
+                    if previous_manifest is None and p.state.exists():
+                        shutil.rmtree(p.state)
+                    clear_transition(p)
                 except BaseException as restore_failure:
                     report['rollback'] = 'pre_switch_restore_failed: ' + type(restore_failure).__name__ + ': ' + str(restore_failure)
-                p.reports.mkdir(parents=True, exist_ok=True)
-                failed_path = p.reports / (template['release_id'] + '-failed.json')
+                failure_reports = p.reports if previous_state else p.bootstrap_reports
+                failure_reports.mkdir(parents=True, exist_ok=True)
+                failed_path = failure_reports / (template['release_id'] + '-failed.json')
                 report['completed_at'] = time.time(); af.atomic_json(failed_path, report)
                 raise
             switched = False
             try:
+                write_transition(p, transition, 'switching')
                 if is_ui:
                     self.commands.run(['systemctl', 'stop', 'funding_bot-interface.service'])
                     switch_link(p, release); switched = True
+                    write_transition(p, transition, 'switched', db_authority='state')
                     self.commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
                     # UI identity is checked without touching the live core.
                     wait_interface(p, self.commands, manifest)
@@ -754,6 +976,7 @@ class Job:
                     self.commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
                     _wait_inactive(self.commands, 'funding_bot-collector.service')
                     switch_link(p, release); switched = True
+                    write_transition(p, transition, 'switched', db_authority='state')
                     self.commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     self.commands.run(['systemctl', 'start', 'funding_bot-core.service'])
                     health = wait_core_ready(self.client_factory(), manifest, commands=self.commands)
@@ -764,29 +987,27 @@ class Job:
                     report['health'] = wait_components(p, self.commands, manifest)
                     if previous_state is None:
                         clear_first_start_drain(p.state / 'secrets/core.env')
-                    ended = self.client_factory().call('end_drain', {'drain_epoch': epoch,
-                                                      'expected_release_id': template['release_id']})
-                    if ended.get('drain') is not False:
-                        raise DeployFailure('new core did not leave drain')
+                    end_drain_verified(self.client_factory, manifest, epoch)
                     components = {name: manifest['release_id'] for name in ('collector', 'core', 'interface')}
                     drain = False
                     report['stages'].append('three_process_ready')
             except BaseException as failure:
                 report['status'] = 'failed'; report['failure'] = type(failure).__name__ + ': ' + str(failure)
                 rollback_ok = False
-                if switched and previous_manifest is not None:
+                if previous_manifest is not None:
                     try:
-                        if is_ui:
-                            rollback_ui(p, self.commands, old_release, previous_manifest)
-                        else:
-                            rollback_release(p, self.commands, self.client_factory, old_release, previous_manifest)
+                        restore_activation_failure(p, self.commands, self.client_factory, old_release,
+                                                   previous_manifest, ui_update=is_ui, switched=switched)
                         report['rollback'] = 'code_only_succeeded'
                         rollback_ok = True
                     except BaseException as rollback_failure:
                         report['rollback'] = 'refused_or_failed: ' + type(rollback_failure).__name__ + ': ' + str(rollback_failure)
                 elif not switched and previous_manifest is None:
                     resume_legacy(p, self.commands)
+                    if p.state.exists():
+                        shutil.rmtree(p.state)
                     report['rollback'] = 'legacy_resumed_before_switch'
+                    rollback_ok = True
                 else:
                     # First cutover has no execution-lock-compatible old core.
                     # Keep the new recovery-capable code drained; never copy the
@@ -797,9 +1018,14 @@ class Job:
                 report['completed_at'] = time.time(); af.atomic_json(failed_path, report)
                 if switched and not rollback_ok:
                     failed_components = {name: manifest['release_id'] for name in ('collector', 'core', 'interface')}
+                    drain_observed = observed_drain(p, self.client_factory, manifest)
                     af.atomic_json(p.release_state, release_state(previous_state, manifest,
-                                   components=failed_components, status='drained_failure', drain=True,
+                                   components=failed_components,
+                                   status='drained_failure' if drain_observed is True else 'execution_state_unknown',
+                                   drain=drain_observed,
                                    report=failed_path))
+                if rollback_ok or switched:
+                    clear_transition(p)
                 raise
 
             report['status'] = 'healthy'; report['completed_at'] = time.time()
@@ -808,6 +1034,7 @@ class Job:
             af.atomic_json(report_path, report)
             af.atomic_json(p.release_state, release_state(previous_state, manifest, components=components,
                                                           status='healthy', drain=drain, report=report_path))
+            clear_transition(p)
             return report
 
 

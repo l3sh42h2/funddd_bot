@@ -79,10 +79,17 @@ case "$cmd" in
     "${SCP[@]}" "$receipt" "$VPS:$incoming/receipt.json" >/dev/null
     "${SCP[@]}" "$expected" "$VPS:$incoming/expected-base.json" >/dev/null
     "${SCP[@]}" "$M5/artifacts.py" "$M5/deploy_ipc.py" "$M5/prepare_layout.py" "$M5/server_job.py" "$VPS:$incoming/" >/dev/null
+    server_hash="$(shasum -a 256 "$M5/server_job.py" | awk '{print $1}')"
+    artifacts_hash="$(shasum -a 256 "$M5/artifacts.py" | awk '{print $1}')"
+    ipc_hash="$(shasum -a 256 "$M5/deploy_ipc.py" | awk '{print $1}')"
+    layout_hash="$(shasum -a 256 "$M5/prepare_layout.py" | awk '{print $1}')"
     unit="funding-bot-deploy-$release_id"
-    "${SSH[@]}" "$VPS" "sudo systemd-run --quiet --collect --unit '$unit' --property=Type=oneshot \
+    bootstrap='import hashlib,os,sys; root=sys.argv[1]; names=("server_job.py","artifacts.py","deploy_ipc.py","prepare_layout.py"); expected=sys.argv[2:6]; actual=[hashlib.sha256(open(root+"/"+n,"rb").read()).hexdigest() for n in names]; actual==list(expected) or sys.exit("runner hash mismatch"); os.execv("/usr/bin/python3",["/usr/bin/python3",root+"/server_job.py"]+sys.argv[7:])'
+    "${SSH[@]}" "$VPS" "sudo chown -R root:root '$incoming' && sudo chmod -R go-w '$incoming' && \
+      sudo systemd-run --quiet --collect --unit '$unit' --property=Type=oneshot \
       --property=TimeoutStartSec=infinity --setenv=FUNDING_M5_ENTRY=deploy/deploy.sh \
-      /usr/bin/python3 '$incoming/server_job.py' install --artifact '$incoming/artifact.tar' \
+      /usr/bin/python3 -c '$bootstrap' '$incoming' '$server_hash' '$artifacts_hash' '$ipc_hash' '$layout_hash' -- \
+      install --artifact '$incoming/artifact.tar' \
       --receipt '$incoming/receipt.json' --expected-base '$incoming/expected-base.json'"
     echo "supervised job started: $unit"
     echo "rerun: deploy/deploy.sh status $release_id"

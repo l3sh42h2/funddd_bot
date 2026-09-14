@@ -5,6 +5,7 @@ import sys
 import time
 from types import SimpleNamespace
 import sqlite3
+import os
 
 import pytest
 
@@ -36,6 +37,31 @@ def test_drain_waits_for_fresh_safe_epoch_without_killing_executor():
     bad = safe_state(); bad['execution']['lock_held'] = False
     with pytest.raises(deploy_ipc.IpcRefused, match='ownership'):
         deploy_ipc.validate_drain(bad, release_id='release-x', epoch='epoch-1', require_safe=True)
+
+
+def test_end_drain_refreshes_after_ui_ack_and_retries_lost_reply():
+    manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a',
+                'ipc_version': 1, 'schema_version': 2}
+    state = {'ended': False, 'end_calls': 0, 'drain_checks': 0}
+    class Client:
+        def call(self, method, payload):
+            if method == 'get_status':
+                return {'ready': True, 'release_id': 'release-x', 'source_sha256': 's',
+                        'artifact_sha256': 'a', 'ipc_version': 1, 'schema_version': 2,
+                        'drain': not state['ended'], 'drain_epoch': 'epoch-1',
+                        'recovery_complete': True, 'execution_lock_held': True}
+            if method == 'get_drain_state':
+                state['drain_checks'] += 1
+                if state['drain_checks'] == 1:
+                    raise deploy_ipc.IpcRefused('drain_not_ready after UI ACK commit')
+                return safe_state('epoch-1')
+            if method == 'end_drain':
+                state['end_calls'] += 1
+                state['ended'] = True
+                raise deploy_ipc.IpcRefused('reply lost')
+            raise AssertionError(method)
+    result = job.end_drain_verified(Client, manifest, 'epoch-1', attempts=3, sleep=lambda _: None)
+    assert result['drain'] is False and state['end_calls'] == 1 and state['drain_checks'] == 2
 
 
 def test_core_readiness_triggers_recovery_before_waiting_for_complete():
@@ -117,6 +143,75 @@ def test_missing_database_and_stale_base_cause_no_service_mutation(tmp_path, mon
     assert commands.calls == [] and not paths.state.exists() and not paths.opt.exists()
 
 
+def test_transition_identity_prevents_stale_release_state_after_link_switch(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    target = paths.releases / 'release-new'; target.mkdir(parents=True)
+    paths.opt.mkdir(exist_ok=True)
+    paths.current.symlink_to(target)
+    af.atomic_json(paths.transition, {'operation_id': 'op-1', 'phase': 'switched',
+                                      'target_release_id': 'release-new', 'db_authority': 'state',
+                                      'previous_identity': {'release_id': 'release-old'}})
+    identity = job.current_identity(paths)
+    assert identity == {'kind': 'transition', 'operation_id': 'op-1', 'phase': 'switched',
+                        'target_release_id': 'release-new', 'db_authority': 'state',
+                        'current_release_id': 'release-new',
+                        'previous_identity': {'release_id': 'release-old'}}
+
+
+def test_interrupted_first_preswitch_resumes_legacy_and_discards_copied_state(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    paths.opt.mkdir(parents=True); paths.state.mkdir(parents=True)
+    (paths.state / 'copied').write_text('not authoritative')
+    transition = {'operation_id': 'op', 'phase': 'state_ready', 'target_release_id': 'release-new',
+                  'db_authority': 'legacy_copied', 'previous_state': None, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    resumed = []
+    monkeypatch.setattr(job, 'resume_legacy', lambda *a: resumed.append(True))
+    with pytest.raises(job.DeployFailure, match='RESNAPSHOT'):
+        job.recover_transition(paths, object(), None, transition)
+    assert resumed == [True] and not paths.state.exists() and not paths.transition.exists()
+
+
+def test_existing_release_revalidates_complete_installed_identity(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release = paths.releases / 'release-existing'; release.mkdir(parents=True)
+    manifest = {'release_id': 'release-existing', 'artifact_sha256': 'x'}
+    af.atomic_json(release / 'release-manifest.json', manifest)
+    checked = []
+    monkeypatch.setattr(job, 'verify_installed_release',
+                        lambda *args: checked.append((args[0], args[4])))
+    result, loaded = job.install_release(paths, tmp_path / 'artifact', {'identity': {}},
+                                         {'release_id': 'release-existing'}, object())
+    assert result == release and loaded == manifest and checked == [(release, manifest)]
+
+
+@pytest.mark.skipif(sys.platform != 'linux' or os.geteuid() != 0,
+                    reason='isolated Linux root DAC fixture')
+def test_shared_pace_dac_allows_two_uids_but_denies_private_controls(tmp_path):
+    gid, uid1, uid2 = 61001, 61002, 61003
+    os.chmod(tmp_path, 0o755)
+    shared = tmp_path / 'shared'; shared.mkdir(mode=0o770)
+    pace = shared / 'okxdex.pace'; pace.write_text('0\n')
+    private = tmp_path / 'core.env'; private.write_text('TOKEN=fixture\n')
+    os.chown(shared, 0, gid); os.chown(pace, 0, gid); os.chmod(pace, 0o660)
+    os.chown(private, 0, 0); os.chmod(private, 0o600)
+    for uid in (uid1, uid2):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setgroups([gid]); os.setgid(gid); os.setuid(uid)
+                fd = os.open(pace, os.O_RDWR); os.close(fd)
+                try:
+                    os.open(private, os.O_RDONLY)
+                except PermissionError:
+                    os._exit(0)
+                os._exit(2)
+            except BaseException:
+                os._exit(3)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+
+
 def test_ui_only_requires_identical_core_collector_runtime_and_protocol():
     new = {'component_hashes': {'core': 'c', 'collector': 'k', 'interface': 'new'},
            'dependencies': {'d': 1}, 'ipc_version': 1, 'dto_version': 1, 'schema_version': 2, 'min_reader': 2}
@@ -143,6 +238,7 @@ def test_code_rollback_switches_reader_only_and_never_restores_database(tmp_path
     monkeypatch.setattr(job, 'wait_core_ready', lambda *a, **k: {
         'drain': True, 'drain_epoch': 'epoch-1', 'release_id': 'old-release'})
     monkeypatch.setattr(job, 'wait_components', lambda *a, **k: {})
+    monkeypatch.setattr(job, 'end_drain_verified', lambda *a, **k: calls.append('end_verified'))
     class Client:
         def call(self, method, payload):
             if method == 'get_status': return {'drain': True, 'drain_epoch': 'epoch-1', 'release_id': 'new'}
@@ -154,6 +250,17 @@ def test_code_rollback_switches_reader_only_and_never_restores_database(tmp_path
     monkeypatch.setattr(af, 'backup_database', lambda *a, **k: pytest.fail('rollback must not restore/copy a DB'))
     job.rollback_release(paths, Commands(), Client, previous, manifest)
     assert 'switch_code' in calls and 'lock_free' in calls
+
+
+def test_link_failure_restores_prior_compatible_owner_without_first_cutover_path(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    old = paths.releases / 'old'; old.mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(job, 'restore_before_switch', lambda *a: calls.append('restore_old_owner'))
+    monkeypatch.setattr(job, 'rollback_release', lambda *a: pytest.fail('link never switched'))
+    job.restore_activation_failure(paths, object(), object(), old, {'release_id': 'old'},
+                                   ui_update=False, switched=False)
+    assert calls == ['restore_old_owner']
 
 
 def test_service_templates_keep_single_executor_and_public_port():
@@ -192,7 +299,7 @@ def test_first_transition_migrates_latest_state_offsets_and_secrets_privately(tm
     assert (paths.state / 'core/trade.db').is_file() and (runtime / 'trade.db').is_file()
     assert (paths.state / 'shared/okxdex.pace').read_text() == '17\n'
     assert oct((paths.state / 'shared/okxdex.pace').stat().st_mode & 0o777) == '0o660'
-    assert oct((paths.state / 'shared/trading.busy').stat().st_mode & 0o777) == '0o660'
+    assert oct((paths.state / 'shared/trading.busy').stat().st_mode & 0o777) == '0o640'
     assert (paths.state / 'interface/public_url.txt').read_text() == 'https://stable.example\n'
     core_env = (paths.state / 'secrets/core.env').read_text()
     assert str(paths.state / 'core/keys/solana_keypair_file.json') in core_env
@@ -245,6 +352,7 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
     monkeypatch.setattr(job, 'wait_core_ready', lambda *a, **k: {
         'drain': True, 'drain_epoch': 'epoch-new', 'release_id': 'new-release'})
     monkeypatch.setattr(job, 'wait_components', lambda *a, **k: {'all': 'ready'})
+    monkeypatch.setattr(job, 'end_drain_verified', lambda *a, **k: events.append('end_drain'))
     class Client:
         def call(self, method, payload):
             events.append(method)

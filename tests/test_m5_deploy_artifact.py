@@ -31,7 +31,8 @@ def test_tree_profile_and_dependency_fingerprints_are_complete(tmp_path):
 
 
 def test_server_recomputes_artifact_identity_and_runner(tmp_path):
-    source = {'deploy/migration/server_job.py': af.digest(M5 / 'server_job.py')}
+    runner_names = ('server_job.py', 'artifacts.py', 'deploy_ipc.py', 'prepare_layout.py')
+    source = {'deploy/migration/' + name: af.digest(M5 / name) for name in runner_names}
     template = {
         'format_version': 1, 'release_id': 'release-12345678', 'source_revision': 'a' * 40,
         'source_sha256': af.value_digest(source), 'sources': source,
@@ -43,7 +44,8 @@ def test_server_recomputes_artifact_identity_and_runner(tmp_path):
         'compatible_readers': [2], 'patchnote': 'PATCHNOTES/x.md',
     }
     release = tmp_path / 'release'; (release / 'deploy/migration').mkdir(parents=True)
-    (release / 'deploy/migration/server_job.py').write_bytes((M5 / 'server_job.py').read_bytes())
+    for name in runner_names:
+        (release / 'deploy/migration' / name).write_bytes((M5 / name).read_bytes())
     af.atomic_json(release / 'release-manifest.template.json', template)
     artifact = tmp_path / 'release.tar'; build.deterministic_tar(release, artifact)
     identity = af.verification_identity(artifact=artifact, sources=source,
