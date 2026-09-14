@@ -6,6 +6,7 @@ All clip + budget mutations occur in the caller's receipt transaction or one
 short IMMEDIATE transaction. No network calls belong in these transactions.
 """
 from dataclasses import dataclass
+import json
 from typing import Callable, Any
 from . import store
 from .store import ClipState as C
@@ -74,12 +75,15 @@ class OperationController:
                 return False
             if deal is None or it['deal_id'] != run.did or any(
                     it[k] != run.it[k] for k in ('spec_json', 'plan_json', 'kind')) or (
-                    deal['inst_json'] != run.deal['inst_json']):
+                    any(deal[k] != run.deal[k] for k in ('inst_json', 'owner_json', 'chain', 'token',
+                                                    'token_dec', 'symbol', 'perp_venue', 'sim'))):
                 raise store.StoreError('admission frozen context changed')
             require_resolved(self.con, deal)
             op = store.operation_of_intent(self.con, run.iid)
             if (op['id'] if op else None) != run.op_id:
                 raise store.StoreError('admission root changed')
+            if op is not None and op['bounds_hash'] != store._json_hash(json.loads(it['spec_json']).get('approval')):
+                raise store.StoreError('admission approved bounds changed')
             if not store.set_intent_status(self.con, run.iid, store.IntentStatus.RUNNING,
                                            expect=store.IntentStatus.APPROVED):
                 raise store.StoreError('admission CAS failed')
@@ -130,7 +134,8 @@ class OperationController:
             if it is None or deal is None or it['deal_id'] != run.did:
                 raise store.StoreError('operation context no longer exists')
             if any(it[k] != run.it[k] for k in ('spec_json', 'plan_json', 'kind')) or (
-                    deal['inst_json'] != run.deal['inst_json']):
+                    any(deal[k] != run.deal[k] for k in ('inst_json', 'owner_json', 'chain', 'token',
+                                                    'token_dec', 'symbol', 'perp_venue', 'sim'))):
                 raise store.StoreError('operation frozen context changed')
             if it['status'] != store.IntentStatus.RUNNING:
                 raise store.StoreError('operation is no longer running')
@@ -138,7 +143,9 @@ class OperationController:
             if (op['id'] if op else None) != run.op_id:
                 raise store.StoreError('operation root changed')
             if decision.intent_state == store.IntentStatus.DONE or decision.deal_state in (
-                    store.DealState.CLOSED, store.DealState.ABORTED):
+                    store.DealState.OPEN, store.DealState.CLOSED, store.DealState.ABORTED) or any(
+                        state in (store.OpState.OPEN, store.OpState.CLOSED, store.OpState.ABANDONED)
+                        for state in decision.root_states):
                 require_resolved(self.con, deal)
             for target in decision.root_states:
                 if op is None:

@@ -25,6 +25,73 @@ class NativeNotSubmitted(AdapterError):
         super().__init__(ErrorKind.REJECTED, 'native journal proves no submission')
 
 
+@dataclass
+class ComposedClip:
+    """One clip's composed adapters and the exact bindings they close over."""
+    first: object
+    second: object
+    spot_bindings: object
+    perp_bindings: object
+    perp_captured: dict
+    spot_captured: dict
+
+
+def build_perp_binding(con, *, deal, clip_id, native, account, fill_venue, clock, authorize,
+                      client_id=None):
+    """Build the frozen perpetual spec and its real clip-scoped binding once.
+
+    The helper intentionally retains the account/continuation/native journal
+    fences from submit_ioc.  ``captured_by_attempt`` is a compatibility view
+    of the native result, never a second journal.
+    """
+    from .execution_scope import continuation_identity
+    _account_gate(con, deal, native, account)
+    native = _connection_native(native, con, account)
+    clip = store.get_clip(con, clip_id)
+    intent = store.get_intent(con, clip['intent_id']) if clip else None
+    if intent is None or intent['deal_id'] != deal['id']:
+        raise AdapterError(ErrorKind.IDENTITY, 'attempt, clip and frozen deal differ')
+    spec = map_perpetual(deal, account=account, filters=native.filters(deal['symbol']),
+                         metadata_revision='frozen:' + deal['id'],
+                         continuation_evidence=continuation_identity(con, deal, intent['kind']))
+    attach = getattr(native, 'bind_execution_journal', None)
+    barrier = attach(con, account) if callable(attach) else None
+    journal = PerpJournal(con, clip_id=clip_id, fill_venue=fill_venue, spec=spec, send_barrier=barrier)
+    bindings = bind(native, journal=journal, authorize=authorize,
+                    attempt_lookup=journal.lookup, on_signed=journal.on_signed,
+                    clock=clock, hedge=True,
+                    links=dict(deal_id=journal.deal_id, intent_id=journal.intent_id, clip_id=clip_id))
+    captured_by_attempt = {}
+    native_submit = bindings.submit
+
+    def submit(leg, prepared):
+        fill = native_submit(leg, prepared)
+        if fill.client_id != prepared.attempt_id:
+            raise AdapterError(ErrorKind.IDENTITY, 'native result belongs to another attempt')
+        captured_by_attempt.setdefault(prepared.attempt_id, []).append(fill)
+        return fill
+
+    bindings.submit = submit
+    bindings._captured_by_attempt = captured_by_attempt
+    return spec, bindings, captured_by_attempt
+
+
+def compose_clip_pair(registry, *, spot_spec, spot_bindings, perp_spec, perp_bindings):
+    """Compose exactly one clip pair through the runtime registry."""
+    from .registry import AdapterRegistry
+    if isinstance(registry, AdapterRegistry):
+        from .context import AdapterContext
+        context = AdapterContext()
+        context.add(spot_spec, spot_bindings)
+        context.add(perp_spec, perp_bindings)
+    else:
+        context = {spot_spec.leg_id: spot_bindings, perp_spec.leg_id: perp_bindings}
+    pair = registry.compose(spot_spec, perp_spec, context)
+    return ComposedClip(pair.first, pair.second, spot_bindings, perp_bindings,
+                        getattr(perp_bindings, '_captured_by_attempt', {}),
+                        getattr(spot_bindings, '_captured_by_attempt', {}))
+
+
 def recover_not_submitted(con, *, deal, clip_id, native, account, client_id):
     """Resolve the claim/native-prepare crash gap under the sole execution owner.
 
@@ -63,7 +130,7 @@ def recover_not_submitted(con, *, deal, clip_id, native, account, client_id):
 
 
 def submit_ioc(con, *, deal, clip_id, native, account, fill_venue, client_id,
-               side, quantity, price, reduce_only, clock, authorize, registry=None):
+               side, quantity, price, reduce_only, clock, authorize, registry=None, pair=None):
     persisted = store.get_deal(con, deal['id'])
     clip = store.get_clip(con, clip_id)
     intent = store.get_intent(con, clip['intent_id']) if clip else None
@@ -77,39 +144,33 @@ def submit_ioc(con, *, deal, clip_id, native, account, fill_venue, client_id,
     expected_venue = ('sim:' if deal['sim'] else '') + deal['perp_venue']
     if fill_venue != expected_venue or native.venue != deal['perp_venue']:
         raise AdapterError(ErrorKind.IDENTITY, 'native venue differs from frozen deal')
-    _account_gate(con, deal, native, account)
-    native = _connection_native(native, con, account)
-    from .execution_scope import continuation_identity, check_continuation_action
+    from .execution_scope import check_continuation_action
     check_continuation_action(con, deal, intent, side, quantity, reduce_only)
-    spec = map_perpetual(deal, account=account, filters=native.filters(deal['symbol']),
-                         metadata_revision='frozen:' + deal['id'],
-                         continuation_evidence=continuation_identity(con, deal, intent['kind']))
-    attach = getattr(native, 'bind_execution_journal', None)
-    barrier = attach(con, account) if callable(attach) else None
-    journal = PerpJournal(con, clip_id=clip_id, fill_venue=fill_venue, spec=spec, send_barrier=barrier)
-    bindings = bind(native, journal=journal, authorize=authorize,
-                    attempt_lookup=journal.lookup, on_signed=journal.on_signed,
-                    clock=clock, hedge=True,
-                    links=dict(deal_id=journal.deal_id, intent_id=journal.intent_id, clip_id=clip_id))
-    native_submit = bindings.submit
-    captured = []
-
-    def submit(leg, prepared):
-        fill = native_submit(leg, prepared)
-        if fill.client_id != prepared.attempt_id:
-            raise AdapterError(ErrorKind.IDENTITY, 'native result belongs to another attempt')
-        captured.append(fill)
-        return fill
-
-    bindings.submit = submit
-    adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
+    if pair is not None and hasattr(pair, 'perp_bindings'):
+        bindings = pair.perp_bindings
+        captured_by_attempt = pair.perp_captured
+        from .execution_scope import continuation_identity
+        _account_gate(con, deal, native, account)
+        spec = map_perpetual(deal, account=account, filters=native.filters(deal['symbol']),
+                            metadata_revision='frozen:' + deal['id'],
+                            continuation_evidence=continuation_identity(con, deal, intent['kind']))
+    else:
+        spec, bindings, captured_by_attempt = build_perp_binding(
+            con, deal=deal, clip_id=clip_id, native=native, account=account,
+            fill_venue=fill_venue, clock=clock, authorize=authorize, client_id=client_id)
+    if pair is not None:
+        if pair.second.describe() != spec:
+            raise AdapterError(ErrorKind.IDENTITY, 'composed perpetual leg differs from frozen spec')
+        adapter = pair.second
+    else:
+        adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
     action = Action(client_id, spec.leg_id, side, quantity, reduce_only)
     prepared = adapter.prepare(client_id, adapter.quote(action, {'price_cap': price}))
     result = adapter.submit(prepared)
     if result.status == Status.UNKNOWN and recover_not_submitted(
             con, deal=deal, clip_id=clip_id, native=native, account=account, client_id=client_id):
         raise NativeNotSubmitted()
-    return _compat(result, captured, client_id)
+    return _compat(result, captured_by_attempt.get(client_id, ()), client_id)
 
 
 def _compat(result, captured, client_id):

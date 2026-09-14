@@ -51,6 +51,12 @@ class CredentialProvider:
                     raise
             return self._cache[scope]
 
+    @staticmethod
+    def _mode(mode, loaded, label):
+        # A cached credential is a ceiling, never a reason to silently escalate.
+        if K.effective_mode(mode, loaded.mode) != mode:
+            raise K.ModeForbidden(f'{label} permissions require restart')
+
     def evm(self, mode, wallet):
         if mode == 'dry':
             raise K.KeysForbidden('dry: EVM credentials are not loaded')
@@ -64,12 +70,12 @@ class CredentialProvider:
         k = self.once('evm', load)
         if not wallet or K._lc(wallet) != K._lc(k.evm_address):
             raise K.KeyMismatch('configured EVM wallet differs from signing account')
-        if K.effective_mode(mode, k.mode) != mode:
-            raise K.ModeForbidden('EVM signing permissions require restart')
+        self._mode(mode, k, 'EVM signing')
         return k
 
-    def legacy(self, cfg, mode):
-        evm = self.evm(mode, cfg.get('wallets.bsc'))
+    def aster(self, cfg, mode):
+        if mode == 'dry':
+            raise K.KeysForbidden('dry: Aster credentials are not loaded')
         def load():
             raw = self._env.pop(K.ASTER_KEY_ENV, None)
             acct = K._from_key(K._account_cls(), raw, K.ASTER_KEY_ENV)
@@ -81,8 +87,22 @@ class CredentialProvider:
                 raise K.KeyMismatch('Aster signer identity mismatch')
             if eu and K._lc(eu) != K._lc(user):
                 raise K.KeyMismatch('Aster user identity mismatch')
-            return K.Keys(mode, evm.evm_address, user, acct.address, K.SignerKey(acct, 'aster'), evm.evm)
-        return self.once('aster', load)
+            return AsterCredentials(mode, user, acct.address, K.SignerKey(acct, 'aster'))
+        user = cfg.get('wallets.aster_user')
+        signer = cfg.get('wallets.aster_signer')
+        k = self.once('aster', load)
+        if not user or not signer or (K._lc(user), K._lc(signer)) != k.identity:
+            raise K.KeyMismatch('configured Aster identity differs from signing credentials')
+        self._mode(mode, k, 'Aster signing')
+        return k
+
+    def legacy(self, cfg, mode):
+        # Historical alias: compose the two independent credential scopes only when
+        # the legacy EVM×Aster profile is actually requested.
+        evm = self.evm(mode, cfg.get('wallets.bsc'))
+        aster = self.aster(cfg, mode)
+        return K.Keys(mode, evm.evm_address, aster.aster_user, aster.aster_signer,
+                      aster.aster, evm.evm)
 
     def gate(self):
         def load():
@@ -107,7 +127,12 @@ class CredentialProvider:
                 file_name = cfg.env_name('spot.solana.keypair_file_env')
                 secret = K._load_solana(raw, self._env.get(file_name), name, file_name, wallet)
             return SolanaCredentials(mode, wallet, secret, **K._api_creds(cfg, self._env))
-        return self.once('solana', load)
+        k = self.once('solana', load)
+        wallet = cfg.get('wallets.sol_hl.solana_address')
+        if wallet and K._lc(wallet) != K._lc(k.solana_address):
+            raise K.KeyMismatch('configured Solana wallet differs from cached credentials')
+        self._mode(mode, k, 'Solana signing')
+        return k
 
     def hyperliquid(self, cfg, mode):
         if mode == 'dry':
@@ -119,7 +144,12 @@ class CredentialProvider:
             agent = cfg.get('wallets.sol_hl.hl_agent_address')
             signer = K._load_hl_agent(raw, name, agent, user, account) if mode == 'live' else None
             return HlCredentials(mode, user, account, cfg.get('wallets.sol_hl.hl_vault_address'), agent, signer)
-        return self.once('hyperliquid', load)
+        k = self.once('hyperliquid', load)
+        user, account = cfg.get('wallets.sol_hl.hl_user_address'), cfg.get('wallets.sol_hl.hl_account_address')
+        if (user and K._lc(user) != K._lc(k.hl_user)) or (account and K._lc(account) != K._lc(k.hl_account)):
+            raise K.KeyMismatch('configured Hyperliquid identity differs from cached credentials')
+        self._mode(mode, k, 'Hyperliquid signing')
+        return k
 
     def sol_hl(self, cfg, mode):
         # Historical alias only: each half loads independently and is reusable by another composition.
@@ -137,6 +167,18 @@ class ModeCredentials:
 
     def __reduce__(self):
         raise TypeError('credentials cannot be serialized')
+
+
+@dataclass(frozen=True, repr=False)
+class AsterCredentials(ModeCredentials):
+    mode: str
+    aster_user: str
+    aster_signer: str
+    aster: object
+
+    @property
+    def identity(self):
+        return K._lc(self.aster_user), K._lc(self.aster_signer)
 
 
 @dataclass(frozen=True, repr=False)

@@ -1256,23 +1256,33 @@ class SolEngine:
 
         def apply(o: SwapOutcome) -> None:
             apply_swap(con, run.did, clip_id, run.op_id, amount, o)
+        def apply_presend_refusal():
+            from .adapters.spot_execution import reject_unsigned_sol
+            if not reject_unsigned_sol(con, deal=run.deal, clip_id=clip_id, native=legs.spot, logical=logical):
+                store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
+                raise Pause("dex_unknown", "нет доказательства отсутствия отправки Solana")
+            OperationController(con).settle_spot(clip_id, SpotSettlement(False),
+                operation_id=run.op_id, reserve_raw=amount)
+
         try:
             from .adapters.spot_execution import submit_sol
+            context = self.e._compose_context(run, clip_id, account=legs.account_id,
+                authorize=lambda *_: self._agent_gate(run, "hedge"))
             out = submit_sol(con, deal=run.deal, clip_id=clip_id, native=legs.spot, router=legs.router,
                              decision=dec, request=req, logical=logical, metadata=meta,
                              min_validity_heights=_lim(run.cfg, "min_blockhash_validity_heights"), apply=apply,
                              authorize=lambda leg, action: self.guard(run, entry=run.kind == "entry"),
-                             clock=self.e.clock, block_height=legs.block_height,
+                             clock=self.e.clock, block_height=legs.block_height, compose_context=context,
                              registry=getattr(self.e.legs, 'adapters', None))
         except PresendRefused as e:
-            apply(SwapOutcome("not_sent", None, None, reason=str(e)))
+            apply_presend_refusal()
             store.event(con, "dex_not_sent", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, err=redact(e))
             raise Pause("dex_refused", f"своп не отправлен: {redact(e)}") from None
         except Exception as e:        # noqa
             if not legs.sim and legs.spot.touched(con, logical):
                 store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
                 raise Pause("dex_unknown", f"исход свопа неизвестен: {type(e).__name__}: {redact(e)}") from None
-            apply(SwapOutcome("not_sent", None, None, reason=type(e).__name__))
+            apply_presend_refusal()
             raise Pause("dex_refused", f"своп не отправлен: {type(e).__name__}: {redact(e)}") from None
         run.swap = out
         store.event(con, "dex", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, status=out.state, tx=out.signature,
@@ -1344,6 +1354,7 @@ class SolEngine:
                                   client_id=cid, side=side, quantity=q, price=cap,
                                   reduce_only=reduce_only, clock=self.e.clock,
                                   authorize=lambda leg, action: self._agent_gate(run, "hedge"),
+                                  pair=getattr(run, "_clip_contexts", {}).get(clip_id, {}).get("pair"),
                                   registry=getattr(self.e.legs, 'adapters', None))
             except Exception as e:    # noqa — до отправки (ворота, параметры, незакрытая заявка) — или после подписи
                 row = store.get_perp_order(con, cid)
@@ -1561,9 +1572,10 @@ class SolEngine:
             new = DealState.OPEN
         else:
             new = DealState.PAUSED
-        self.e._set_deal(run.did, new, reason="сбалансировано" if new == DealState.PAUSED else None,
-                         carry=dl if dl is not None else None, now=self.e.clock())
-        store.set_intent_status(con, run.iid, IntentStatus.DONE)
+        from .operations import EndDecision
+        OperationController(con).commit_end(run, EndDecision(new, IntentStatus.DONE,
+            fields={"carry": dl if dl is not None else None},
+            reason="сбалансировано" if new == DealState.PAUSED else None), now=self.e.clock())
         store.event(con, "fixed", deal_id=run.did, intent_id=run.iid, intent_kind=run.kind,
                     what=noop or f"{side} {qty} = {usd}", state=str(new))
         self.e.hooks.report(v.fix_done(v.FixDoneView(

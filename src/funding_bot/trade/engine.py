@@ -2002,11 +2002,22 @@ class Engine:
 
     def _release_unstarted_root(self, run: Run) -> None:
         con = self.conns.get()
-        op = store.operation_of_intent(con, run.iid)
-        if op and op['state'] == store.OpState.APPROVED and not int(op['reserved_raw']):
-            store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason='plan not started')
-            if not int(op['confirmed_raw']):
-                store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason='plan not started')
+        from .adapters.obligations import unresolved
+        with store.tx(con):
+            op = store.operation_of_intent(con, run.iid)
+            deal = store.get_deal(con, run.did)
+            if op and op['state'] == store.OpState.APPROVED:
+                if unresolved(con, deal):
+                    store.set_operation_state(con, op['id'], store.OpState.PAUSED_UNKNOWN,
+                                              reason='unresolved prerequisite')
+                    if deal['state'] == DealState.DRAFT:
+                        store.set_deal_state(con, run.did, DealState.ENTERING)
+                        store.set_deal_state(con, run.did, DealState.PAUSED, reason='unresolved prerequisite')
+                else:
+                    store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason='plan not started')
+                    if not int(op['confirmed_raw']):
+                        store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason='plan not started')
+
     def _abort_draft(self, run: Run) -> None:
         self._release_unstarted_root(run)
         con = self.conns.get()
@@ -2251,6 +2262,22 @@ class Engine:
         return bool(self.conns.get().execute("SELECT count(*) FROM dex_txs WHERE clip_id=? AND state != 'DROPPED'",
                                              (clip_id,)).fetchone()[0])
 
+    def _compose_context(self, run, clip_id, *, account, authorize):
+        """Keep the exact clip bindings alive through spot and every hedge child."""
+        from .adapters.execution import build_perp_binding
+        from .adapters.registry import production_registry
+        contexts = getattr(run, '_clip_contexts', None)
+        if contexts is None:
+            contexts = run._clip_contexts = {}
+        if clip_id not in contexts:
+            spec, bindings, _ = build_perp_binding(
+                self.conns.get(), deal=run.deal, clip_id=clip_id, native=run.legs.perp,
+                account=account, fill_venue=run.legs.fill_venue, clock=self.clock, authorize=authorize)
+            registry = self.legs if callable(getattr(self.legs, 'compose', None)) else (
+                getattr(self.legs, 'adapters', None) or production_registry())
+            contexts[clip_id] = dict(registry=registry, perp_spec=spec, perp_bindings=bindings)
+        return contexts[clip_id]
+
     def _dex(self, run: Run, clip_id: int, t_in: str, t_out: str, units: int, retry: bool = True):
         """Своп клипа с записью-до. Не отправлено — DEX_REVERTED (ничего не двигалось) и пауза; исход неизвестен —
         DEX_UNKNOWN и пауза; откат в сети — один повтор по свежей котировке, второй — пауза."""
@@ -2260,10 +2287,14 @@ class Engine:
                                               reserve_raw=int(units) if run.op_id else None, retry_reverted=True)
         try:
             from .adapters.spot_execution import submit_evm
+            from .adapters.execution_scope import account_for
+            context = self._compose_context(run, clip_id,
+                account=account_for(con, run.deal, run.legs.perp),
+                authorize=lambda *_: self._authorize_child(run))
             res = submit_evm(con, deal=run.deal, clip_id=clip_id, native=run.legs.spot,
                              stable=run.stable, stable_dec=run.sdec, token_in=t_in, token_out=t_out,
                              amount_raw=int(units), clock=self.clock, authorize=lambda *_: self._authorize_child(run),
-                             registry=getattr(self.legs, 'adapters', None))
+                             compose_context=context, registry=getattr(self.legs, 'adapters', None))
         except Exception as e:                 # noqa
             if isinstance(e, SentUnknown) or (not run.legs.sim and self._dex_touched(clip_id)):
                 store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
@@ -2384,6 +2415,7 @@ class Engine:
                                   account=account, fill_venue=run.legs.fill_venue, client_id=cid,
                                   side=side, quantity=q, price=cap, reduce_only=ro, clock=self.clock,
                                   authorize=lambda *_: self._authorize_child(run),
+                                  pair=getattr(run, '_clip_contexts', {}).get(clip_id, {}).get('pair'),
                                   registry=getattr(self.legs, 'adapters', None))
             except Exception as e:             # noqa — до отправки: ворота, бюджет, параметры, сбой записи-до
                 row = store.get_perp_order(con, cid)
@@ -2758,9 +2790,10 @@ class Engine:
         hr = self._hedge(run, clip_id, "BUY", bk.short, True)
         self._after_hedge(run, clip_id, hr, bk.delta(run.dec))
         self._backfill(run)
-        store.set_intent_status(con, run.iid, IntentStatus.DONE)
-        self._set_deal(run.did, DealState.PAUSED, reason="перп закрыт, спот остался — «откат» продаст спот"
-                       if run.m_known else "перп закрыт, спот остался — «выход» продаст спот")
+        from .operations import EndDecision
+        OperationController(con).commit_end(run, EndDecision(DealState.PAUSED, IntentStatus.DONE,
+            reason="перп закрыт, спот остался — «откат» продаст спот" if run.m_known else
+                   "перп закрыт, спот остался — «выход» продаст спот"))
         after = deal_book(con, run.did)
         v = _views()
         tokens = after.tokens(run.dec)
@@ -2862,8 +2895,9 @@ class Engine:
         else:
             new, fields = DealState.PAUSED, {"carry": bk.delta(run.dec)}
         self._backfill(run)
-        self._set_deal(run.did, new, reason="сбалансировано" if new == DealState.PAUSED else None, **fields)
-        store.set_intent_status(con, run.iid, IntentStatus.DONE)
+        from .operations import EndDecision
+        OperationController(con).commit_end(run, EndDecision(new, IntentStatus.DONE, fields=fields,
+            reason="сбалансировано" if new == DealState.PAUSED else None))
         what = noop or f"{side or 'DEX'} {qty} = {usd}"                  # журнал: сырые числа
         store.event(con, "fixed", deal_id=run.did, intent_id=run.iid, intent_kind=run.kind, what=what, state=str(new))
         v = _views()

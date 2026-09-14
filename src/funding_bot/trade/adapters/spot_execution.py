@@ -73,7 +73,7 @@ class SpotJournal:
 
 
 def submit_evm(con, *, deal, clip_id, native, stable, stable_dec, token_in, token_out,
-               amount_raw, clock, authorize, registry=None):
+               amount_raw, clock, authorize, registry=None, pair=None, compose_context=None):
     from .execution_scope import continuation_identity
     clip = store.get_clip(con, clip_id)
     intent = store.get_intent(con, clip['intent_id']) if clip else None
@@ -100,7 +100,18 @@ def submit_evm(con, *, deal, clip_id, native, stable, stable_dec, token_in, toke
         captured.append(result)
         return result
     bindings.submit = submit
-    adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
+    bindings._captured_by_attempt = {aid: captured}
+    if compose_context is not None and pair is None:
+        from .execution import compose_clip_pair
+        pair = compose_clip_pair(compose_context['registry'], spot_spec=spec, spot_bindings=bindings,
+                                 perp_spec=compose_context['perp_spec'], perp_bindings=compose_context['perp_bindings'])
+        compose_context['pair'] = pair
+    if pair is not None:
+        if pair.first.describe() != spec:
+            raise AdapterError(ErrorKind.IDENTITY, 'composed spot leg differs from frozen spec')
+        adapter = pair.first
+    else:
+        adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
     action = Action(aid, spec.leg_id, side, quantity)
     bounds = {'spend': from_raw(amount_raw, stable_dec)} if side == 'BUY' else {'min_receive': D(0)}
     prepared = adapter.prepare(aid, adapter.quote(action, bounds))
@@ -139,8 +150,35 @@ def sol_spec(deal, native, *, wallet=None):
                    metadata_revision='frozen:' + deal['id'], legacy_hash=inst.inst_hash())
 
 
+def reject_unsigned_sol(con, *, deal, clip_id, native, logical):
+    """Prove a local pre-submit refusal without fabricating a chain receipt.
+
+    No native attempt is safe only before the common send claim. After a claim,
+    require the native journal's explicit unsigned-abandonment proof.
+    """
+    with exclusive_transaction(con):
+        if native.touched(con, logical):
+            return False
+        attempts = native.attempts(con, logical)
+        claims = con.execute("SELECT 1 FROM exec_events WHERE kind='adapter_spot_claimed' "
+                             "AND clip_id=? AND json_extract(json,'$.attempt_id')=?",
+                             (clip_id, logical)).fetchone()
+        if (attempts and any(a['state'] != 'ABANDONED_UNSIGNED' for a in attempts)) or (
+                claims and not attempts):
+            return False
+        done = con.execute("SELECT 1 FROM exec_events WHERE kind='adapter_spot_terminal' "
+                           "AND clip_id=? AND json_extract(json,'$.attempt_id')=?",
+                           (clip_id, logical)).fetchone()
+        if not done:
+            store.event(con, 'adapter_spot_terminal', deal_id=deal['id'], clip_id=clip_id,
+                        attempt_id=logical, status=Status.REJECTED.value,
+                        proof='native_unsigned' if attempts else 'before_common_claim')
+        return True
+
+
 def submit_sol(con, *, deal, clip_id, native, router, decision, request, logical,
-               metadata, min_validity_heights, apply, authorize, clock, block_height, registry=None):
+               metadata, min_validity_heights, apply, authorize, clock, block_height, registry=None, pair=None,
+               compose_context=None):
     """Use the already approved/reselected route; do not choose a second route."""
     from .spot_bindings import solana
     from .contracts import from_raw
@@ -165,10 +203,29 @@ def submit_sol(con, *, deal, clip_id, native, router, decision, request, logical
             errors.append(exc)
             raise
     bindings.submit = submit
-    adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
+    bindings._captured_by_attempt = {logical: captured}
+    if compose_context is not None and pair is None:
+        from .execution import compose_clip_pair
+        pair = compose_clip_pair(compose_context['registry'], spot_spec=spec, spot_bindings=bindings,
+                                 perp_spec=compose_context['perp_spec'], perp_bindings=compose_context['perp_bindings'])
+        compose_context['pair'] = pair
+    if pair is not None:
+        if pair.first.describe() != spec:
+            raise AdapterError(ErrorKind.IDENTITY, 'composed spot leg differs from frozen spec')
+        adapter = pair.first
+    else:
+        adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
+    # Keep the common quote bound tied to the already approved route. BUY has
+    # no separate min-out field in the common contract, so its quantity is the
+    # route's effective on-chain minimum; SELL keeps the exact token input.
+    winner = decision.winner
+    minimum_raw = winner.effective_min_out if winner is not None else None
+    if minimum_raw is None:
+        raise AdapterError(ErrorKind.REJECTED, 'approved Solana route has no minimum receive')
     action = Action(logical, spec.leg_id, side,
-                    from_raw(1 if side == 'BUY' else request.amount_in_raw, spec.decimals))
-    bounds = {'spend': from_raw(request.amount_in_raw, spec.quote_decimals)} if side == 'BUY' else {'min_receive': D(0)}
+                    from_raw(minimum_raw if side == 'BUY' else request.amount_in_raw, spec.decimals))
+    bounds = ({'spend': from_raw(request.amount_in_raw, request.input.decimals)} if side == 'BUY' else
+              {'min_receive': from_raw(minimum_raw, request.output.decimals)})
     prepared = adapter.prepare(logical, adapter.quote(action, bounds))
     result = adapter.submit(prepared)
     if result.terminal and captured:
@@ -177,7 +234,22 @@ def submit_sol(con, *, deal, clip_id, native, router, decision, request, logical
                         attempt_id=logical, status=result.status.value,
                         native_ref=result.native_ref.id if result.native_ref else None)
         return captured[0]
-    # Preserve the native presend/no-sign proof path owned by the caller. A
+    # NativeAdapter maps post-claim exceptions to UNKNOWN. An
+    # ABANDONED_UNSIGNED attempt is the only safe exception: the native
+    # journal proves that no signature existed, so synchronize the common
+    # journal as terminal REJECTED and let sol_flow apply its not-sent gate.
+    # Expiry or an absent attempt alone never proves this.
+    attempts = getattr(native, 'attempts', lambda *_: [])(con, logical)
+    unsigned = [a for a in attempts if a.get('state') == 'ABANDONED_UNSIGNED']
+    if unsigned and not getattr(native, 'touched', lambda *_: True)(con, logical):
+        attempt_id = unsigned[-1]['attempt_id']
+        if not any(e.get('attempt_id') == logical for e in journal._event('adapter_spot_terminal')):
+            with exclusive_transaction(con):
+                store.event(con, 'adapter_spot_terminal', deal_id=deal['id'], clip_id=clip_id,
+                            attempt_id=logical, status=Status.REJECTED.value, native_ref=attempt_id)
+        from ..sol_exec import PresendRefused
+        raise PresendRefused('подпись не создана — своп не отправлялся')
+    # Preserve the native presend/no-sign path owned by the caller. A
     # signed/touched attempt remains UNKNOWN there and cannot release reserve.
     if errors:
         raise errors[0]
