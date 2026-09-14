@@ -1,4 +1,4 @@
-"""Version 1 value contracts; no exchange, wallet, database or UI imports."""
+"""Versioned value contracts; no exchange, wallet, database or UI imports."""
 from dataclasses import dataclass, asdict
 from decimal import Decimal
 from enum import StrEnum
@@ -91,6 +91,8 @@ class LegSpec:
     version: int = 1
     # Original frozen record is a reference, never reserialized or written back.
     legacy_hash: str | None = None
+    # Appended in M4 so legacy positional LegSpec construction remains stable.
+    quote_decimals: int | None = None
 
     def __post_init__(self):
         if self.version != 1 or self.direction not in {'long', 'short'}:
@@ -101,8 +103,10 @@ class LegSpec:
                 raise AdapterError(ErrorKind.IDENTITY, f'missing {name}')
         for name in ('multiplier', 'step', 'tick'):
             decimal(getattr(self, name), name, positive=True)
-        if self.decimals is not None and (type(self.decimals) is not int or not 0 <= self.decimals <= 36):
-            raise AdapterError(ErrorKind.INVALID, 'invalid token decimals')
+        for name in ('decimals', 'quote_decimals'):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or not 0 <= value <= 36):
+                raise AdapterError(ErrorKind.INVALID, f'invalid {name}')
         if self.direction == 'short' and not self.capabilities.short:
             raise AdapterError(ErrorKind.UNSUPPORTED, 'leg cannot hold short exposure')
         if self.capabilities.network_family and not self.network:
@@ -187,6 +191,45 @@ class Prepared:
 
 
 @dataclass(frozen=True)
+class NativeRef:
+    kind: str
+    id: str
+
+    def __post_init__(self):
+        if not isinstance(self.kind, str) or not self.kind or not isinstance(self.id, str) or not self.id:
+            raise AdapterError(ErrorKind.INVALID, 'native reference kind/id required')
+
+
+@dataclass(frozen=True)
+class RawAmount:
+    asset_id: str
+    raw: int
+    decimals: int
+
+    def __post_init__(self):
+        if not isinstance(self.asset_id, str) or not self.asset_id:
+            raise AdapterError(ErrorKind.IDENTITY, 'raw amount asset required')
+        if type(self.raw) is not int or self.raw < 0:
+            raise AdapterError(ErrorKind.INVALID, 'raw amount must be a non-negative integer')
+        if type(self.decimals) is not int or not 0 <= self.decimals <= 36:
+            raise AdapterError(ErrorKind.INVALID, 'raw amount decimals invalid')
+
+    @property
+    def amount(self):
+        return D(self.raw) / D(10) ** self.decimals
+
+
+@dataclass(frozen=True)
+class QuoteAmount:
+    amount: D
+    currency: str
+
+    def __post_init__(self):
+        if decimal(self.amount, 'quote amount') < 0 or not isinstance(self.currency, str) or not self.currency:
+            raise AdapterError(ErrorKind.INVALID, 'quote amount/currency invalid')
+
+
+@dataclass(frozen=True)
 class Result:
     status: Status
     executed_quantity: D | None
@@ -197,6 +240,16 @@ class Result:
     terminal: bool = False
     error: ErrorKind | None = None
     fees_complete: bool = False
+    version: int = 1
+    leg_id: str | None = None
+    spec_hash: str | None = None
+    scope: tuple | None = None
+    native_ref: NativeRef | None = None
+    spot_input_raw: RawAmount | None = None
+    spot_output_raw: RawAmount | None = None
+    perp_quote: QuoteAmount | None = None
+    trade_notional: QuoteAmount | None = None
+    avg_price: QuoteAmount | None = None
 
     def __post_init__(self):
         if self.executed_quantity is not None and decimal(self.executed_quantity, 'executed quantity') < 0:
@@ -207,6 +260,29 @@ class Result:
             raise AdapterError(ErrorKind.INVALID, 'unknown outcome is not terminal')
         if self.status == Status.SETTLED and (self.provisional or not self.terminal or self.executed_quantity is None):
             raise AdapterError(ErrorKind.INVALID, 'settled requires proven execution')
+        if self.version not in (1, 2):
+            raise AdapterError(ErrorKind.INVALID, 'unsupported result version')
+        if self.version == 2:
+            if (not isinstance(self.leg_id, str) or not self.leg_id or
+                    not isinstance(self.spec_hash, str) or not self.spec_hash or not isinstance(self.scope, tuple)
+                    or not self.scope or not isinstance(self.native_ref, NativeRef)):
+                raise AdapterError(ErrorKind.IDENTITY, 'v2 result identity incomplete')
+            one_spot = (self.spot_input_raw is None) != (self.spot_output_raw is None)
+            if one_spot:
+                raise AdapterError(ErrorKind.INVALID, 'spot input/output must be paired')
+            one_perp = (self.perp_quote is None) != (self.trade_notional is None)
+            if one_perp:
+                raise AdapterError(ErrorKind.INVALID, 'perpetual quote/notional must be paired')
+            if self.spot_input_raw is not None and self.perp_quote is not None:
+                raise AdapterError(ErrorKind.INVALID, 'spot and perpetual accounting cannot be mixed')
+            if self.executed_quantity is not None and self.executed_quantity > 0:
+                spot_complete = self.spot_input_raw is not None and self.spot_output_raw is not None
+                perp_complete = self.perp_quote is not None and self.trade_notional is not None
+                if not (spot_complete or perp_complete):
+                    raise AdapterError(ErrorKind.INVALID, 'v2 execution accounting incomplete')
+            if (self.status == Status.SETTLED and
+                    (self.executed_quantity is None or self.executed_quantity <= 0)):
+                raise AdapterError(ErrorKind.INVALID, 'v2 settled execution must be positive')
 
 
 @dataclass(frozen=True)

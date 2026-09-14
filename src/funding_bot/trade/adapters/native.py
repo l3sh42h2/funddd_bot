@@ -8,7 +8,7 @@ from decimal import Decimal as D
 import time
 from typing import Callable
 from .contracts import (Action, AdapterError, ErrorKind, Observation, Prepared, Quote,
-                        Result, Status, ExecutionPage)
+                        Result, Status, ExecutionPage, NativeRef)
 from . import outcomes
 
 
@@ -72,6 +72,12 @@ class NativeAdapter:
         if quote.expires_at <= self.bindings.clock():
             raise AdapterError(ErrorKind.STALE, 'quote expired')
 
+    def _unknown_attempt(self, attempt_ref, *, operation='attempt'):
+        return Result(Status.UNKNOWN, None, 'unresolved', True,
+                      (f'{operation}:{attempt_ref}',), error=ErrorKind.UNKNOWN,
+                      version=2, leg_id=self.spec.leg_id, spec_hash=self.spec.fingerprint,
+                      scope=self.spec.scope, native_ref=NativeRef('attempt', attempt_ref))
+
     def prepare(self, attempt_id: str, quote: Quote):
         self._fresh(quote)
         if not attempt_id:
@@ -91,8 +97,7 @@ class NativeAdapter:
             return self.normalize(native, prepared.quote.action.side)
         except Exception:
             # After claim an exception cannot prove zero execution, even a parser error.
-            return Result(Status.UNKNOWN, None, 'unresolved', True,
-                          (f'attempt:{prepared.attempt_id}',), error=ErrorKind.UNKNOWN)
+            return self._unknown_attempt(prepared.attempt_id)
 
     def resolve(self, attempt_ref):
         # Native resolver must recover side/amounts from its persisted attempt, not a new plan.
@@ -109,8 +114,7 @@ class NativeAdapter:
             native, side = self.bindings.cancel(self.spec, attempt_ref)
             return self.normalize(native, side)
         except Exception:
-            return Result(Status.UNKNOWN, None, 'unresolved', True,
-                          (f'cancel:{attempt_ref}',), error=ErrorKind.UNKNOWN)
+            return self._unknown_attempt(attempt_ref, operation='cancel')
 
     def read_executions(self, cursor):
         page = self._read(self.bindings.executions, self.spec, cursor)
@@ -123,7 +127,7 @@ class FuturesAdapter(NativeAdapter):
     market_kind = 'perpetual'
 
     def normalize(self, native, side):
-        return outcomes.perpetual(native, self.spec.scope)
+        return outcomes.perpetual(native, self.spec.scope, spec=self.spec, side=side)
 
 
 class EvmSpotAdapter(NativeAdapter):
