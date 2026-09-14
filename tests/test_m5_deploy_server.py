@@ -25,6 +25,14 @@ def safe_state(epoch='epoch-1', safe=True):
             'safe_to_switch': safe, 'blockers': [] if safe else ['journal_unresolved']}
 
 
+def release_manifest(release_id):
+    return {'release_id': release_id, 'source_revision': '1' * 40, 'source_sha256': 's' * 64,
+            'artifact_sha256': 'a' * 64, 'verification_identity_sha256': 'v' * 64,
+            'component_hashes': {'core': 'c', 'collector': 'k', 'interface': 'i'},
+            'dependencies': {}, 'runtime': {}, 'ipc_version': 1, 'dto_version': 1,
+            'schema_version': 2, 'min_reader': 2, 'compatible_readers': [2]}
+
+
 def test_drain_waits_for_fresh_safe_epoch_without_killing_executor():
     class Client:
         def __init__(self): self.values = [safe_state(safe=False), safe_state()]
@@ -64,6 +72,19 @@ def test_end_drain_refreshes_after_ui_ack_and_retries_lost_reply():
     assert result['drain'] is False and state['end_calls'] == 1 and state['drain_checks'] == 2
 
 
+def test_end_drain_rejects_undrained_status_from_wrong_epoch():
+    manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a',
+                'ipc_version': 1, 'schema_version': 2}
+    class Client:
+        def call(self, method, payload):
+            return {'ready': True, 'release_id': 'release-x', 'source_sha256': 's',
+                    'artifact_sha256': 'a', 'ipc_version': 1, 'schema_version': 2,
+                    'drain': False, 'drain_epoch': 'other', 'recovery_complete': True,
+                    'execution_lock_held': True}
+    with pytest.raises(job.DeployFailure, match='outcome unknown: drain epoch changed'):
+        job.end_drain_verified(Client, manifest, 'expected', attempts=1, sleep=lambda _: None)
+
+
 def test_core_readiness_triggers_recovery_before_waiting_for_complete():
     manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a',
                 'ipc_version': 1, 'schema_version': 2}
@@ -82,6 +103,24 @@ def test_core_readiness_triggers_recovery_before_waiting_for_complete():
             raise AssertionError(method)
     value = job.wait_core_ready(Client(), manifest, sleep=lambda _: pytest.fail('must not spin'))
     assert value['recovery_complete'] and calls == ['get_status', 'get_drain_state', 'get_status']
+
+
+def test_old_core_restore_keeps_target_owned_drain_until_old_code_is_ready():
+    manifest = {'release_id': 'release-old', 'source_sha256': 's', 'artifact_sha256': 'a',
+                'ipc_version': 1, 'schema_version': 2}
+    class Client:
+        def call(self, method, payload):
+            if method == 'get_status':
+                return {'ready': True, 'release_id': 'release-old', 'source_sha256': 's',
+                        'artifact_sha256': 'a', 'ipc_version': 1, 'schema_version': 2,
+                        'drain': True, 'drain_epoch': 'epoch-1', 'recovery_complete': True,
+                        'execution_lock_held': True}
+            if method == 'get_drain_state':
+                return dict(safe_state('epoch-1'), release_id='release-target')
+            raise AssertionError(method)
+    value = job.wait_core_ready(Client(), manifest, drain_release_id='release-target',
+                                sleep=lambda _: pytest.fail('valid restored core must pass'))
+    assert value['release_id'] == 'release-old'
 
 
 def test_core_readiness_refuses_immediately_when_service_exited():
@@ -172,6 +211,129 @@ def test_interrupted_first_preswitch_resumes_legacy_and_discards_copied_state(tm
     assert resumed == [True] and not paths.state.exists() and not paths.transition.exists()
 
 
+def test_prepared_transition_with_undrained_old_core_only_clears_journal(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    old = paths.releases / 'release-old'; old.mkdir(parents=True)
+    previous = {'release_id': 'release-old'}
+    af.atomic_json(old / 'release-manifest.json', previous)
+    af.atomic_json(paths.release_state, previous)
+    transition = {'operation_id': 'op', 'phase': 'prepared', 'target_release_id': 'release-new',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    class Commands:
+        def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 0, '')
+    class Client:
+        def call(self, method, payload):
+            assert method == 'get_status'
+            return {'drain': False}
+    monkeypatch.setattr(job, 'restore_before_switch', lambda *a, **k: pytest.fail('old core is already healthy'))
+    with pytest.raises(job.DeployFailure, match='RESNAPSHOT'):
+        job.recover_transition(paths, Commands(), Client, transition)
+    assert not paths.transition.exists() and json.loads(paths.release_state.read_text()) == previous
+
+
+def test_committed_healthy_target_wins_over_leftover_transition(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    target = paths.releases / 'release-new'; target.mkdir(parents=True)
+    paths.current.symlink_to(target)
+    committed = {'release_id': 'release-new', 'status': 'healthy'}
+    af.atomic_json(paths.release_state, committed)
+    transition = {'operation_id': 'op', 'phase': 'switched', 'target_release_id': 'release-new',
+                  'db_authority': 'state', 'previous_state': {'release_id': 'release-old'}, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    monkeypatch.setattr(job, 'rollback_release', lambda *a: pytest.fail('committed target must not roll back'))
+    with pytest.raises(job.DeployFailure, match='FINALIZED_RESNAPSHOT'):
+        job.recover_transition(paths, object(), object(), transition)
+    assert not paths.transition.exists() and json.loads(paths.release_state.read_text()) == committed
+
+
+def test_inactive_first_target_without_core_meta_is_fenced_by_start_config_and_lock(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    paths.execution_lock = paths.state / 'core/execution.lock'
+    target = paths.releases / 'release-new'; target.mkdir(parents=True)
+    manifest = release_manifest('release-new')
+    af.atomic_json(target / 'release-manifest.json', manifest)
+    paths.current.symlink_to(target)
+    (paths.state / 'core').mkdir(parents=True)
+    sqlite3.connect(paths.state / 'core/trade.db').close()
+    (paths.state / 'secrets').mkdir()
+    (paths.state / 'secrets/core.env').write_text(
+        'FUNDING_START_DRAINED="1"\nFUNDING_DRAIN_RELEASE_ID="release-new"\n')
+    transition = {'operation_id': 'op', 'phase': 'switched', 'target_release_id': 'release-new',
+                  'db_authority': 'state', 'previous_state': None, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    class Commands:
+        def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 3, '')
+    with pytest.raises(job.DeployFailure, match='FENCED_RESNAPSHOT'):
+        job.recover_transition(paths, Commands(), None, transition)
+    state = json.loads(paths.release_state.read_text())
+    assert state['release_id'] == 'release-new' and state['drain'] is True
+    assert not paths.transition.exists()
+
+
+def test_partial_rollback_records_actual_old_link_and_retains_transition(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    old = paths.releases / 'release-old'; old.mkdir(parents=True)
+    paths.current.symlink_to(old)
+    previous = {'format_version': 1, 'generation': 3, 'release_id': 'release-old',
+                'source_revision': '0' * 40, 'source_sha256': 'o' * 64,
+                'artifact_sha256': 'b' * 64, 'components': {}, 'ipc_version': 1,
+                'dto_version': 1, 'schema_version': 2, 'min_reader': 2}
+    af.atomic_json(paths.transition, {'operation_id': 'op'})
+    selected = job.record_failed_selection(paths, None, previous, release_manifest('release-new'),
+                                           tmp_path / 'failed.json')
+    state = json.loads(paths.release_state.read_text())
+    assert selected == 'release-old' and state['release_id'] == 'release-old'
+    assert state['status'] == 'rollback_incomplete' and paths.transition.exists()
+
+
+def test_restore_before_switch_restarts_and_verifies_both_readers_before_end(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    old = paths.releases / 'release-old'; (old / 'deploy/migration').mkdir(parents=True)
+    manifest = release_manifest('release-old')
+    now = time.time()
+    collector = {'ready': True, 'pid': 41, 'boot_id': 'cb', 'updated_at': now,
+                 **{k: manifest[k] for k in ('release_id', 'source_sha256', 'artifact_sha256')}}
+    interface = {'ready': True, 'pid': 42, 'boot_id': 'ib', 'updated_at': now,
+                 **{k: manifest[k] for k in ('release_id', 'source_sha256', 'artifact_sha256')}}
+    (paths.state / 'collector/public').mkdir(parents=True)
+    (paths.state / 'interface').mkdir(parents=True)
+    af.atomic_json(paths.state / 'collector/public/collector_health.json', collector)
+    af.atomic_json(paths.state / 'interface/interface_health.json', interface)
+    events, state = [], {'ended': False}
+    class Client:
+        def call(self, method, payload):
+            events.append(method)
+            if method == 'get_status':
+                return {'ready': True, 'release_id': 'release-old',
+                        'source_sha256': manifest['source_sha256'], 'artifact_sha256': manifest['artifact_sha256'],
+                        'ipc_version': 1, 'schema_version': 2, 'drain': not state['ended'],
+                        'drain_epoch': 'epoch', 'recovery_complete': True, 'execution_lock_held': True}
+            if method == 'get_drain_state':
+                return dict(safe_state('epoch'), release_id='release-target')
+            if method == 'end_drain':
+                state['ended'] = True; return {'drain': False}
+            raise AssertionError(method)
+    class Commands:
+        def run(self, argv, **kwargs):
+            events.append(' '.join(map(str, argv)))
+            if argv[:3] == ['systemctl', 'show', '-p']:
+                return subprocess.CompletedProcess(argv, 0, '41\n' if 'collector' in argv[-1] else '42\n')
+            if argv[0] == 'curl': return subprocess.CompletedProcess(argv, 0, json.dumps(collector))
+            return subprocess.CompletedProcess(argv, 0, '')
+    job.restore_before_switch(paths, Commands(), Client, old, manifest,
+                              drain_release_id='release-target')
+    assert state['ended'] is True
+    assert events.index('systemctl start funding_bot-collector.service') < events.index('end_drain')
+    assert events.index('systemctl start funding_bot-interface.service') < events.index('end_drain')
+
+
+def test_first_preswitch_failure_report_does_not_recreate_state_root(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    assert job.failure_report_root(paths, None, False) == paths.bootstrap_reports
+    assert job.failure_report_root(paths, None, True) == paths.reports
+
+
 def test_existing_release_revalidates_complete_installed_identity(tmp_path, monkeypatch):
     paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
     release = paths.releases / 'release-existing'; release.mkdir(parents=True)
@@ -242,7 +404,7 @@ def test_code_rollback_switches_reader_only_and_never_restores_database(tmp_path
     class Client:
         def call(self, method, payload):
             if method == 'get_status': return {'drain': True, 'drain_epoch': 'epoch-1', 'release_id': 'new'}
-            if method == 'get_drain_state': return safe_state()
+            if method == 'get_drain_state': return dict(safe_state(), release_id='old-release')
             if method == 'end_drain': return {'drain': False}
             raise AssertionError(method)
     class Commands:
@@ -256,7 +418,7 @@ def test_link_failure_restores_prior_compatible_owner_without_first_cutover_path
     paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
     old = paths.releases / 'old'; old.mkdir(parents=True)
     calls = []
-    monkeypatch.setattr(job, 'restore_before_switch', lambda *a: calls.append('restore_old_owner'))
+    monkeypatch.setattr(job, 'restore_before_switch', lambda *a, **k: calls.append('restore_old_owner'))
     monkeypatch.setattr(job, 'rollback_release', lambda *a: pytest.fail('link never switched'))
     job.restore_activation_failure(paths, object(), object(), old, {'release_id': 'old'},
                                    ui_update=False, switched=False)
@@ -365,7 +527,8 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
     class Commands:
         def run(self, argv, **kwargs):
             events.append(' '.join(map(str, argv)))
-            code = 1 if list(map(str, argv))[:3] == ['systemctl', 'is-active', '--quiet'] else 0
+            args = list(map(str, argv))
+            code = 0 if args[:4] == ['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'] else 0
             return subprocess.CompletedProcess(argv, code, '')
     report = job.Job(paths, Commands(), Client).install(tmp_path / 'artifact', tmp_path / 'receipt', expected)
     state = json.loads(paths.release_state.read_text())

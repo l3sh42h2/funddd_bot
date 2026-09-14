@@ -285,7 +285,8 @@ def wait_drain(client, release_id, epoch, *, sleep=time.sleep):
         sleep(2)
 
 
-def end_drain_verified(client_factory, manifest, epoch, *, attempts=6, sleep=time.sleep):
+def end_drain_verified(client_factory, manifest, epoch, *, drain_release_id=None,
+                       attempts=6, sleep=time.sleep):
     """Refresh drain evidence after UI ACK writes and prove the final state.
 
     A lost reply is retried with the same epoch/release id.  We accept success
@@ -297,11 +298,11 @@ def end_drain_verified(client_factory, manifest, epoch, *, attempts=6, sleep=tim
         try:
             health = health_matches(client.call('get_status', {}), manifest,
                                     require_drain=False, require_recovery=False)
-            if health.get('drain') is False:
-                return health
             if health.get('drain_epoch') != epoch:
                 raise DeployFailure('drain epoch changed before release')
-            wait_drain(client, manifest['release_id'], epoch, sleep=sleep)
+            if health.get('drain') is False:
+                return health
+            wait_drain(client, drain_release_id or manifest['release_id'], epoch, sleep=sleep)
             ended = client.call('end_drain', {'drain_epoch': epoch,
                                 'expected_release_id': manifest['release_id']})
             if ended.get('drain') is not False:
@@ -435,6 +436,34 @@ def clear_first_start_drain(path):
         os.replace(tmp, path)
     finally:
         Path(tmp).unlink(missing_ok=True)
+
+
+def first_start_drain_configured(path):
+    try:
+        lines = set(Path(path).read_text().splitlines())
+    except OSError:
+        return False
+    return ('FUNDING_START_DRAINED="1"' in lines
+            and any(line.startswith('FUNDING_DRAIN_RELEASE_ID="') for line in lines))
+
+
+def prove_inactive_offline_fence(paths, commands, previous_state):
+    if commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'],
+                    check=False).returncode == 0:
+        raise DeployFailure('core unexpectedly active during offline fence')
+    if commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-trader.service'],
+                    check=False).returncode == 0:
+        raise DeployFailure('legacy trader active during offline fence')
+    execution_lock_free(paths.execution_lock)
+    try:
+        return durable_drain(paths.state / 'core/trade.db')
+    except DeployFailure:
+        if (previous_state.get('status') not in
+                {'drained_failure', 'drained_interrupted', 'execution_state_unknown'}
+                or not first_start_drain_configured(paths.state / 'secrets/core.env')):
+            raise
+        return {'drain': True, 'drain_epoch': None,
+                'release_id': previous_state.get('release_id'), 'offline_start_fence': True}
 
 
 def installed_tree_sha256(root):
@@ -582,7 +611,8 @@ def health_matches(value, manifest, *, require_drain=True, require_recovery=True
     return value
 
 
-def wait_core_ready(client, manifest, *, commands=None, timeout=180, sleep=time.sleep):
+def wait_core_ready(client, manifest, *, commands=None, drain_release_id=None,
+                    timeout=180, sleep=time.sleep):
     deadline = time.monotonic() + timeout
     last = 'not checked'
     while time.monotonic() < deadline:
@@ -590,7 +620,8 @@ def wait_core_ready(client, manifest, *, commands=None, timeout=180, sleep=time.
             health = health_matches(client.call('get_status', {}), manifest, require_recovery=False)
             epoch = health['drain_epoch']
             state = client.call('get_drain_state', {'drain_epoch': epoch})
-            validate_drain(state, release_id=manifest['release_id'], epoch=epoch, require_safe=True)
+            validate_drain(state, release_id=drain_release_id or manifest['release_id'],
+                           epoch=epoch, require_safe=True)
             # Recovery evidence in drain state and the compact health must describe
             # the same running core before the caller can switch UI or end drain.
             return health_matches(client.call('get_status', {}), manifest)
@@ -687,14 +718,20 @@ def resume_legacy(paths, commands):
     commands.run(['systemctl', 'start', 'funding_bot-trader.service'])
 
 
-def restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest):
+def restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
+                          *, drain_release_id=None):
     install_units(previous_release, commands)
     commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-    health = wait_core_ready(client_factory(), previous_manifest, commands=commands)
+    health = wait_core_ready(client_factory(), previous_manifest, commands=commands,
+                             drain_release_id=drain_release_id)
     epoch = health['drain_epoch']
-    validate_drain(client_factory().call('get_drain_state', {'drain_epoch': epoch}),
-                   release_id=previous_manifest['release_id'], epoch=epoch, require_safe=True)
-    end_drain_verified(client_factory, previous_manifest, epoch)
+    state = client_factory().call('get_drain_state', {'drain_epoch': epoch})
+    owner = drain_release_id or state.get('release_id') or previous_manifest['release_id']
+    validate_drain(state, release_id=owner, epoch=epoch, require_safe=True)
+    commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
+    commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+    wait_components(paths, commands, previous_manifest)
+    end_drain_verified(client_factory, previous_manifest, epoch, drain_release_id=owner)
 
 
 def restore_ui_before_switch(commands, previous_release):
@@ -711,7 +748,7 @@ def rollback_ui(paths, commands, previous_release, previous_manifest):
 
 
 def restore_activation_failure(paths, commands, client_factory, previous_release,
-                               previous_manifest, *, ui_update, switched):
+                               previous_manifest, *, ui_update, switched, drain_release_id=None):
     if ui_update and switched:
         rollback_ui(paths, commands, previous_release, previous_manifest)
     elif ui_update:
@@ -722,7 +759,8 @@ def restore_activation_failure(paths, commands, client_factory, previous_release
     else:
         # Link replacement failed after the old services were stopped. The old
         # code is still selected, so restore that compatible owner in place.
-        restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest)
+        restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
+                              drain_release_id=drain_release_id)
 
 
 def rollback_release(paths, commands, client_factory, previous_release, previous_manifest):
@@ -736,19 +774,24 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
         health = client.call('get_status', {})
         if health.get('drain') is True and health.get('drain_epoch'):
             epoch = health['drain_epoch']
+            raw = client.call('get_drain_state', {'drain_epoch': epoch})
+            drain_owner = raw.get('release_id')
+            if not isinstance(drain_owner, str) or not drain_owner:
+                raise DeployFailure('active drain owner missing')
         else:
             begun = validate_drain(client.call('begin_drain', {
                 'release_id': previous_manifest['release_id'],
                 'expected_state_revision': health['state_revision'], 'reason': 'rollback',
             }), release_id=previous_manifest['release_id'])
             epoch = begun['drain_epoch']
-        wait_drain(client, health.get('release_id') or previous_manifest['release_id'], epoch)
+            drain_owner = previous_manifest['release_id']
+        wait_drain(client, drain_owner, epoch)
         commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
         _wait_inactive(commands, 'funding_bot-core.service')
     else:
         # A failed new core may have exited before IPC. The already durable drain
         # and released kernel lock prove that no new admission can occur.
-        durable_drain(paths.state / 'core/trade.db')
+        drain_owner = durable_drain(paths.state / 'core/trade.db').get('release_id') or previous_manifest['release_id']
     commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
     commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
     _wait_inactive(commands, 'funding_bot-collector.service')
@@ -757,13 +800,14 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
     switch_link(paths, previous_release)
     commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
     commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-    old_health = wait_core_ready(client_factory(), previous_manifest, commands=commands)
+    old_health = wait_core_ready(client_factory(), previous_manifest, commands=commands,
+                                 drain_release_id=drain_owner)
     old_epoch = old_health['drain_epoch']
     validate_drain(client_factory().call('get_drain_state', {'drain_epoch': old_epoch}),
-                   release_id=previous_manifest['release_id'], epoch=old_epoch, require_safe=True)
+                   release_id=drain_owner, epoch=old_epoch, require_safe=True)
     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
     wait_components(paths, commands, previous_manifest)
-    end_drain_verified(client_factory, previous_manifest, old_epoch)
+    end_drain_verified(client_factory, previous_manifest, old_epoch, drain_release_id=drain_owner)
 
 
 def release_state(previous, manifest, *, components, status, drain, report):
@@ -780,6 +824,10 @@ def release_state(previous, manifest, *, components, status, drain, report):
     }
 
 
+def failure_report_root(paths, previous_state, switched):
+    return paths.reports if previous_state or switched else paths.bootstrap_reports
+
+
 def observed_drain(paths, client_factory, manifest):
     try:
         value = health_matches(client_factory().call('get_status', {}), manifest,
@@ -793,6 +841,27 @@ def observed_drain(paths, client_factory, manifest):
             return None
 
 
+def record_failed_selection(paths, client_factory, previous_state, manifest, failed_path):
+    selected = None
+    if paths.current.is_symlink():
+        try:
+            selected = paths.current.resolve(strict=True).name
+        except OSError:
+            selected = 'BROKEN'
+    if selected == manifest['release_id']:
+        components = {name: manifest['release_id'] for name in ('collector', 'core', 'interface')}
+        drain = observed_drain(paths, client_factory, manifest)
+        af.atomic_json(paths.release_state, release_state(
+            previous_state, manifest, components=components,
+            status='drained_failure' if drain is True else 'execution_state_unknown',
+            drain=drain, report=failed_path))
+    elif previous_state is not None and selected == previous_state['release_id']:
+        old_failure = dict(previous_state, status='rollback_incomplete', drain=None,
+                           report=str(failed_path), installed_at=time.time())
+        af.atomic_json(paths.release_state, old_failure)
+    return selected
+
+
 def recover_transition(paths, commands, client_factory, transition):
     """Reconcile a crash-recorded cutover before requiring a new base snapshot."""
     target_id = transition.get('target_release_id')
@@ -801,20 +870,42 @@ def recover_transition(paths, commands, client_factory, transition):
     previous = transition.get('previous_state')
     previous_manifest = None
     previous_release = None
+    actual_target = paths.current.is_symlink() and paths.current.resolve(strict=True).name == target_id
+    committed = _json(paths.release_state) if paths.release_state.exists() else None
+    if (actual_target and committed and committed.get('release_id') == target_id
+            and committed.get('status') == 'healthy'):
+        # The last atomic state write completed and only journal cleanup was
+        # interrupted. The committed release is the exact base.
+        clear_transition(paths)
+        raise DeployFailure('TRANSITION_FINALIZED_RESNAPSHOT_REQUIRED')
     if previous:
         previous_release = paths.releases / previous['release_id']
         previous_manifest = _json(previous_release / 'release-manifest.json')
-    actual_target = paths.current.is_symlink() and paths.current.resolve(strict=True).name == target_id
     if not actual_target:
         if previous_manifest is None:
             resume_legacy(paths, commands)
             if str(transition.get('db_authority', '')).startswith('legacy') and paths.state.exists():
                 shutil.rmtree(paths.state)
+        elif transition.get('phase') == 'prepared':
+            active = commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'],
+                                  check=False).returncode == 0
+            if active:
+                health = client_factory().call('get_status', {})
+                if health.get('drain') is True:
+                    restore_before_switch(paths, commands, client_factory, previous_release,
+                                          previous_manifest, drain_release_id=target_id)
+                # An undrained old core means begin_drain had not mutated it.
+            else:
+                restore_before_switch(paths, commands, client_factory, previous_release,
+                                      previous_manifest, drain_release_id=target_id)
         elif transition.get('ui_only'):
             restore_ui_before_switch(commands, previous_release)
             commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
         else:
-            restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest)
+            restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
+                                  drain_release_id=target_id)
+        if previous is not None:
+            af.atomic_json(paths.release_state, previous)
         clear_transition(paths)
         raise DeployFailure('TRANSITION_RECOVERED_RESNAPSHOT_REQUIRED')
 
@@ -825,6 +916,7 @@ def recover_transition(paths, commands, client_factory, transition):
             rollback_ui(paths, commands, previous_release, previous_manifest)
         else:
             rollback_release(paths, commands, client_factory, previous_release, previous_manifest)
+        af.atomic_json(paths.release_state, previous)
         clear_transition(paths)
         raise DeployFailure('TRANSITION_ROLLED_BACK_RESNAPSHOT_REQUIRED')
 
@@ -846,7 +938,11 @@ def recover_transition(paths, commands, client_factory, transition):
         commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
         _wait_inactive(commands, 'funding_bot-core.service')
     else:
-        durable_drain(paths.state / 'core/trade.db')
+        try:
+            durable_drain(paths.state / 'core/trade.db')
+        except DeployFailure:
+            if not first_start_drain_configured(paths.state / 'secrets/core.env'):
+                raise
     execution_lock_free(paths.execution_lock)
     paths.reports.mkdir(parents=True, exist_ok=True)
     report_path = paths.reports / (target_id + '-interrupted.json')
@@ -885,7 +981,8 @@ class Job:
             if previous_state:
                 old_release = p.releases / previous_state['release_id']
                 previous_manifest = _json(old_release / 'release-manifest.json')
-            is_ui = ui_only(previous_manifest, template)
+            is_ui = (previous_state is not None and previous_state.get('status') == 'healthy'
+                     and previous_state.get('drain') is False and ui_only(previous_manifest, template))
             db_path = (p.state / 'core/trade.db') if previous_state else (p.legacy / 'runtime/trade.db')
             db_before = database_info(db_path)
             if not compatible_reader(template, db_before):
@@ -900,17 +997,26 @@ class Job:
             write_transition(p, transition, 'prepared')
 
             old_epoch = None
+            drain_owner_release = template['release_id']
             if previous_state and not is_ui:
-                client = self.client_factory()
-                begun = validate_drain(client.call('begin_drain', {'release_id': template['release_id'],
-                                       'expected_state_revision': client.call('get_status', {})['state_revision'],
-                                       'reason': 'deploy'}), release_id=template['release_id'])
-                old_epoch = begun['drain_epoch']
-                wait_drain(client, template['release_id'], old_epoch)
+                active = self.commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'],
+                                           check=False).returncode == 0
+                if active:
+                    client = self.client_factory()
+                    begun = validate_drain(client.call('begin_drain', {'release_id': template['release_id'],
+                                           'expected_state_revision': client.call('get_status', {})['state_revision'],
+                                           'reason': 'deploy'}), release_id=template['release_id'])
+                    old_epoch = begun['drain_epoch']
+                    wait_drain(client, template['release_id'], old_epoch)
+                else:
+                    offline = prove_inactive_offline_fence(p, self.commands, previous_state)
+                    drain_owner_release = offline.get('release_id') or previous_state['release_id']
+                    report['stages'].append('offline_fence_proved')
                 write_transition(p, transition, 'fenced')
                 report['stages'].append('drained')
-                self.commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
-                _wait_inactive(self.commands, 'funding_bot-core.service')
+                if active:
+                    self.commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
+                    _wait_inactive(self.commands, 'funding_bot-core.service')
             elif not previous_state:
                 fence_legacy(self.commands)
                 write_transition(p, transition, 'fenced')
@@ -944,14 +1050,15 @@ class Job:
                     elif is_ui:
                         restore_ui_before_switch(self.commands, old_release)
                     else:
-                        restore_before_switch(p, self.commands, self.client_factory, old_release, previous_manifest)
+                        restore_before_switch(p, self.commands, self.client_factory, old_release, previous_manifest,
+                                              drain_release_id=template['release_id'])
                     report['rollback'] = 'pre_switch_owner_restored'
                     if previous_manifest is None and p.state.exists():
                         shutil.rmtree(p.state)
                     clear_transition(p)
                 except BaseException as restore_failure:
                     report['rollback'] = 'pre_switch_restore_failed: ' + type(restore_failure).__name__ + ': ' + str(restore_failure)
-                failure_reports = p.reports if previous_state else p.bootstrap_reports
+                failure_reports = failure_report_root(p, previous_state, False)
                 failure_reports.mkdir(parents=True, exist_ok=True)
                 failed_path = failure_reports / (template['release_id'] + '-failed.json')
                 report['completed_at'] = time.time(); af.atomic_json(failed_path, report)
@@ -979,15 +1086,17 @@ class Job:
                     write_transition(p, transition, 'switched', db_authority='state')
                     self.commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     self.commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-                    health = wait_core_ready(self.client_factory(), manifest, commands=self.commands)
+                    health = wait_core_ready(self.client_factory(), manifest, commands=self.commands,
+                                             drain_release_id=drain_owner_release)
                     epoch = health['drain_epoch']
                     validate_drain(self.client_factory().call('get_drain_state', {'drain_epoch': epoch}),
-                                   release_id=template['release_id'], epoch=epoch, require_safe=True)
+                                   release_id=drain_owner_release, epoch=epoch, require_safe=True)
                     self.commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
                     report['health'] = wait_components(p, self.commands, manifest)
+                    end_drain_verified(self.client_factory, manifest, epoch,
+                                       drain_release_id=drain_owner_release)
                     if previous_state is None:
                         clear_first_start_drain(p.state / 'secrets/core.env')
-                    end_drain_verified(self.client_factory, manifest, epoch)
                     components = {name: manifest['release_id'] for name in ('collector', 'core', 'interface')}
                     drain = False
                     report['stages'].append('three_process_ready')
@@ -997,7 +1106,8 @@ class Job:
                 if previous_manifest is not None:
                     try:
                         restore_activation_failure(p, self.commands, self.client_factory, old_release,
-                                                   previous_manifest, ui_update=is_ui, switched=switched)
+                                                   previous_manifest, ui_update=is_ui, switched=switched,
+                                                   drain_release_id=template['release_id'])
                         report['rollback'] = 'code_only_succeeded'
                         rollback_ok = True
                     except BaseException as rollback_failure:
@@ -1013,18 +1123,15 @@ class Job:
                     # Keep the new recovery-capable code drained; never copy the
                     # frozen legacy DB back over current state.
                     report['rollback'] = 'first_transition_requires_compatible_fix; current_DB_retained'
-                p.reports.mkdir(parents=True, exist_ok=True)
-                failed_path = p.reports / (template['release_id'] + '-failed.json')
+                failure_reports = failure_report_root(p, previous_state, switched)
+                failure_reports.mkdir(parents=True, exist_ok=True)
+                failed_path = failure_reports / (template['release_id'] + '-failed.json')
                 report['completed_at'] = time.time(); af.atomic_json(failed_path, report)
-                if switched and not rollback_ok:
-                    failed_components = {name: manifest['release_id'] for name in ('collector', 'core', 'interface')}
-                    drain_observed = observed_drain(p, self.client_factory, manifest)
-                    af.atomic_json(p.release_state, release_state(previous_state, manifest,
-                                   components=failed_components,
-                                   status='drained_failure' if drain_observed is True else 'execution_state_unknown',
-                                   drain=drain_observed,
-                                   report=failed_path))
-                if rollback_ok or switched:
+                if not rollback_ok:
+                    record_failed_selection(p, self.client_factory, previous_state, manifest, failed_path)
+                    # Keep the journal on every partial/failed rollback. A retry
+                    # reports the actual link and reconciles it under flock.
+                if rollback_ok:
                     clear_transition(p)
                 raise
 
