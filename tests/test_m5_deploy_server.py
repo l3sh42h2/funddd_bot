@@ -617,7 +617,8 @@ def test_first_transition_migrates_latest_state_offsets_and_secrets_privately(tm
     monkeypatch.setattr(job.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=1234))
     class Commands:
         def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 0, '')
-    info, backup = job.migrate_legacy_runtime(paths, Commands(), 'release-12345678')
+    info, backup = job.migrate_legacy_runtime(paths, Commands(), 'release-12345678',
+                                              expected_configuration=job.legacy_configuration(paths)[0])
     assert info['tg_offset'] == 417 and backup.is_file()
     assert json.loads((paths.state / 'interface/state.json').read_text())['offset'] == 417
     assert (paths.state / 'core/trade.db').is_file() and (runtime / 'trade.db').is_file()
@@ -718,3 +719,104 @@ def test_full_update_orders_drain_stop_backup_switch_readiness_and_release_state
     assert report['status'] == 'healthy' and state['release_id'] == 'new-release' and state['generation'] == 8
     assert events.index('safe_old') < events.index('old_stopped') < events.index('backup') < events.index('switch')
     assert events.index('switch') < events.index('end_drain')
+
+
+def test_legacy_admission_tracks_private_config_but_ignores_python_cache(tmp_path):
+    legacy=tmp_path/'legacy'; runtime=legacy/'runtime'; runtime.mkdir(parents=True)
+    (legacy/'app.py').write_text('source')
+    (legacy/'.env').write_text('KEY=fixture\n')
+    (runtime/'owner.toml').write_text('mode="readonly"\n')
+    (runtime/'instruments.json').write_text('{}')
+    paths=job.Paths(tmp_path/'opt',tmp_path/'state',legacy)
+    source=job._source_sha(legacy)
+    before,_=job.legacy_configuration(paths)
+    cache=legacy/'src/__pycache__';cache.mkdir(parents=True)
+    (cache/'app.cpython-311.pyc').write_bytes(b'cache')
+    assert job._source_sha(legacy)==source
+    assert '.env' not in source[0]
+    (runtime/'owner.toml').write_text('mode="live"\n')
+    after,_=job.legacy_configuration(paths)
+    assert after!=before and set(after)=={'version','sha256'}
+    (runtime/'instruments.json').write_text('{"changed":true}')
+    assert job.legacy_configuration(paths)[0]!=after
+
+
+def test_custom_owner_key_file_and_registry_affect_admission(tmp_path):
+    legacy=tmp_path/'legacy';runtime=legacy/'runtime';runtime.mkdir(parents=True)
+    key=tmp_path/'key.json';key.write_bytes(b'synthetic')
+    (legacy/'.env').write_text(f'CUSTOM_SOL_PATH="{key}"\n')
+    (runtime/'owner.toml').write_text('[spot.solana]\nkeypair_file_env="CUSTOM_SOL_PATH"\n'
+                                     '[profiles.sol_best_hyperliquid]\ninstrument_registry="custom.json"\n')
+    paths=job.Paths(tmp_path/'opt',tmp_path/'state',legacy)
+    initial,files=job.legacy_configuration(paths)
+    assert files=={'CUSTOM_SOL_PATH':key}
+    key.write_bytes(b'changed')
+    assert job.legacy_configuration(paths)[0]!=initial
+    previous=job.legacy_configuration(paths)[0]
+    (runtime/'custom.json').write_text('{}')
+    assert job.legacy_configuration(paths)[0]!=previous
+
+
+def test_layout_probe_uses_real_roles_no_network_and_no_trader_entrypoint(tmp_path):
+    seen=[]
+    class Commands:
+        def run(self,argv,**kw): seen.append(list(map(str,argv)))
+    paths=job.Paths(tmp_path/'opt',tmp_path/'state',tmp_path/'legacy')
+    job.probe_service_layout(tmp_path/'release',paths,Commands())
+    assert len(seen)==3
+    for role,argv in zip(('core','collector','interface'),seen):
+        assert '--property=User=funding-'+role in argv
+        assert '--property=PrivateNetwork=true' in argv
+        assert '--property=ProtectHome=true' in argv
+        assert str(tmp_path/'release/deploy/migration/layout_probe.py') in argv
+        assert 'funding_bot.cli' not in argv
+
+
+@pytest.mark.parametrize('change', ['before_capture', 'transient_optional'])
+def test_migration_uses_admitted_config_including_absence(tmp_path, monkeypatch, change):
+    legacy = tmp_path / 'legacy'; runtime = legacy / 'runtime'; runtime.mkdir(parents=True)
+    con = sqlite3.connect(runtime / 'trade.db')
+    con.executescript("CREATE TABLE deals(id); CREATE TABLE intents(id); CREATE TABLE flags(k PRIMARY KEY,v);"
+                      "CREATE TABLE schema_version(id PRIMARY KEY,version,min_reader);"
+                      "INSERT INTO schema_version VALUES(1,2,2);")
+    con.commit(); con.close()
+    (legacy / '.env').write_text('TG_BOT_TOKEN=fixture\n')
+    (runtime / 'owner.toml').write_text('[spot.solana]\nkeypair_file_env="  "\n'
+        '[profiles.sol_best_hyperliquid]\ninstrument_registry=" "\n')
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', legacy)
+    expected = job.legacy_configuration(paths)[0]
+    class Commands:
+        def run(self, argv, **kwargs): return subprocess.CompletedProcess(argv, 0, '')
+    if change == 'before_capture':
+        (legacy / '.env').write_text('TG_BOT_TOKEN=changed\n')
+        with pytest.raises(job.DeployFailure, match='STALE_BASE'):
+            job.migrate_legacy_runtime(paths, Commands(), 'release-12345678', expected_configuration=expected)
+        assert not paths.state.exists()
+        return
+    def appear(_):
+        (runtime / 'cabinet.env').write_text('CABINET_LOGIN=unadmitted\n')
+        (runtime / 'instruments.json').write_text('unadmitted')
+        return SimpleNamespace(pw_uid=1234)
+    monkeypatch.setattr(job.pwd, 'getpwnam', appear)
+    original = job.legacy_configuration
+    calls = 0
+    def disappear_at_final(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (runtime / 'cabinet.env').unlink()
+            (runtime / 'instruments.json').unlink()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(job, 'legacy_configuration', disappear_at_final)
+    job.migrate_legacy_runtime(paths, Commands(), 'release-12345678', expected_configuration=expected)
+    assert 'unadmitted' not in (paths.state / 'secrets/interface.env').read_text()
+    assert not (paths.state / 'core/instruments.json').exists()
+
+
+def test_migration_refuses_missing_mandatory_environment_without_live_fallback(tmp_path):
+    legacy = tmp_path / 'legacy'; legacy.mkdir()
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', legacy)
+    expected = job.legacy_configuration(paths)[0]
+    with pytest.raises(job.DeployFailure, match='mandatory legacy environment'):
+        job.migrate_legacy_runtime(paths, None, 'release-12345678', expected_configuration=expected)
+    assert not paths.state.exists()

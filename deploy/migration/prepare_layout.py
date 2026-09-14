@@ -12,9 +12,10 @@ DATA_KEYS = {'OKX_DEX_API_KEY','OKX_DEX_SECRET','OKX_DEX_PASSPHRASE','OKX_DEX_PR
 UI_KEYS = {'TG_BOT_TOKEN','CABINET_LOGIN','CABINET_PASS_HASH'}
 
 
-def parse_env(path):
+def parse_env(path, *, contents=None):
     out = {}
-    for line in Path(path).read_text().splitlines():
+    text = Path(path).read_text() if contents is None else contents.decode('utf-8')
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             continue
@@ -26,13 +27,13 @@ def parse_env(path):
 
 
 def prepare(root, secret_env, cabinet_env=None, *, final_root='/var/lib/funding-bot',
-            interface_uid=None, deploy_uid=0):
+            interface_uid=None, deploy_uid=0, secret_content=None, cabinet_content=None):
     root = Path(root)
     if root.exists():
         raise ValueError('staging directory already exists')
-    values = parse_env(secret_env)
-    if cabinet_env:
-        extra = parse_env(cabinet_env)
+    values = parse_env(secret_env, contents=secret_content)
+    if cabinet_env or cabinet_content is not None:
+        extra = parse_env(cabinet_env, contents=cabinet_content)
         if set(extra) - UI_KEYS:
             raise ValueError('unexpected cabinet environment keys')
         values.update(extra)

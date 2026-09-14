@@ -55,7 +55,7 @@ case "$cmd" in
     incoming="$("${SSH[@]}" "$VPS" "mktemp -d /var/tmp/funding-m5-inspect.XXXXXXXX")"
     [[ "$incoming" =~ ^/var/tmp/funding-m5-inspect\.[a-zA-Z0-9]+$ ]] || die "unsafe remote temporary path"
     "${SCP[@]}" "$M5/artifacts.py" "$M5/deploy_ipc.py" "$M5/prepare_layout.py" "$M5/server_job.py" "$VPS:$incoming/" >/dev/null
-    "${SSH[@]}" "$VPS" "sudo env FUNDING_M5_ENTRY=deploy/deploy.sh /usr/bin/python3 '$incoming/server_job.py' inspect-base" > "$output"
+    "${SSH[@]}" "$VPS" "sudo env FUNDING_M5_ENTRY=deploy/deploy.sh /usr/bin/python3 -B '$incoming/server_job.py' inspect-base" > "$output"
     "${SSH[@]}" "$VPS" "rm -rf '$incoming'"
     echo "base snapshot: $output"
     ;;

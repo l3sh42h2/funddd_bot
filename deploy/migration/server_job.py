@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
+import re
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -29,7 +32,7 @@ import artifacts as af  # noqa: E402
 from deploy_ipc import DeployClient, IpcRefused, validate_drain  # noqa: E402
 from prepare_layout import parse_env, prepare  # noqa: E402
 
-LEGACY_EXCLUDE = {'.git', '.venv', '.pytest_cache', 'runtime', 'logs'}
+LEGACY_EXCLUDE = {'.git', '.venv', '.pytest_cache', 'runtime', 'logs', '.env'}
 SERVICES = ('funding_bot-collector.service', 'funding_bot-core.service', 'funding_bot-interface.service')
 OLD_SERVICES = ('funding_bot-trader.service', 'funding_bot-web.service')
 TUNNEL_SERVICE = 'funding_bot-tunnel.service'
@@ -68,7 +71,7 @@ def _json(path):
 
 
 def _source_sha(root):
-    manifest = af.tree_manifest(root, excluded=LEGACY_EXCLUDE)
+    manifest = af.tree_manifest(root, excluded=LEGACY_EXCLUDE, excluded_components={'__pycache__'})
     return manifest, af.value_digest(manifest)
 
 
@@ -130,11 +133,74 @@ def state_identity(state):
     return {k: state[k] for k in keys}
 
 
+def legacy_configuration(paths, *, captured=None):
+    """Private configuration fingerprint; no individual secrets or paths exported."""
+    runtime = paths.legacy / 'runtime'
+    owner = runtime / 'owner.toml'
+    try:
+        cfg = tomllib.loads(owner.read_text()) if owner.exists() else {}
+        env = parse_env(paths.legacy / '.env') if (paths.legacy / '.env').exists() else {}
+    except (ValueError, OSError):
+        raise DeployFailure('legacy configuration cannot be parsed (values omitted)') from None
+    files = {'.env': paths.legacy / '.env', 'cabinet.env': runtime / 'cabinet.env',
+             'owner.toml': owner, 'instruments.json': runtime / 'instruments.json'}
+    keynames = {key for key in env if key.endswith('KEYPAIR_FILE')}
+    def discover(value):
+        if not isinstance(value, dict):
+            return
+        for key, item in value.items():
+            if key in ('keypair_file_env', 'instrument_registry') and isinstance(item, str):
+                item = item.strip()
+                if not item:
+                    continue
+            if key == 'keypair_file_env':
+                if not isinstance(item, str) or re.fullmatch(r'[A-Z][A-Z0-9_]*', item) is None:
+                    raise DeployFailure('invalid keypair environment reference')
+                keynames.add(item)
+            if key == 'instrument_registry':
+                if not isinstance(item, str) or re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\.json', item) is None:
+                    raise DeployFailure('unsafe instrument registry name')
+                files['registry:' + item] = runtime / item
+            discover(item)
+    discover(cfg)
+    keyfiles = {}
+    for key in sorted(keynames):
+        raw = env.get(key, '=').split('=', 1)[1].strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1]
+        if not raw:
+            continue
+        source = Path(raw)
+        if not source.is_absolute() or source.is_symlink() or not source.is_file():
+            raise DeployFailure('configured keypair file missing/unsafe (path omitted)')
+        keyfiles[key] = source
+        files['keyfile:' + key] = source
+    records = {}
+    for name, path in sorted(files.items()):
+        if path.is_symlink():
+            raise DeployFailure('configuration symlink refused (path omitted)')
+        if not path.exists():
+            records[name] = {'exists': False}
+            if captured is not None:
+                captured[name] = {'path': path, 'data': None}
+            continue
+        if not path.is_file():
+            raise DeployFailure('configuration must be a regular file (path omitted)')
+        stat = path.stat()
+        data = path.read_bytes()
+        if captured is not None:
+            captured[name] = {'path': path, 'data': data}
+        records[name] = dict(exists=True, path=str(path.resolve()), sha256=hashlib.sha256(data).hexdigest(),
+                             mode=stat.st_mode & 0o777, uid=stat.st_uid, gid=stat.st_gid)
+    return {'version': 1, 'sha256': af.value_digest(records)}, keyfiles
+
+
 def legacy_identity(paths):
     manifest, source_sha = _source_sha(paths.legacy)
     db = database_info(paths.legacy / 'runtime/trade.db')
     return {'kind': 'legacy', 'source_sha256': source_sha, 'sources': manifest,
-            'schema_version': db['schema_version'], 'min_reader': db['min_reader']}
+            'schema_version': db['schema_version'], 'min_reader': db['min_reader'],
+            'configuration': legacy_configuration(paths)[0]}
 
 
 def current_identity(paths):
@@ -337,6 +403,13 @@ def provision_accounts(commands):
     commands.run(['usermod', '-a', '-G', 'funding-ipc,funding-market', 'funding-interface'])
 
 
+def _write_private(data, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(data)
+
+
 def _copy_private(src, dst):
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -344,9 +417,15 @@ def _copy_private(src, dst):
         shutil.copyfileobj(inp, out)
 
 
-def migrate_legacy_runtime(paths, commands, release_id):
+def migrate_legacy_runtime(paths, commands, release_id, *, expected_configuration):
     """Run only after legacy trader is fully stopped and fenced."""
     legacy_runtime = paths.legacy / 'runtime'
+    captured = {}
+    config_before, configured_keyfiles = legacy_configuration(paths, captured=captured)
+    if config_before != expected_configuration:
+        raise DeployFailure('STALE_BASE: admitted legacy configuration changed')
+    if captured['.env']['data'] is None:
+        raise DeployFailure('mandatory legacy environment file missing')
     info = database_info(legacy_runtime / 'trade.db')
     if paths.state.exists():
         raise DeployFailure('new state root exists before first migration')
@@ -354,17 +433,24 @@ def migrate_legacy_runtime(paths, commands, release_id):
     stage_state = paths.state.with_name('.' + paths.state.name + '-staging-' + uuid.uuid4().hex)
     try:
         prepare(stage_state, paths.legacy / '.env',
-                legacy_runtime / 'cabinet.env' if (legacy_runtime / 'cabinet.env').exists() else None,
-                final_root=str(paths.state), interface_uid=uid, deploy_uid=0)
+                None,  # Optional config is read exclusively from the admitted snapshot.
+                final_root=str(paths.state), interface_uid=uid, deploy_uid=0,
+                secret_content=captured['.env']['data'],
+                cabinet_content=captured.get('cabinet.env', {}).get('data'))
         # Keep all non-collector runtime files private to core so owner.toml keypair
         # paths and durable journals retain their relative names.
         collector_names = {'funding_bot.db', 'table.json', 'collector_health.json'}
         shared_names = {'okxdex.pace', 'trading.busy'}
         skip = collector_names | shared_names | {'trade.db', 'trade.db-wal', 'trade.db-shm', 'cabinet.env', 'public_url.txt'}
+        frozen_files = {entry['path']: entry['data'] for entry in captured.values()}
         for src in sorted(legacy_runtime.rglob('*')):
             if not src.is_file() or src.name in skip or src.is_symlink():
                 continue
-            _copy_private(src, stage_state / 'core' / src.relative_to(legacy_runtime))
+            if src not in frozen_files:
+                _copy_private(src, stage_state / 'core' / src.relative_to(legacy_runtime))
+        for src, data in frozen_files.items():
+            if data is not None and src.is_relative_to(legacy_runtime) and src.name != 'cabinet.env':
+                _write_private(data, stage_state / 'core' / src.relative_to(legacy_runtime))
         for name in shared_names:
             if (legacy_runtime / name).is_file():
                 _copy_private(legacy_runtime / name, stage_state / 'shared' / name)
@@ -375,17 +461,9 @@ def migrate_legacy_runtime(paths, commands, release_id):
         # Keypair file locations are secrets carried by env indirection. Copy the
         # bytes privately and rewrite only their path, never their value/content.
         keyfiles = {}
-        for key, line in parse_env(paths.legacy / '.env').items():
-            if not key.endswith('KEYPAIR_FILE'):
-                continue
-            raw = line.split('=', 1)[1].strip()
-            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
-                raw = raw[1:-1]
-            source = Path(raw)
-            if not source.is_absolute() or source.is_symlink() or not source.is_file():
-                raise DeployFailure('configured keypair file missing/unsafe (path omitted)')
+        for key, source in configured_keyfiles.items():
             installed_path = paths.state / 'core/keys' / (key.lower() + '.json')
-            _copy_private(source, stage_state / 'core/keys' / installed_path.name)
+            _write_private(captured['keyfile:' + key]['data'], stage_state / 'core/keys' / installed_path.name)
             keyfiles[key] = installed_path
         if keyfiles:
             core_env = stage_state / 'secrets/core.env'
@@ -427,6 +505,8 @@ def migrate_legacy_runtime(paths, commands, release_id):
         os.chmod(stage_state / 'collector/public', 0o2750)
         os.chmod(stage_state / 'interface', 0o700)
         os.chmod(stage_state / 'shared', 0o2770)
+        if legacy_configuration(paths)[0] != config_before:
+            raise DeployFailure('STALE_BASE: legacy configuration changed during migration')
         os.replace(stage_state, paths.state)
         return info, paths.backups / backup_name
     except BaseException:
@@ -589,6 +669,26 @@ def migration_dry_run(release, database, commands):
                      env={**os.environ, 'PYTHONPATH': str(release / 'src'), 'PYTHONDONTWRITEBYTECODE': '1'})
     finally:
         scratch.unlink(missing_ok=True)
+
+
+def probe_service_layout(release, paths, commands):
+    """No network, no executable trading entry point; check real UID/DAC before selection."""
+    for role in ('core', 'collector', 'interface'):
+        props = {'User': 'funding-' + role, 'Group': 'funding-' + role,
+                 'EnvironmentFile': str(paths.state / 'secrets' / (role + '.env')),
+                 'WorkingDirectory': str(release), 'NoNewPrivileges': 'true',
+                 'ProtectSystem': 'strict', 'ProtectHome': 'true', 'PrivateTmp': 'true',
+                 'PrivateNetwork': 'true', 'TimeoutStartSec': '30',
+                 'ReadWritePaths': str(paths.state / role)}
+        if role in ('core', 'collector'):
+            props['ReadWritePaths'] += ' ' + str(paths.state / 'shared')
+        argv = ['systemd-run', '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+                '--unit=funding-layout-' + role + '-' + uuid.uuid4().hex[:12],
+                '--setenv=PYTHONPATH=' + str(release / 'src'), '--setenv=PYTHONDONTWRITEBYTECODE=1']
+        argv.extend('--property=' + key + '=' + value for key, value in props.items())
+        argv.extend([release / '.venv/bin/python', '-B', release / 'deploy/migration/layout_probe.py',
+                     role, paths.state])
+        commands.run(argv)
 
 
 def install_units(release, commands):
@@ -1135,9 +1235,12 @@ class Job:
                 report['stages'].append('legacy_fenced')
 
             try:
+                if not previous_state:
+                    af.require_base(legacy_identity(p), expected)
                 provision_accounts(self.commands)
                 if not previous_state:
-                    db_before, backup = migrate_legacy_runtime(p, self.commands, template['release_id'])
+                    db_before, backup = migrate_legacy_runtime(p, self.commands, template['release_id'],
+                                                               expected_configuration=expected['configuration'])
                     write_transition(p, transition, 'state_ready', db_authority='legacy_copied')
                     report['backup'] = {'path': str(backup), 'sha256': af.digest(backup)}
                 else:
@@ -1153,6 +1256,8 @@ class Job:
                     report['stages'].append('execution_released')
                 release, manifest = install_release(p, artifact, receipt, template, self.commands)
                 migration_dry_run(release, p.state / 'core/trade.db', self.commands)
+                probe_service_layout(release, p, self.commands)
+                report['stages'].append('service_layout_proved')
                 report['stages'].append('artifact_installed')
                 install_units(release, self.commands)
             except BaseException as pre_switch_failure:

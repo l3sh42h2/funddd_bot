@@ -68,7 +68,7 @@ def source_manifest(root, paths):
     return out
 
 
-def tree_manifest(root, *, excluded=()):
+def tree_manifest(root, *, excluded=(), excluded_components=()):
     """Hash every regular file below root; refuse links and special files.
 
     ``excluded`` contains top-level names.  It is intended for non-source state
@@ -79,7 +79,7 @@ def tree_manifest(root, *, excluded=()):
     names = []
     for p in sorted(root.rglob('*')):
         rel = p.relative_to(root)
-        if rel.parts and rel.parts[0] in skip:
+        if rel.parts and (rel.parts[0] in skip or set(rel.parts) & set(excluded_components)):
             continue
         if p.is_symlink():
             raise Refused(f'source symlink: {rel}')
