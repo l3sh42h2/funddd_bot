@@ -202,7 +202,7 @@ class Bot:
 
     def _press(self, d: auth.Decision, now: float) -> None:
         con = self.conns.get()
-        paused = store.is_paused(con) or self.engine.pause_evt.is_set()
+        paused = store.execution_paused(con) or self.engine.pause_evt.is_set() or self.engine.drain_evt.is_set()
         r = auth.press(con, d.text, paused=paused, now=now)
         self._answer(d.callback_id, r.answer)
         if r.closed and d.chat_id is not None and d.message_id is not None:

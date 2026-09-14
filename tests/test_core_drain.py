@@ -61,3 +61,16 @@ def test_stale_controller_cannot_overwrite_epoch(tmp_path):
     with pytest.raises(RpcError, match='stale_drain_state'):
         b.begin(dict(release_id='R3', expected_state_revision=0))
     assert Drain(conns, threading.Event()).state['release_id'] == 'R2'
+
+
+def test_native_gate_reads_deploy_fence_and_unknown_fails_closed(tmp_path):
+    from funding_bot.trade import store
+    conns = setup(tmp_path); con = conns.get()
+    assert not store.execution_paused(con)
+    d = Drain(conns, threading.Event())
+    state = d.begin(dict(release_id='R2', expected_state_revision=0))
+    assert store.execution_paused(con) and not store.is_paused(con)
+    d.end(dict(drain_epoch=state['drain_epoch'], expected_release_id='R2'), running_release='R2')
+    assert not store.execution_paused(con)
+    con.execute("UPDATE core_meta SET value='broken' WHERE key='deployment_drain'")
+    assert store.execution_paused(con)

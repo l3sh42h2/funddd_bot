@@ -193,6 +193,9 @@ def new_attempt(con, *, network: str, wallet: str, logical_action_id: str, provi
     now = time.time() if now is None else now
     aid = f"sa-{secrets.token_hex(8)}"
     with tx(con):
+        from ..store import execution_paused
+        if execution_paused(con):
+            raise JournalError('new Solana action fenced by owner/deployment pause')
         prev = [dict(zip(("attempt_id", "state"), r)) for r in con.execute(
             "SELECT attempt_id, state FROM sol_tx_attempts WHERE logical_action_id=? ORDER BY created",
             (logical_action_id,))]

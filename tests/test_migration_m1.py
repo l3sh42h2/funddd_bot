@@ -318,3 +318,51 @@ def test_config_change_while_quoting_invalidates_plan(conns):
         assert r is not None and r['fingerprint'] != s._plan_fingerprint(r['intent_id'])
         assert s.engine.submissions==[]
     finally:release.set();s.shutdown()
+
+
+def test_end_drain_rpc_lost_response_retries_without_new_recovery(conns):
+    s = service(conns); s.ready = True; s.release = {'release_id':'R2'}
+    first = s.dispatch('begin_drain', {'release_id':'R2','expected_state_revision':0}, None, 0)
+    s._drain_status = lambda _: {'safe_to_switch': True}
+    payload = dict(drain_epoch=first['drain_epoch'], expected_release_id='R2')
+    result = s.dispatch('end_drain', payload, None, 0)
+    s._drain_status = lambda _: (_ for _ in ()).throw(AssertionError('no second recovery'))
+    assert s.dispatch('end_drain', payload, None, 0) == result
+    with pytest.raises(RpcError, match='stale_drain_owner'):
+        s.dispatch('end_drain', dict(payload, drain_epoch='stale'), None, 0)
+
+
+def test_drain_evidence_invalidated_by_later_ledger_commit(conns, monkeypatch):
+    from funding_bot.core import recovery
+    s=service(conns); s.ready=True; s.release={'release_id':'R2'}
+    s.execution_owner=SimpleNamespace(fd=3)
+    s.jobs.sync=True
+    monkeypatch.setattr(recovery, 'check', lambda *_, **kwargs: [])
+    try:
+        begin=s.dispatch('begin_drain', {'release_id':'R2','expected_state_revision':0}, None, 0)
+        payload=dict(drain_epoch=begin['drain_epoch'])
+        assert s.dispatch('get_drain_state',payload,None,0)['safe_to_switch']
+        # A later fill/backfill commit invalidates even if no pending attempt exists.
+        conns.get().execute("INSERT INTO flags VALUES('fixture_new_fill','1')")
+        monkeypatch.setattr(recovery, 'check', lambda *_, **kwargs: ['position_unverified'])
+        state=s.dispatch('get_drain_state',payload,None,0)
+        assert not state['safe_to_switch'] and not state['recovery']['complete']
+    finally:
+        s._evidence_db.close()
+
+
+def test_drain_rejects_commit_inside_final_validation(conns, monkeypatch):
+    from funding_bot.core import recovery
+    s=service(conns);s.ready=True;s.release={'release_id':'R2'}
+    s.execution_owner=SimpleNamespace(fd=3);s.jobs.sync=True
+    def check(con, legs, *, resolve=True):
+        if not resolve:
+            con.execute("INSERT OR REPLACE INTO flags VALUES('concurrent_evidence','changed')")
+        return []
+    monkeypatch.setattr(recovery,'check',check)
+    try:
+        first=s.dispatch('begin_drain',{'release_id':'R2','expected_state_revision':0},None,0)
+        result=s.dispatch('get_drain_state',{'drain_epoch':first['drain_epoch']},None,0)
+        assert not result['safe_to_switch']
+        assert 'evidence_changed_during_validation' in result['recovery']['blockers']
+    finally:s._evidence_db.close()

@@ -604,7 +604,7 @@ def build_runtime(cfg: OwnerCfg, conns: Conns, *, holder: CfgHolder | None = Non
     native_px = NativePrice(okx)
 
     def mode_state():
-        return holder.loader().mode, store.is_paused(conns.get())
+        return holder.loader().mode, store.execution_paused(conns.get())
 
     wallet = cfg.get(f"wallets.{CHAIN}")
     placeholder = "0x" + "0" * 40              # кошелёк не задан (dry): только котировки, балансы неизвестны
@@ -622,7 +622,7 @@ def build_runtime(cfg: OwnerCfg, conns: Conns, *, holder: CfgHolder | None = Non
         tl = conns
 
         def gate(in_flight: bool) -> None:
-            k.gate(holder.loader().mode, "send", paused=store.is_paused(tl.get()), hedge=in_flight)
+            k.gate(holder.loader().mode, "send", paused=store.execution_paused(tl.get()), hedge=in_flight)
 
         sender = EvmWallet(rpc, tconfig.CHAIN_IDS[CHAIN], k.evm, lambda row: store.dex_tx_signed(tl.get(), **row),
                            gate=gate, on_sent=lambda h: store.dex_tx_sent(tl.get(), h),

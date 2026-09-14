@@ -413,7 +413,7 @@ def _q(call):
 
 def test_okxdex_swap_sends_only_allowed_params(tmp_path):
     d = _okx(tmp_path)
-    wallet = "0xE4Ebf0815d0980E5a03f7D675F86dc5079fB8919"
+    wallet = "0x" + "12" * 20  # synthetic request fixture, never a configured trading account
     assert d.swap("56", USDT, AIW3, 500 * E18, Decimal("3"), Decimal("1.5"), wallet) == {"routerResult": {}, "tx": {}}
     path, q = _q(d._s.calls[0])
     assert path == "/api/v6/dex/aggregator/swap" and d._s.calls[0]["method"] == "GET"
@@ -1035,3 +1035,26 @@ def test_spotleg_protocol_quote_balances_pool_price(env):
 def test_bump_price_rounding():
     assert evm.bump_price(50_000_000) == 60_000_000
     assert evm.bump_price(1) == 2 and evm.bump_price(7) == 9
+
+
+def test_gate_rechecked_after_slow_nonce_before_signature(env, monkeypatch):
+    original = env.rpc.nonce
+    def nonce(address, tag):
+        result = original(address, tag)
+        if tag == 'pending':
+            env.gs['paused'] = True
+        return result
+    monkeypatch.setattr(env.rpc, 'nonce', nonce)
+    with pytest.raises(keys.ModeForbidden):
+        env.wallet.send_and_wait(USDT, '0x', 0, 21000, 50_000_000)
+    assert env.chain.sent == [] and store.dex_txs_unresolved(env.con) == []
+
+
+def test_drain_wins_atomic_signed_journal_admission(env):
+    # Simulate drain committing after the final in-memory gate passed. Native
+    # journal admission must still refuse before any signed bytes are broadcast.
+    env.con.execute('CREATE TABLE core_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+    env.con.execute("INSERT INTO core_meta VALUES('deployment_drain','{\"drain\":true}')")
+    with pytest.raises(store.StoreError, match='fenced'):
+        env.wallet.send_and_wait(USDT, '0x', 0, 21000, 50_000_000)
+    assert env.chain.sent == [] and store.dex_txs_unresolved(env.con) == []

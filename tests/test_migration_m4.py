@@ -139,3 +139,48 @@ def test_cash_flow_projection_partial_fill_and_unknown_amount(journal):
     con.execute('UPDATE perp_orders SET cum_quote=NULL WHERE client_id=?', (f'fb-{did}-x01-c1-a1',))
     assert perp_quote_flows(con, did).net is None
     assert perp_quote_flows(con, did).legacy_net == D(10)
+
+
+def test_common_loop_finishes_started_hedge_then_stops_next_clip(journal):
+    from funding_bot.trade.operations import ClipLifecycle
+    con, oid, existing = journal
+    old_intent = store.get_clip(con, existing)['intent_id']
+    did = store.get_operation(con, oid)['deal_id']
+    iid, _ = store.create_intent(con, deal_id=did, kind='entry', spec={}, plan={})
+    paused = False
+    events = []
+    def guard():
+        if paused: raise RuntimeError('draining')
+    def spot(*_):
+        nonlocal paused
+        assert not con.in_transaction
+        events.append('spot'); paused = True
+    program = ClipLifecycle(iid, [50,50], lambda *_:None, guard, lambda n,_:n,
+                            lambda *_:None, spot, lambda *_:events.append('hedge'),
+                            lambda *_:events.append('settled'), lambda c,d,q,t:q,
+                            lambda:events.append('finished'))
+    with pytest.raises(RuntimeError, match='draining'):
+        OperationController(con).run_clips(program)
+    assert events == ['spot','hedge','settled']
+    assert con.execute('SELECT count(*) FROM clips WHERE intent_id=?',(iid,)).fetchone()[0] == 1
+    # Same durable action cannot be replayed as a new clip after a crash/re-entry.
+    paused = False
+    with pytest.raises(Exception):
+        OperationController(con).run_clips(program)
+    assert events == ['spot','hedge','settled']
+
+
+def test_common_loop_never_hedges_an_unknown_spot(journal):
+    from funding_bot.trade.operations import ClipLifecycle
+    con, oid, _ = journal
+    iid, _ = store.create_intent(con, deal_id=store.get_operation(con, oid)['deal_id'],
+                                 kind='exit', spec={}, plan={})
+    events = []
+    def unknown(*_): raise RuntimeError('unknown receipt')
+    program = ClipLifecycle(iid, [20], lambda *_:None, lambda:None, lambda n,_:n,
+                            lambda *_:None, unknown, lambda *_:events.append('hedge'),
+                            lambda *_:events.append('settled'), lambda c,d,q,t:q,
+                            lambda:events.append('finished'))
+    with pytest.raises(RuntimeError, match='unknown receipt'):
+        OperationController(con).run_clips(program)
+    assert not events

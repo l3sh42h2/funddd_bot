@@ -115,3 +115,24 @@ def test_recorded_receipt_applies_without_network(tmp_path):
     again = w.spot.resolve(w.con, o.attempt_id, apply=out.append)
     assert (again.state, again.in_raw, again.out_raw, again.receipt) == ("ok", o.in_raw, o.out_raw, "same")
     assert out == [again]
+
+
+def test_drain_arriving_during_block_height_prevents_signing(tmp_path, monkeypatch):
+    import threading
+    from funding_bot.core.drain import Drain
+    from funding_bot.core.journal import Journal
+    from funding_bot.trade import store
+    w, req, cand = setup(tmp_path)
+    candidate=cand()
+    Journal(w.conns)
+    drain=Drain(w.conns, threading.Event())
+    w.spot.mode_state=lambda: ('live', store.execution_paused(w.con))
+    original=w.spot.chain.block_height
+    def height():
+        result=original()
+        drain.begin(dict(release_id='R2',expected_state_revision=0))
+        return result
+    monkeypatch.setattr(w.spot.chain, 'block_height', height)
+    with pytest.raises(PresendRefused):
+        swap(w, req, candidate, [])
+    assert rows(w) == [] and w.sol.sends == []

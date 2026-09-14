@@ -3,6 +3,8 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
+from pathlib import Path
 import threading
 import time
 from .journal import Journal, Outbox
@@ -80,6 +82,11 @@ class CoreService:
         self.snapshot = None
         self.snapshot_lock = threading.Lock()
         self._drain_lock = threading.RLock()
+        db_path = next(r[2] for r in conns.get().execute('PRAGMA database_list') if r[1] == 'main')
+        self._evidence_db = sqlite3.connect(Path(db_path).resolve().as_uri()+'?mode=ro', uri=True,
+                                            isolation_level=None, check_same_thread=False)
+        self._evidence_db.execute('PRAGMA query_only=ON')
+        self._evidence_version = None
 
     def start(self, reconcile=True):
         self.journal.recover()
@@ -108,22 +115,38 @@ class CoreService:
                     **{k:self.release.get(k) for k in ('release_id','source_sha256','artifact_sha256',
                                                       'verification_identity_sha256')})
 
+    def _evidence_current(self):
+        # This dedicated connection survives RPC threads. SQLite data_version values
+        # may only be compared on the SAME connection. Any commit invalidates proof.
+        version = self._evidence_db.execute('PRAGMA data_version').fetchone()[0]
+        return self._evidence_version == version
+
     def _schedule_recovery(self):
         if self.recovery_pending or self.engine.busy():
             return
         epoch = self.drain_state.state['drain_epoch']
         revision = self.drain_state.state['state_revision']
-        if (self.recovery['complete'] and self.recovery['evidence_revision'] == revision
+        if (self._evidence_current() and self.recovery['complete'] and self.recovery['evidence_revision'] == revision
                 and 0 <= time.time()-self.recovery['checked_at'] < 30):
             return
         self.recovery_pending = True
         def recover():
+            evidence_after = None
             result = dict(complete=False, checked_at=time.time(), evidence_revision=revision,
                           blockers=['recovery_failed'])
             try:
                 if self.drain and not self.engine.busy():
                     from .recovery import check
                     blockers = check(self.conns.get(), self.legs)
+                    with self._drain_lock:
+                        evidence_before = self._evidence_db.execute('PRAGMA data_version').fetchone()[0]
+                    # Native recovery writes evidence. Validate again without journal
+                    # mutations and bracket that phase with one observer's revisions.
+                    blockers.extend(check(self.conns.get(), self.legs, resolve=False))
+                    with self._drain_lock:
+                        evidence_after = self._evidence_db.execute('PRAGMA data_version').fetchone()[0]
+                    if evidence_before != evidence_after:
+                        blockers.append('evidence_changed_during_validation')
                     result = dict(complete=not blockers, checked_at=time.time(),
                                   evidence_revision=revision, blockers=blockers)
             except Exception:
@@ -132,6 +155,7 @@ class CoreService:
                 with self._drain_lock:
                     if self.drain_state.state['drain_epoch'] == epoch:
                         self.recovery = result
+                        self._evidence_version = evidence_after
                     self.recovery_pending = False
         if not self.jobs.put('drain-recovery', recover):
             self.recovery_pending = False
@@ -158,7 +182,7 @@ class CoreService:
         if not state['ledger_quiet']:
             blockers.append('journal_unresolved')
         rec = self.recovery
-        if (not rec['complete'] or rec['evidence_revision'] != health['state_revision']
+        if (not self._evidence_current() or not rec['complete'] or rec['evidence_revision'] != health['state_revision']
                 or rec['checked_at'] is None or not 0 <= time.time()-rec['checked_at'] < 30):
             blockers.append('fresh_recovery_required')
         counts = state['pending']
@@ -182,7 +206,7 @@ class CoreService:
                     self.drain = True
                     return result
                 if method == 'end_drain':
-                    if not self._drain_status(payload)['safe_to_switch']:
+                    if self.drain and not self._drain_status(payload)['safe_to_switch']:
                         raise RpcError('drain_not_ready')
                     result = self.drain_state.end(payload, running_release=self.release.get('release_id'))
                     self.drain = False
@@ -345,3 +369,4 @@ class CoreService:
             self.jobs._thread.join()
         for t in self.workers:
             t.join(timeout=2)
+        self._evidence_db.close()

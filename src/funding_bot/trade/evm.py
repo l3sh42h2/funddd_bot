@@ -426,14 +426,14 @@ class EvmWallet:
                 self.note(h, DexTxState.UNKNOWN, err=why)
 
     # --- подпись ---
-    def _sign_persist(self, info: SendInfo, kind: str, tx: dict, price: int, meta: dict) -> str:
+    def _sign_persist(self, info: SendInfo, kind: str, tx: dict, price: int, meta: dict, *, in_flight=False) -> str:
         signed = self._acct.sign_transaction({"nonce": info.nonce, "gasPrice": int(price), "gas": int(tx["gas"]),
                                               "to": _checksum(tx["to"]), "value": int(tx["value"]),
                                               "data": _hexbytes(tx["data"]), "chainId": self.chain_id})
         raw = "0x" + bytes(signed.raw_transaction).hex()
         h = "0x" + bytes(signed.hash).hex()          # hexbytes ≥ 1: .hex() без 0x — собираем сами
         mark_public(h)
-        self._on_signed({"clip_id": meta.get("clip_id"), "kind": str(kind), "chain": self.chain,
+        self._on_signed({"new_action": not in_flight, "clip_id": meta.get("clip_id"), "kind": str(kind), "chain": self.chain,
                          "wallet": self.address, "nonce": info.nonce, "to_addr": _addr(tx["to"]),
                          "value": int(tx["value"]),
                          "min_receive": meta.get("min_receive") if kind != DexTxKind.CANCEL else None,
@@ -470,6 +470,7 @@ class EvmWallet:
                 raise NoncePending(latest, pending)
             info = SendInfo(nonce=pending)
             self.last = info
+            self._gate(False)                        # recheck after chain/nonce reads, immediately before signing
             h = self._sign_persist(info, kind, tx, int(gas_price), meta)   # исключение здесь — ничего не ушло
             outcome, text = self.rpc.send_raw(info.raws[h])
             if outcome in ("rejected", "underpriced", "nonce_used"):
@@ -540,7 +541,7 @@ class EvmWallet:
             log.error("evm: %s на nonce %d не отправлен — ворота режима: %s", kind, info.nonce, e)
             return price
         m = meta if kind != DexTxKind.CANCEL else {"clip_id": meta.get("clip_id")}
-        h = self._sign_persist(info, kind, tx, newp, m)
+        h = self._sign_persist(info, kind, tx, newp, m, in_flight=True)
         outcome, text = self.rpc.send_raw(info.raws[h])
         if outcome in ("ok", "known"):
             self._sent(h)

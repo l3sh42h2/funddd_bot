@@ -729,6 +729,24 @@ def is_paused(con) -> bool:
     return get_flag(con, FLAG_PAUSED, "0") == "1"
 
 
+def execution_paused(con) -> bool:
+    """Owner pause or durable deployment fence, including native signing gates."""
+    if is_paused(con):
+        return True
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_meta'").fetchone():
+        return False
+    row = con.execute("SELECT value FROM core_meta WHERE key='deployment_drain'").fetchone()
+    if row is None:
+        return False
+    try:
+        value = json.loads(row[0]).get('drain')
+        if type(value) is not bool:
+            return True
+        return value
+    except (ValueError, TypeError, AttributeError):
+        return True
+
+
 def set_paused(con, on: bool) -> None:
     """«стоп» переживает рестарт: флаг в БД, а не только Event в памяти."""
     set_flag(con, FLAG_PAUSED, "1" if on else "0")
@@ -923,17 +941,19 @@ def set_clip_state(con, clip_id: int, new: str, *, expect=None, now: float | Non
 # --- dex_txs: запись-до для транзакций -------------------------------------------------------------
 def dex_tx_signed(con, *, clip_id: int | None, kind: str, chain: str, wallet: str, nonce: int, to_addr: str,
                   value: int, min_receive: int | None, gas_limit: int, gas_price: int, raw_tx: str, tx_hash: str,
-                  now: float | None = None) -> int:
+                  now: float | None = None, new_action: bool = True) -> int:
     """Подписанная транзакция — В БД ДО отправки (on_signed у EvmWallet). После падения рестарт найдёт хэш и
     nonce и спросит сеть, а не подпишет новую на новом nonce."""
     if str(kind) not in {k.value for k in DexTxKind}:
         raise ValueError(f"неизвестный вид транзакции: {kind}")
-    return con.execute(
-        "INSERT INTO dex_txs(clip_id, kind, chain, wallet, nonce, to_addr, value, min_receive, gas_limit, gas_price, "
-        "raw_tx, tx_hash, state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (clip_id, str(kind), chain, wallet.lower(), int(nonce), to_addr.lower(), amt(int(value)),
-         amt(min_receive), int(gas_limit), amt(int(gas_price)), raw_tx, tx_hash.lower(), str(DexTxState.SIGNED))).lastrowid
-
+    with tx(con):
+        if new_action and execution_paused(con):
+            raise StoreError('new EVM action fenced by owner/deployment pause')
+        return con.execute(
+            "INSERT INTO dex_txs(clip_id, kind, chain, wallet, nonce, to_addr, value, min_receive, gas_limit, gas_price, "
+            "raw_tx, tx_hash, state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (clip_id, str(kind), chain, wallet.lower(), int(nonce), to_addr.lower(), amt(int(value)),
+             amt(min_receive), int(gas_limit), amt(int(gas_price)), raw_tx, tx_hash.lower(), str(DexTxState.SIGNED))).lastrowid
 
 def dex_tx_sent(con, tx_hash: str, now: float | None = None) -> bool:
     ts = time.time() if now is None else now

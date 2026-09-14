@@ -60,7 +60,7 @@ class Drain:
         return dict(self.state)
 
     def end(self, payload, *, running_release):
-        if (payload.get('drain_epoch') != self.state['drain_epoch']
+        if (not payload.get('drain_epoch') or payload.get('drain_epoch') != self.state['drain_epoch']
                 or payload.get('expected_release_id') != running_release or not running_release):
             raise RpcError('stale_drain_owner')
         if not self.state['drain']:

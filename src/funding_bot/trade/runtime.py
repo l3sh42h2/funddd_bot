@@ -196,7 +196,7 @@ class EvmGateFactory:
 
         def mode_state():
             from .keys import effective_mode
-            return effective_mode(loader().profile_mode(RH_GATE), mode), store.is_paused(conns.get())
+            return effective_mode(loader().profile_mode(RH_GATE), mode), store.execution_paused(conns.get())
 
         if sim:
             perp_ro = self.gate if self.gate is not None else self._gate_reader(mode, mode_state)
@@ -221,7 +221,7 @@ class EvmGateFactory:
         if evm is not None:                      # readonly без EVM-ключа — ноги только для чтения (как build_runtime)
 
             def gate(in_flight: bool) -> None:
-                k.gate(loader().profile_mode(RH_GATE), "send", paused=store.is_paused(conns.get()), hedge=in_flight)
+                k.gate(loader().profile_mode(RH_GATE), "send", paused=store.execution_paused(conns.get()), hedge=in_flight)
 
             sender = EvmWallet(rpc, tconfig.CHAIN_IDS[chain], evm, lambda row: store.dex_tx_signed(conns.get(), **row),
                                gate=gate, on_sent=lambda h: store.dex_tx_sent(conns.get(), h),
@@ -413,7 +413,7 @@ def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Call
 
     def mode_state():
         return loader().profile_mode(SOL_HL), bool(paused()) if paused is not None else \
-            store.is_paused(conns.get())
+            store.execution_paused(conns.get())
 
     hl, fee_rate = build_hl_component(cfg, conns, mode=mode, keys=keys, mode_state=mode_state,
                                      hl_session=hl_session, clock=clock, sleep=sleep)

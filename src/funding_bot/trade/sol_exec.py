@@ -237,6 +237,10 @@ class SolanaExecutor:
                     out_account=req.output_account or ata(self.wallet, req.output.mint, req.output.program),
                     amount_in_raw=int(cand.amount_in_raw), expected_out_raw=cand.expected_out_raw,
                     min_out_raw=cand.effective_min_out, request_hash=cand.request_hash)
+        try:
+            self._gate()  # block-height/slot reads may have outlived the first admission check
+        except ModeForbidden as e:
+            raise PresendRefused(str(e)) from None
         prev = [a for a in self.attempts(con, logical_action_id)]
         try:
             aid = J.new_attempt(con, network=self.genesis, wallet=self.wallet, logical_action_id=logical_action_id,
