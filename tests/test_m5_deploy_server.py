@@ -38,6 +38,65 @@ def test_drain_waits_for_fresh_safe_epoch_without_killing_executor():
         deploy_ipc.validate_drain(bad, release_id='release-x', epoch='epoch-1', require_safe=True)
 
 
+def test_core_readiness_triggers_recovery_before_waiting_for_complete():
+    manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a',
+                'ipc_version': 1, 'schema_version': 2}
+    calls, recovered = [], {'value': False}
+    class Client:
+        def call(self, method, payload):
+            calls.append(method)
+            if method == 'get_drain_state':
+                recovered['value'] = True
+                return safe_state('epoch-x')
+            if method == 'get_status':
+                return {'ready': True, 'release_id': 'release-x', 'source_sha256': 's',
+                        'artifact_sha256': 'a', 'ipc_version': 1, 'schema_version': 2,
+                        'drain': True, 'drain_epoch': 'epoch-x', 'recovery_complete': recovered['value'],
+                        'execution_lock_held': True}
+            raise AssertionError(method)
+    value = job.wait_core_ready(Client(), manifest, sleep=lambda _: pytest.fail('must not spin'))
+    assert value['recovery_complete'] and calls == ['get_status', 'get_drain_state', 'get_status']
+
+
+def test_core_readiness_refuses_immediately_when_service_exited():
+    manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a',
+                'ipc_version': 1, 'schema_version': 2}
+    class Client:
+        def call(self, method, payload):
+            raise deploy_ipc.IpcRefused('socket absent')
+    class Commands:
+        def run(self, argv, **kwargs):
+            assert argv[:3] == ['systemctl', 'is-active', '--quiet']
+            return subprocess.CompletedProcess(argv, 3, '')
+    with pytest.raises(job.DeployFailure, match='exited before readiness'):
+        job.wait_core_ready(Client(), manifest, commands=Commands(), timeout=180,
+                            sleep=lambda _: pytest.fail('dead service must not spin'))
+
+
+def test_component_health_uses_private_interface_identity_and_public_collector(tmp_path):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    manifest = {'release_id': 'release-x', 'source_sha256': 's', 'artifact_sha256': 'a'}
+    collector = {'ready': True, 'pid': 41, 'boot_id': 'collector-boot', 'updated_at': time.time(), **manifest}
+    interface = {'ready': True, 'pid': 42, 'boot_id': 'interface-boot', 'updated_at': time.time(), **manifest}
+    (paths.state / 'collector/public').mkdir(parents=True)
+    (paths.state / 'interface').mkdir(parents=True)
+    af.atomic_json(paths.state / 'collector/public/collector_health.json', collector)
+    af.atomic_json(paths.state / 'interface/interface_health.json', interface)
+    class Commands:
+        def run(self, argv, **kwargs):
+            if argv[:3] == ['systemctl', 'is-active', '--quiet']:
+                return subprocess.CompletedProcess(argv, 0, '')
+            if argv[:3] == ['systemctl', 'show', '-p']:
+                pid = '41\n' if 'collector' in argv[-1] else '42\n'
+                return subprocess.CompletedProcess(argv, 0, pid)
+            if argv[0] == 'curl':
+                return subprocess.CompletedProcess(argv, 0, json.dumps(collector))
+            raise AssertionError(argv)
+    result = job.wait_components(paths, Commands(), manifest,
+                                 sleep=lambda _: pytest.fail('valid health must pass'))
+    assert result['collector']['pid'] == 41 and result['interface']['pid'] == 42
+
+
 def test_missing_database_and_stale_base_cause_no_service_mutation(tmp_path, monkeypatch):
     missing = tmp_path / 'typo.db'
     with pytest.raises(FileNotFoundError):
@@ -132,6 +191,8 @@ def test_first_transition_migrates_latest_state_offsets_and_secrets_privately(tm
     assert json.loads((paths.state / 'interface/state.json').read_text())['offset'] == 417
     assert (paths.state / 'core/trade.db').is_file() and (runtime / 'trade.db').is_file()
     assert (paths.state / 'shared/okxdex.pace').read_text() == '17\n'
+    assert oct((paths.state / 'shared/okxdex.pace').stat().st_mode & 0o777) == '0o660'
+    assert oct((paths.state / 'shared/trading.busy').stat().st_mode & 0o777) == '0o660'
     assert (paths.state / 'interface/public_url.txt').read_text() == 'https://stable.example\n'
     core_env = (paths.state / 'secrets/core.env').read_text()
     assert str(paths.state / 'core/keys/solana_keypair_file.json') in core_env

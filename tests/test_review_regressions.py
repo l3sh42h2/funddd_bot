@@ -207,17 +207,17 @@ def test_deploy_tests_before_switch_and_strict_checks():
         assert subprocess.run(["bash", "-n", str(f)]).returncode == 0, f
         assert "set -euo pipefail" in f.read_text(), f
     d = (root / "deploy.sh").read_text()
-    order = ["pytest", "mkdir $LOCK", 'remote remote_test.sh "$TOKEN"', 'remote remote_switch.sh "$TOKEN"',
-             'remote remote_verify.sh "$TOKEN" strict']
-    assert [d.index(s) for s in order] == sorted(d.index(s) for s in order)
-    assert "remote_rollback.sh" in d and "exit 1" in d
-    assert "hyper/funding_bot/" not in d.split('remote remote_switch.sh "$TOKEN"')[0]   # до зелёных тестов боевая не тронута
-    assert re.search(r'remote remote_switch\.sh "\$TOKEN" \|\| \{[^}]*rollback', d)      # упавшее переключение — откат
-    v = (root / "remote_verify.sh").read_text()
-    assert all(s in v for s in ("curl -fsS", "tick_ts", "is-active", "MainPID", "NRestarts", ".verified"))
-    sw = (root / "remote_switch.sh").read_text()
-    assert sw.index(".verified") < sw.index('"$NEXT/" "$DEST/"') and "chown admin:admin" in sw and "need_lock" in sw
-    assert "--no-build-isolation" in (root / "remote_lib.sh").read_text()
+    assert all(f"{name})" in d for name in ("build", "inspect-base", "install", "status"))
+    assert "systemd-run" in d and "TimeoutStartSec=infinity" in d and "expected-base.json" in d
+    server = (root / "migration" / "server_job.py").read_text()
+    install = server[server.index("class Job:"):server.index("\ndef inspect(paths):")]
+    order = ["af.require_base(current_identity(p), expected)", "wait_drain(client", "systemctl', 'stop', 'funding_bot-core.service",
+             "af.backup_database(db_path, backup)", "switch_link(p, release)", "wait_core_ready(self.client_factory()", "end_drain"]
+    assert [install.index(s) for s in order] == sorted(install.index(s) for s in order)
+    assert "TimeoutStopSec=infinity" in (root / "migration/funding_bot-core.service").read_text()
+    for name in ("remote_test.sh", "remote_switch.sh", "remote_verify.sh", "remote_rollback.sh"):
+        result = subprocess.run(["bash", str(root / name)], capture_output=True, text=True)
+        assert result.returncode == 64 and "RETIRED" in result.stderr
 
 
 # --- добавлено после прогона проб ревьюера на новом коде --------------------------------------------------------------

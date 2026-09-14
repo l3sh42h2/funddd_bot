@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+set -euo pipefail
+echo 'RETIRED: deploy switching is accepted only through deploy/deploy.sh (M5 supervised job)' >&2
+exit 64
 # Шаг 4 выката (на сервере): снимок → .prev, проверенная тестами .next → боевая папка, юниты, рестарт.
 # .prev — последняя ПРОВЕРЕННАЯ версия: метку .verified ставит проверка после рестарта. Выкат, упавший на полпути,
 # не затирает её непроверенным кодом (проверка исправлений 11.09). Что может упасть, не трогая боевую папку

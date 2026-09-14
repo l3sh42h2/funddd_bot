@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+set -euo pipefail
+echo 'RETIRED: release verification is owned by deploy/deploy.sh supervised M5 job' >&2
+exit 64
 # Шаг 5 выката (на сервере). Аргументы: <токен> <strict|loose>.
 # strict: оба сервиса active, /status отвечает (curl -fsS), таблицу пишет ИМЕННО текущий процесс коллектора
 #   (pid в table.json = MainPID из systemd — раньше проверка проходила по таблице, которую успел записать ещё

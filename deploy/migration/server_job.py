@@ -95,6 +95,23 @@ def database_info(path):
         con.close()
 
 
+def durable_drain(path):
+    path = Path(path).resolve(strict=True)
+    con = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=10)
+    try:
+        row = con.execute("SELECT value FROM core_meta WHERE key='deployment_drain'").fetchone()
+        if row is None:
+            raise DeployFailure('durable drain missing')
+        value = json.loads(row[0])
+        if value.get('drain') is not True or not isinstance(value.get('drain_epoch'), str):
+            raise DeployFailure('durable drain inactive/invalid')
+        return value
+    except (sqlite3.Error, ValueError, TypeError) as e:
+        raise DeployFailure('durable drain unreadable') from e
+    finally:
+        con.close()
+
+
 def state_identity(state):
     keys = ('format_version', 'generation', 'release_id', 'source_revision', 'source_sha256',
             'artifact_sha256', 'components', 'ipc_version', 'dto_version', 'schema_version', 'min_reader')
@@ -275,6 +292,9 @@ def migrate_legacy_runtime(paths, commands, release_id):
         for name in shared_names:
             if (legacy_runtime / name).is_file():
                 _copy_private(legacy_runtime / name, stage_state / 'shared' / name)
+            else:
+                fd = os.open(stage_state / 'shared' / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660)
+                os.close(fd)
         # Keypair file locations are secrets carried by env indirection. Copy the
         # bytes privately and rewrite only their path, never their value/content.
         keyfiles = {}
@@ -321,6 +341,8 @@ def migrate_legacy_runtime(paths, commands, release_id):
         commands.run(['chown', '-R', 'funding-interface:funding-interface', stage_state / 'interface'])
         commands.run(['chown', '-R', 'root:root', stage_state / 'secrets'])
         commands.run(['chown', '-R', 'root:funding-pace', stage_state / 'shared'])
+        for name in shared_names:
+            os.chmod(stage_state / 'shared' / name, 0o660)
         os.chmod(stage_state, 0o755)
         os.chmod(stage_state / 'core', 0o700)
         os.chmod(stage_state / 'collector', 0o710)
@@ -428,7 +450,7 @@ def switch_link(paths, release):
     os.replace(tmp, paths.current)
 
 
-def health_matches(value, manifest, *, require_drain=True):
+def health_matches(value, manifest, *, require_drain=True, require_recovery=True):
     if not isinstance(value, dict) or value.get('ready') is not True:
         raise DeployFailure('core readiness false')
     if value.get('release_id') != manifest['release_id'] or value.get('source_sha256') != manifest['source_sha256']:
@@ -439,19 +461,32 @@ def health_matches(value, manifest, *, require_drain=True):
         raise DeployFailure('core schema version mismatch')
     if require_drain and (value.get('drain') is not True or not value.get('drain_epoch')):
         raise DeployFailure('new core did not retain drain')
-    if value.get('recovery_complete') is not True:
+    if require_recovery and value.get('recovery_complete') is not True:
         raise DeployFailure('new core recovery incomplete')
     if value.get('execution_lock_held') is not True:
         raise DeployFailure('new core execution ownership missing')
     return value
 
 
-def wait_core_ready(client, manifest, *, sleep=time.sleep):
-    while True:
+def wait_core_ready(client, manifest, *, commands=None, timeout=180, sleep=time.sleep):
+    deadline = time.monotonic() + timeout
+    last = 'not checked'
+    while time.monotonic() < deadline:
         try:
+            health = health_matches(client.call('get_status', {}), manifest, require_recovery=False)
+            epoch = health['drain_epoch']
+            state = client.call('get_drain_state', {'drain_epoch': epoch})
+            validate_drain(state, release_id=manifest['release_id'], epoch=epoch, require_safe=True)
+            # Recovery evidence in drain state and the compact health must describe
+            # the same running core before the caller can switch UI or end drain.
             return health_matches(client.call('get_status', {}), manifest)
-        except (IpcRefused, DeployFailure):
+        except (IpcRefused, DeployFailure) as e:
+            last = str(e)
+            if commands is not None and commands.run(
+                    ['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'], check=False).returncode != 0:
+                raise DeployFailure('core exited before readiness: ' + last) from e
             sleep(2)
+    raise DeployFailure('core readiness timeout: ' + last)
 
 
 def _service_pid(commands, name):
@@ -488,12 +523,17 @@ def wait_components(paths, commands, manifest, *, timeout=180, sleep=time.sleep)
             if len(body) > 16 * 1024:
                 raise DeployFailure('collector health exceeds 16 KiB')
             collector = json.loads(body)
-            response = commands.run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:8792/status']).stdout.encode()
-            if len(response) > 16 * 1024:
-                raise DeployFailure('interface status exceeds 16 KiB')
-            interface = json.loads(response)
+            interface_body = (paths.state / 'interface/interface_health.json').read_bytes()
+            if len(interface_body) > 16 * 1024:
+                raise DeployFailure('interface health exceeds 16 KiB')
+            interface = json.loads(interface_body)
+            public_body = commands.run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:8792/status']).stdout.encode()
+            if len(public_body) > 16 * 1024:
+                raise DeployFailure('public status exceeds 16 KiB')
+            public = json.loads(public_body)
             _health_identity(collector, manifest, cp, 'collector')
             _health_identity(interface, manifest, ip, 'interface')
+            _health_identity(public, manifest, cp, 'public collector status')
             return {'collector': collector, 'interface': interface}
         except (OSError, ValueError, json.JSONDecodeError, DeployFailure, subprocess.SubprocessError) as e:
             last = str(e)
@@ -501,15 +541,16 @@ def wait_components(paths, commands, manifest, *, timeout=180, sleep=time.sleep)
     raise DeployFailure('component readiness timeout: ' + last)
 
 
-def wait_interface(commands, manifest, *, timeout=180, sleep=time.sleep):
+def wait_interface(paths, commands, manifest, *, timeout=180, sleep=time.sleep):
     deadline = time.monotonic() + timeout
     last = 'not checked'
     while time.monotonic() < deadline:
         try:
             pid = _service_pid(commands, 'funding_bot-interface.service')
-            response = commands.run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:8792/status']).stdout.encode()
+            path = paths.state / 'interface/interface_health.json'
+            response = path.read_bytes()
             if len(response) > 16 * 1024:
-                raise DeployFailure('interface status exceeds 16 KiB')
+                raise DeployFailure('interface health exceeds 16 KiB')
             value = json.loads(response)
             _health_identity(value, manifest, pid, 'interface')
             return value
@@ -535,7 +576,7 @@ def resume_legacy(paths, commands):
 def restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest):
     install_units(previous_release, commands)
     commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-    health = wait_core_ready(client_factory(), previous_manifest)
+    health = wait_core_ready(client_factory(), previous_manifest, commands=commands)
     epoch = health['drain_epoch']
     validate_drain(client_factory().call('get_drain_state', {'drain_epoch': epoch}),
                    release_id=previous_manifest['release_id'], epoch=epoch, require_safe=True)
@@ -545,24 +586,43 @@ def restore_before_switch(paths, commands, client_factory, previous_release, pre
         raise DeployFailure('old core did not leave pre-switch drain')
 
 
+def restore_ui_before_switch(commands, previous_release):
+    # UI-only preparation never drained or stopped core.
+    install_units(previous_release, commands)
+
+
+def rollback_ui(paths, commands, previous_release, previous_manifest):
+    commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
+    install_units(previous_release, commands)
+    switch_link(paths, previous_release)
+    commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+    wait_interface(paths, commands, previous_manifest)
+
+
 def rollback_release(paths, commands, client_factory, previous_release, previous_manifest):
     """Change code only. The current /var/lib trade.db is never replaced."""
     db = database_info(paths.state / 'core/trade.db')
     if not compatible_reader(previous_manifest, db):
         raise DeployFailure('ROLLBACK_READER_INCOMPATIBLE')
-    client = client_factory()
-    health = client.call('get_status', {})
-    if health.get('drain') is True and health.get('drain_epoch'):
-        epoch = health['drain_epoch']
+    active = commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'], check=False).returncode == 0
+    if active:
+        client = client_factory()
+        health = client.call('get_status', {})
+        if health.get('drain') is True and health.get('drain_epoch'):
+            epoch = health['drain_epoch']
+        else:
+            begun = validate_drain(client.call('begin_drain', {
+                'release_id': previous_manifest['release_id'],
+                'expected_state_revision': health['state_revision'], 'reason': 'rollback',
+            }), release_id=previous_manifest['release_id'])
+            epoch = begun['drain_epoch']
+        wait_drain(client, health.get('release_id') or previous_manifest['release_id'], epoch)
+        commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
+        _wait_inactive(commands, 'funding_bot-core.service')
     else:
-        begun = validate_drain(client.call('begin_drain', {
-            'release_id': previous_manifest['release_id'],
-            'expected_state_revision': health['state_revision'], 'reason': 'rollback',
-        }), release_id=previous_manifest['release_id'])
-        epoch = begun['drain_epoch']
-    wait_drain(client, health.get('release_id') or previous_manifest['release_id'], epoch)
-    commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
-    _wait_inactive(commands, 'funding_bot-core.service')
+        # A failed new core may have exited before IPC. The already durable drain
+        # and released kernel lock prove that no new admission can occur.
+        durable_drain(paths.state / 'core/trade.db')
     commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
     commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
     _wait_inactive(commands, 'funding_bot-collector.service')
@@ -571,7 +631,7 @@ def rollback_release(paths, commands, client_factory, previous_release, previous
     switch_link(paths, previous_release)
     commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
     commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-    old_health = wait_core_ready(client_factory(), previous_manifest)
+    old_health = wait_core_ready(client_factory(), previous_manifest, commands=commands)
     old_epoch = old_health['drain_epoch']
     validate_drain(client_factory().call('get_drain_state', {'drain_epoch': old_epoch}),
                    release_id=previous_manifest['release_id'], epoch=old_epoch, require_safe=True)
@@ -665,6 +725,8 @@ class Job:
                 try:
                     if previous_manifest is None:
                         resume_legacy(p, self.commands)
+                    elif is_ui:
+                        restore_ui_before_switch(self.commands, old_release)
                     else:
                         restore_before_switch(p, self.commands, self.client_factory, old_release, previous_manifest)
                     report['rollback'] = 'pre_switch_owner_restored'
@@ -681,7 +743,7 @@ class Job:
                     switch_link(p, release); switched = True
                     self.commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
                     # UI identity is checked without touching the live core.
-                    wait_interface(self.commands, manifest)
+                    wait_interface(p, self.commands, manifest)
                     components = dict(previous_state['components'], interface=manifest['release_id'])
                     drain = previous_state.get('drain', False)
                     report['stages'].append('ui_only_switched')
@@ -694,7 +756,7 @@ class Job:
                     switch_link(p, release); switched = True
                     self.commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     self.commands.run(['systemctl', 'start', 'funding_bot-core.service'])
-                    health = wait_core_ready(self.client_factory(), manifest)
+                    health = wait_core_ready(self.client_factory(), manifest, commands=self.commands)
                     epoch = health['drain_epoch']
                     validate_drain(self.client_factory().call('get_drain_state', {'drain_epoch': epoch}),
                                    release_id=template['release_id'], epoch=epoch, require_safe=True)
@@ -715,8 +777,7 @@ class Job:
                 if switched and previous_manifest is not None:
                     try:
                         if is_ui:
-                            switch_link(p, old_release)
-                            self.commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+                            rollback_ui(p, self.commands, old_release, previous_manifest)
                         else:
                             rollback_release(p, self.commands, self.client_factory, old_release, previous_manifest)
                         report['rollback'] = 'code_only_succeeded'

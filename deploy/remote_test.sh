@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+set -euo pipefail
+echo 'RETIRED: verified artifact tests are accepted only through deploy/deploy.sh build' >&2
+exit 64
 # Шаг 3 выката (на сервере): тесты новой версии в ~/hyper/funding_bot.next — в ЧИСТОМ venv .next/.venv (тот же Python,
 # что у боевого) с полным замыканием deploy/requirements.lock (ТЗ SOL×HL §3, M09). Боевой venv до зелёных тестов не
 # меняется (кроме setuptools): lock в него ставит переключение, из тех же колёс.

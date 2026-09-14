@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+set -euo pipefail
+echo 'RETIRED: code-only rollback is accepted only through deploy/deploy.sh (M5 supervised job)' >&2
+exit 64
 # Откат выката (на сервере): последняя проверенная версия из .prev → боевая папка, её юниты, рестарт.
 # runtime/trade.db не трогается: откат кода не откатывает сделки. Версию, которая не поймёт открытую сделку или
 # неразрешённую попытку, не ставим (mult_gate, sol_gate). Трейдер — явным шагом: иначе он дорабатывал бы в памяти
