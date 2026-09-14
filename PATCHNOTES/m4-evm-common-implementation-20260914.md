@@ -69,3 +69,30 @@ inst_json ожидают отказ обеих ног. Разрешённый au
 Read-only проверка текущих production аккаунтов и активации на приватной серверной
 копии БД приостановлена: auto-review требует отдельного разрешения, запрос отправлен
 владельцу. Она не выполнена и не считается заменённой synthetic тестами.
+
+
+## Проверенная сборка первого пакета
+
+Код: 0f9037cf72de88131dcbcf8129bfd9455973dcba, опубликован в рабочей ветке.
+Release candidate: 0f9037cf72de-f6e1e96f711e. Полный Linux: 2693 passed,
+0 failed, 12 skipped, 1336.02 s; весь build с подготовкой зависимостей 1504.269 s.
+Локальная проверка verify_bundle и SHA лога из receipt прошли. Отдельные проверки
+этого кандидата: Mac JavaScriptCore 8 passed/0.48 s; Linux DAC 2 passed/0.74 s.
+Два оставшихся skips: legacy layout venv-path и opt-in public network doctor.
+
+Дополнительно: exact финансовый срез проходит actual core startup с нулём отправок,
+full simulated exit, partial stop/startup/manual-resume в рамках того же root и
+повторный recovery. Replay aa446f2→0f9037c без mismatches/unsafe differences;
+exact_strict_unknown не переименован в полную верифицированную историю.
+Ограничения synthetic execution context и неполноты истории — в EVM inventory.
+
+Astra xhigh закрыл последний diff: 227 тестов и дополнительная гонка actual
+Aster/Gate subclasses с двумя connections, одна отправка. Основной исполнитель —
+Codex. Полное время разработки и счётчики токенов не измерены; их не оцениваем.
+
+Production audit/выкат не выполнены: конкретный запрос разрешения после отказа
+auto-review пока без ответа. Последняя проверка release metadata: установлен
+прежний aa446f216047-a82af1f56cf0. Текущие позиции этим не проверены.
+Общий координатор C1–C5 не реализован: подготовлен только подробный инвентарь
+M4_COMMON_COORDINATOR_INVENTORY.md. Полная приёмка первого ТЗ — условие начала
+реализации второго; оба ТЗ завершёнными не объявлены.
