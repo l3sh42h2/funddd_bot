@@ -279,7 +279,7 @@ def safe_extract(artifact, destination):
             p = Path(m.name)
             if p.is_absolute() or '..' in p.parts or m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
                 raise DeployFailure('unsafe artifact member')
-        tf.extractall(destination, filter='data')
+        af.extract_regular_files(tf, destination)
 
 
 def exact_source_check(release, manifest):

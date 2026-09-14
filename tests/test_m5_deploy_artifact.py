@@ -74,3 +74,18 @@ def test_safe_extract_refuses_links_and_escape(tmp_path):
         info = tarfile.TarInfo('../escape'); info.size = 0; tf.addfile(info)
     with pytest.raises(af.Refused):
         build.safe_extract(archive, tmp_path / 'out')
+
+
+def test_extract_regular_files_never_uses_extractall_or_tar_ownership(tmp_path, monkeypatch):
+    import io
+    archive = tmp_path / 'files.tar'
+    with tarfile.open(archive, 'w') as out:
+        member = tarfile.TarInfo('nested/run.py'); member.size = 3; member.mode = 0o4755
+        out.addfile(member, io.BytesIO(b'abc'))
+    def forbidden(*args, **kwargs): raise AssertionError('extractall must not be called')
+    monkeypatch.setattr(tarfile.TarFile, 'extractall', forbidden)
+    build.safe_extract(archive, tmp_path / 'out')
+    path = tmp_path / 'out/nested/run.py'
+    assert path.read_bytes() == b'abc' and path.stat().st_mode & 0o7777 == 0o755
+    with pytest.raises(FileExistsError):
+        build.safe_extract(archive, tmp_path / 'out')

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import sqlite3
+import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -226,3 +227,31 @@ def backup_database(source, destination):
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
+
+
+def extract_regular_files(archive, destination):
+    """Extract a prevalidated regular-file/directory tar on Python 3.11.2.
+
+    Do not apply archive ownership, setuid bits or extractall's implicit links.
+    Exclusive file creation refuses duplicates and existing path replacement.
+    """
+    root = Path(destination).resolve()
+    for member in archive.getmembers():
+        rel = Path(member.name)
+        if rel.is_absolute() or '..' in rel.parts or not (member.isfile() or member.isdir()):
+            raise Refused('unsafe artifact member')
+    for member in archive.getmembers():
+        target = root / member.name
+        for parent in [target, *target.parents]:
+            if parent == root:
+                break
+            if parent.is_symlink():
+                raise Refused('artifact destination symlink')
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as out, archive.extractfile(member) as source:
+            shutil.copyfileobj(source, out)
+        target.chmod(0o755 if member.mode & 0o111 else 0o644)

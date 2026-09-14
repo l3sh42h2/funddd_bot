@@ -34,3 +34,10 @@ was blocked. This is a compatibility check, not live liquidity/exit proof.
 Full Linux results bind the final immutable artifact and appear in its receipt.
 No live trade is part of deployment validation. Actual release selection, loaded
 versions and deployment result must be established by the supervised installer.
+
+Target-runtime build found Python 3.11.2 lacks tarfile's filter argument. Both
+builder and installer now use the same regular-file extractor with exclusive
+creation, symlink/traversal refusal and sanitized executable permissions; archive
+ownership and setuid bits are never applied. Regression forbids extractall use.
+Updated deploy profile: 50 passed, 1 skipped. The failed preliminary build did not
+produce an accepted receipt and did not stop or switch the production bot.

@@ -83,7 +83,7 @@ def safe_extract(archive, destination):
             p = Path(member.name)
             if p.is_absolute() or '..' in p.parts or member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
                 raise af.Refused('unsafe artifact member')
-        tf.extractall(destination, filter='data')
+        af.extract_regular_files(tf, destination)
 
 
 def make_venv(python, root, wheelhouse, lockfile):
