@@ -344,10 +344,12 @@ def test_legacy_mapping_preserves_hash_and_separates_quote_currencies():
 def test_execution_pages_keep_scoped_trade_ids_and_completeness():
     from funding_bot.trade.adapters.futures_bindings import bind
     calls = []
-    native = NS(fills=lambda symbol, start: calls.append(start) or [{'trade_id': 7, 'qty': D(1)}])
+    native = NS(venue='gate', history_account=lambda: spec('gate').account,
+                history_fills=lambda symbol, start: calls.append(start) or
+                [{'symbol': symbol, 'trade_id': 7, 'qty': D(1)}])
     b = bind(native, journal=None, authorize=None, attempt_lookup=None, on_signed=None)
     page = b.executions(spec('gate'), None)
-    assert calls == [0] and page.cursor == '8' and page.complete
+    assert calls == [0] and page.cursor == '8' and not page.complete
     assert page.executions[0]['dedup_key'] == (*spec('gate').scope, 7)
 
 

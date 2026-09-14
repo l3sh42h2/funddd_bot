@@ -314,7 +314,10 @@ def _income_row(r: dict) -> dict:
 
 
 # --- нога -------------------------------------------------------------------------------------------
-class AsterTrade:
+from .adapters.signing_fence import JournalBoundIoc
+
+
+class AsterTrade(JournalBoundIoc):
     """PerpLeg для Aster. Публичное (фильтры, стакан, фандинг, время) — в любом режиме, без ключей; подписанное —
     через call() с воротами. mode_state() → (режим owner.toml, пауза): движок читает их заново на каждый вызов;
     не задан или упал — считаем dry (закрыто)."""
@@ -647,6 +650,8 @@ class AsterTrade:
           REJECTED + err_code — площадка отказала (-2019, -4164, -1111, -2022 …), заявки нет;
           UNKNOWN — 5xx/-1006/-1007/обрыв или не финальный статус: НЕ ПОВТОРЯТЬ, звать settle_unknown().
         hedge=True — хедж уже исполненной ноги DEX (разрешён и на паузе). sign_nonce — nonce подписи заявки."""
+        on_signed = self._ioc_callback(on_signed, symbol=symbol, side=side, quantity=qty,
+                                        price=px_cap, client_id=client_id, reduce_only=reduce_only)
         self._check_order(symbol, side, qty, px_cap, client_id)
         params = {"symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": "IOC", "quantity": qty,
                   "price": px_cap, "newClientOrderId": client_id, "reduceOnly": bool(reduce_only),
@@ -767,6 +772,11 @@ class AsterTrade:
             body = self._signed_ok("GET", "/fapi/v3/userTrades", params, "userTrades")
             if not isinstance(body, list):
                 raise AsterError("userTrades: не список")
+            if _strict:
+                from .history_validation import exact_id
+                if any(type(t) is not dict or not exact_id(t.get('id')) or
+                       not exact_id(t.get('orderId')) for t in body):
+                    raise AsterError('history native trade/order ID is not exact')
             rows = [_trade_row(t) for t in body]
             for r in rows:
                 if _strict and (r['symbol'] != symbol or

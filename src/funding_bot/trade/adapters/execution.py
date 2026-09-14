@@ -14,7 +14,7 @@ import re
 from .contracts import Action, AdapterError, ErrorKind, Status
 from .futures_bindings import bind
 from .mapping import map_perpetual
-from .native_journal import PerpJournal
+from .native_journal import PerpJournal, exclusive_transaction
 from .registry import production_registry
 from ..types import PerpFill, InstrumentSpec
 from .. import store
@@ -33,7 +33,7 @@ def recover_not_submitted(con, *, deal, clip_id, native, account, client_id):
     """
     if con.in_transaction:
         raise AdapterError(ErrorKind.CONFIG, 'recovery cannot join a caller transaction')
-    with store.tx(con):
+    with exclusive_transaction(con):
         row = store.get_perp_order(con, client_id)
         if row is None or row['clip_id'] != clip_id or row['symbol'] != deal['symbol']:
             return False
@@ -77,7 +77,9 @@ def submit_ioc(con, *, deal, clip_id, native, account, fill_venue, client_id,
         raise AdapterError(ErrorKind.IDENTITY, 'native venue differs from frozen deal')
     spec = map_perpetual(deal, account=account, filters=native.filters(deal['symbol']),
                          metadata_revision='frozen:' + deal['id'])
-    journal = PerpJournal(con, clip_id=clip_id, fill_venue=fill_venue, spec=spec)
+    attach = getattr(native, 'bind_execution_journal', None)
+    barrier = attach(con, account) if callable(attach) else None
+    journal = PerpJournal(con, clip_id=clip_id, fill_venue=fill_venue, spec=spec, send_barrier=barrier)
     bindings = bind(native, journal=journal, authorize=authorize,
                     attempt_lookup=journal.lookup, on_signed=journal.on_signed,
                     clock=clock, hedge=True,

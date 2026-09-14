@@ -5,6 +5,7 @@ Trade operation / legacy journal mirroring is wired by M4 before any live activa
 """
 import json
 import time
+import re
 from decimal import Decimal as D
 from .contracts import AdapterError, ErrorKind, Quote, Observation, ExecutionPage
 from .native import Bindings
@@ -76,11 +77,36 @@ def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.ti
             # Overlap the boundary millisecond; core deduplicates using scoped tid.
             rows = tuple({'dedup_key': (*spec.scope, r['time'], r['tid']), 'native': r} for r in page.rows)
             return ExecutionPage(rows, str(page.last_time) if page.last_time is not None else cursor, page.complete)
-        rows = native.fills(spec.instrument, 0 if cursor is None else int(cursor))
-        values = tuple({'dedup_key': (*spec.scope, r['trade_id']), 'native': r} for r in rows)
-        # Both native adapters exhaust from_id pages or raise on their page limit.
-        next_cursor = str(max(int(r['trade_id']) for r in rows) + 1) if rows else cursor
-        return ExecutionPage(values, next_cursor, True)
+        # A trade-ID list proves observed executions, not a complete historical
+        # interval (retention and account scope must not be inferred from pagination).
+        if cursor is not None and (type(cursor) is not str or re.fullmatch(r'0|[1-9][0-9]*', cursor) is None):
+            raise AdapterError(ErrorKind.INVALID, 'canonical nonnegative trade cursor required')
+        start = 0 if cursor is None else int(cursor)
+        reader = getattr(native, 'history_fills', None)
+        def check_source():
+            identity = getattr(native, 'history_account', None)
+            if (native.venue != spec.venue or not callable(identity) or
+                    identity() != spec.account):
+                raise AdapterError(ErrorKind.IDENTITY, 'execution history account differs from frozen leg')
+        check_source()
+        if not callable(reader):
+            raise AdapterError(ErrorKind.UNSUPPORTED, 'strict native execution history required')
+        rows = reader(spec.instrument, start)
+        check_source()
+        if type(rows) not in (list, tuple):
+            raise AdapterError(ErrorKind.INVALID, 'materialized execution history required')
+        seen = {}
+        for row in rows:
+            if (type(row) is not dict or row.get('symbol') != spec.instrument or
+                    type(row.get('trade_id')) is not int or row['trade_id'] < start):
+                raise AdapterError(ErrorKind.IDENTITY, 'execution row outside requested instrument or cursor')
+            tid = row['trade_id']
+            if tid in seen and seen[tid] != row:
+                raise AdapterError(ErrorKind.IDENTITY, 'conflicting native execution ID')
+            seen[tid] = dict(row)
+        values = tuple({'dedup_key': (*spec.scope, tid), 'native': seen[tid]} for tid in sorted(seen))
+        next_cursor = str(max(seen) + 1) if seen else cursor
+        return ExecutionPage(values, next_cursor, False)
 
     return Bindings(native, journal, authorize, quote, submit, resolve, observe, executions, clock=clock,
                     partial_terminal=getattr(native, 'ioc_partial_terminal', False))

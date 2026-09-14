@@ -5,14 +5,30 @@ stores only immutable request fingerprints. Native signature/fill records remain
 unchanged and all transactions finish before a network callback.
 """
 import json
+from contextlib import contextmanager
 from decimal import Decimal as D
 from .contracts import AdapterError, ErrorKind
 from .. import store
 
 
+@contextmanager
+def exclusive_transaction(con):
+    # BEGIN is outside the rollback block: a failed acquisition must not roll
+    # back another callback's transaction. Nested ownership is never allowed.
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        yield
+    except BaseException:
+        con.rollback()
+        raise
+    else:
+        con.commit()
+
+
 class PerpJournal:
-    def __init__(self, con, *, clip_id, fill_venue, spec):
+    def __init__(self, con, *, clip_id, fill_venue, spec, send_barrier=None):
         self.con, self.clip_id, self.fill_venue, self.spec = con, clip_id, fill_venue, spec
+        self.send_barrier = send_barrier
         clip = store.get_clip(con, clip_id)
         if clip is None:
             raise store.StoreError('adapter clip is missing')
@@ -23,6 +39,10 @@ class PerpJournal:
     def _require_autocommit(self):
         if self.con.in_transaction:
             raise AdapterError(ErrorKind.CONFIG, 'native admission cannot join a caller transaction')
+
+    def _transaction(self):
+        self._require_autocommit()
+        return exclusive_transaction(self.con)
 
     def _proof(self, attempt_id):
         row = self.con.execute(
@@ -41,15 +61,15 @@ class PerpJournal:
             intent = store.get_intent(self.con, self.intent_id)
             if json.loads(intent['spec_json']).get('inst_hash') != self.spec.legacy_hash:
                 raise AdapterError(ErrorKind.IDENTITY, 'native intent instrument differs from frozen leg')
-        return dict(attempt_id=prepared.attempt_id, spec_hash=prepared.spec_hash,
+        return dict(**({"send_barrier": self.send_barrier} if self.send_barrier else {}),
+                    attempt_id=prepared.attempt_id, spec_hash=prepared.spec_hash,
                     quote_hash=prepared.quote.fingerprint, account=self.spec.account,
                     instrument=self.spec.instrument)
 
     def prepare(self, prepared):
-        self._require_autocommit()
         a = prepared.quote.action
         price = D(json.loads(prepared.quote.native)['price_cap'])
-        with store.tx(self.con):
+        with self._transaction():
             proof = self._check(prepared)
             row = store.get_perp_order(self.con, prepared.attempt_id)
             if row is None:
@@ -67,8 +87,7 @@ class PerpJournal:
                 raise AdapterError(ErrorKind.IDENTITY, 'existing native attempt differs from prepared request')
 
     def claim(self, prepared):
-        self._require_autocommit()
-        with store.tx(self.con):
+        with self._transaction():
             proof = self._check(prepared)
             if self._proof(prepared.attempt_id) != proof:
                 raise AdapterError(ErrorKind.IDENTITY, 'native request proof missing or changed')
@@ -76,18 +95,22 @@ class PerpJournal:
                 raise AdapterError(ErrorKind.UNKNOWN, 'native attempt already admitted; resolve, never resend')
 
     def on_signed(self, attempt_id, nonce):
-        self._require_autocommit()
         if type(nonce) is not int or nonce < 0:
             raise store.StoreError('invalid native signing nonce')
-        with store.tx(self.con):
+        with self._transaction():
             row = store.get_perp_order(self.con, attempt_id)
             if row is None or row['clip_id'] != self.clip_id or row['state'] != store.PerpOrderState.SENT:
                 raise store.StoreError('signature has no admitted native attempt')
+            if self.send_barrier and row['sign_nonce'] is not None:
+                raise store.StoreError('native attempt was already signed; resolve, never resend')
             if row['sign_nonce'] is not None and int(row['sign_nonce']) != nonce:
                 raise store.StoreError('native attempt signing nonce is immutable')
             # This is evidence of signing, not a resolved order result.
-            self.con.execute("UPDATE perp_orders SET sign_nonce=? WHERE client_id=? AND state=?",
-                             (nonce, attempt_id, str(store.PerpOrderState.SENT)))
+            predicate = " AND sign_nonce IS NULL" if self.send_barrier else ""
+            changed = self.con.execute("UPDATE perp_orders SET sign_nonce=? WHERE client_id=? AND state=?" + predicate,
+                                       (nonce, attempt_id, str(store.PerpOrderState.SENT))).rowcount
+            if changed != 1:
+                raise store.StoreError('native signing admission was consumed or revoked')
 
     def lookup(self, attempt_id):
         row = store.get_perp_order(self.con, attempt_id)

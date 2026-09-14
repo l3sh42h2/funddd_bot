@@ -84,3 +84,16 @@ def test_aster_saturated_timestamp_is_gap_not_success(monkeypatch):
     rows=[dict(tranId=i,symbol='XUSDT',incomeType='FUNDING_FEE',income='1',asset='USDT',time=1000) for i in (1,2)]
     with pytest.raises(at.AsterError,match='saturated'):
         aster(rows).history_funding('XUSDT',1000)
+
+
+@pytest.mark.parametrize('venue', ['aster', 'gate'])
+@pytest.mark.parametrize('field', ['id','order'])
+@pytest.mark.parametrize('bad', [True,False,7.9,7.0,-1,'01','7.0','+7',' 7'])
+def test_strict_native_identifiers_cannot_be_lossily_coerced(venue,field,bad):
+    row = trade() if venue=='gate' else dict(id=1,orderId=2,symbol='XUSDT',side='SELL',price='2',qty='1',
+                                            quoteQty='2',commission='0',commissionAsset='USDT',time=1000)
+    key = 'id' if field=='id' else 'order_id' if venue=='gate' else 'orderId'
+    row[key]=bad
+    n=gate([row]) if venue=='gate' else aster([row])
+    with pytest.raises((at.AsterError,gt.GateError)):
+        n.history_fills('X_USDT' if venue=='gate' else 'XUSDT',0)

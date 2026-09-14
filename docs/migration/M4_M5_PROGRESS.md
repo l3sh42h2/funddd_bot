@@ -221,3 +221,21 @@ Linux checkpoint выполнен после последних code-право�
   Предыдущие полные попытки: 157.74 s (39 failures, root/устаревшие ожидания), 156.17 s (один нестабильный
   cadence test). Исправления и профильные повторы перечислены в патчноутах. Полное время подготовки/ревью
   и счётчики токенов не измерены; эти длительности — только pytest, не весь этап разработки.
+
+### Common native history and Aster/Gate signing prerequisites
+
+- Common Aster/Gate history now uses verified account + strict native readers;
+  observed trade-ID pages are not declared complete historical intervals. Raw
+  trade/order IDs are validated before int conversion, including bool/fractional
+  rejection. Legacy history remains unchanged; no historical records rebound.
+- Explicit native signing opt-in now binds the common submit port to the existing
+  journal/account. A required committed callback, exact prepared proof and unused
+  nonce guard fence HTTP; same-connection local proof recovers pre-sign crashes.
+- Astra xhigh found and reproduced a nested-transaction double-send race. Strict
+  writer ownership and a signature CAS fix it; actual concurrent Gate test proves
+  one POST/position -2. P1/P2 closed; reviewer 323 passed. Final local compatibility
+  profile: 412 passed, 9.32 s. Details in the two new PATCHNOTES.
+- This code is a prerequisite, not full EVM integration: Engine._child and startup
+  recovery wiring, verified legacy account bootstrap, generic spot execution,
+  remaining presentation/ledger/replay criteria and Linux artifact/deploy remain.
+  M4/M5 are not accepted. Production/services untouched; resize/SL remain deferred.

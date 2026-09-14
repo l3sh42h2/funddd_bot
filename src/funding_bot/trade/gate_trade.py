@@ -292,7 +292,10 @@ def order_to_fill(cid: str, body: dict, ts: int, m: Decimal = D(1)) -> PerpFill:
 
 
 # --- нога -------------------------------------------------------------------------------------------
-class GateTrade:
+from .adapters.signing_fence import JournalBoundIoc
+
+
+class GateTrade(JournalBoundIoc):
     """PerpLeg для Gate (USDT-фьючерсы). Публичное — без ключей и без ворот режима (как у Aster); подписанное —
     через call() с воротами mode_state() на КАЖДЫЙ вызов."""
     venue = VENUE
@@ -702,6 +705,8 @@ class GateTrade:
         REJECTED + код=finish_as или label — площадка отказала/сняла заявку без исполнения;
         UNKNOWN — 5xx/SERVER_LABELS/обрыв/не финал: НЕ ПОВТОРЯТЬ, звать settle_unknown()."""
         f = self.filters(symbol)
+        on_signed = self._ioc_callback(on_signed, symbol=symbol, side=side, quantity=qty,
+                                        price=px_cap, client_id=client_id, reduce_only=reduce_only)
         self._check_order(symbol, side, qty, px_cap, client_id, f)
         c = self._meta.get(symbol) or {}
         m = _d(c.get("quanto_multiplier", 1))
@@ -943,6 +948,10 @@ class GateTrade:
             if _strict and any(not isinstance(t, dict) or t.get('contract') != symbol or
                                any(t.get(k) is None for k in ('id','order_id','price','size','create_time')) for t in body):
                 raise GateError('history fill identity or execution fields are missing')
+            if _strict:
+                from .history_validation import exact_id
+                if any(not exact_id(t.get('id')) or not exact_id(t.get('order_id')) for t in body):
+                    raise GateError('history native trade/order ID is not exact')
             rows = [self._trade_row(symbol, t, m) for t in body if isinstance(t, dict)]
             if _strict:
                 for raw, parsed in zip(body, rows):
