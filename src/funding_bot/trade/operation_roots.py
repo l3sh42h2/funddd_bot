@@ -146,6 +146,8 @@ def propose(con, *, deal: Mapping, kind: str, spec: Mapping, plan: Any, profile_
         raise store.StoreError("root proposal requires instrument hash")
     target_kind, asset, decimals, planned = _target(deal, kind, source, plan)
     with store.tx(con):
+        from .adapters.obligations import require_resolved
+        require_resolved(con, deal)
         if operation_id is None:
             op_id = store.create_operation(
                 con, deal_id=deal["id"], profile_id=profile_id, inst_hash=inst_hash,
@@ -177,6 +179,8 @@ def approve_linked(con, intent: Mapping) -> str | None:
         op, spec = _linked(con, intent)
         if op is None:
             return None
+        from .adapters.obligations import require_resolved
+        require_resolved(con, store.get_deal(con, intent["deal_id"]))
         planned = _planned_raw(intent["kind"], spec, _plan(intent))
         remaining = store.operation_remaining(op)
         if planned != remaining:

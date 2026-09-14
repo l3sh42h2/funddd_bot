@@ -68,13 +68,15 @@ def evm(native, *, quote_token, quote_decimals, journal, authorize, resolve_row,
 
 
 def solana(native, router, *, token, quote_asset, journal, authorize, con, prices, hedge,
-           resolve_ref, read_executions, apply, clip_ref, slippage_bps, min_validity_heights, clock=time.time):
+           resolve_ref, read_executions, apply, clip_ref, slippage_bps, min_validity_heights, clock=time.time,
+           approved_selection=None, metadata=None, block_height=None):
     from ..spot_router import QuoteRequest
     from ..solana.accounts import ata
     cache = {}
+    height = block_height or (lambda: native.chain.block_height())
 
     def quote(spec, action, bounds):
-        if token.mint != spec.instrument or native.wallet != spec.account or native.genesis != spec.network:
+        if token.mint != spec.instrument or native.wallet != spec.account or getattr(native, "genesis", getattr(getattr(native, "inner", None), "genesis", None)) != spec.network:
             raise AdapterError(ErrorKind.IDENTITY, 'Solana native scope mismatch')
         if spec.decimals != token.decimals or (spec.quote_decimals is not None and
                 (spec.quote_decimals != quote_asset.decimals or spec.quote_currency != quote_asset.mint)):
@@ -84,17 +86,40 @@ def solana(native, router, *, token, quote_asset, journal, authorize, con, price
         amount = bounds.get('spend') if buy else action.quantity
         raw = _raw(amount, inp.decimals)
         side = 'entry' if buy else 'exit'
-        req = QuoteRequest(side, inp, out, raw, native.wallet, slippage_bps, native.genesis,
-                           router.clock() + 5, purpose=side,
-                           input_account=ata(native.wallet, inp.mint, inp.program),
-                           output_account=ata(native.wallet, out.mint, out.program),
-                           account_rent=((inp.mint, native.account_rent(inp.mint, inp.program)),
-                                         (out.mint, native.account_rent(out.mint, out.program))))
-        decision = router.select(req, prices=prices(), block_height=native.chain.block_height, hedge=hedge,
-                                 inflight_unknown=lambda: 'unresolved' if native.pending(con) else None)
+        if approved_selection is not None:
+            req, decision = approved_selection
+            if (req.side != side or req.input != inp or req.output != out or req.amount_in_raw != raw
+                    or req.wallet != spec.account or req.genesis_hash != spec.network
+                    or req.slippage_bps != slippage_bps):
+                raise AdapterError(ErrorKind.IDENTITY, 'approved Solana request differs from action')
+        else:
+            req = QuoteRequest(side, inp, out, raw, native.wallet, slippage_bps, native.genesis,
+                               router.clock() + 5, purpose=side,
+                               input_account=ata(native.wallet, inp.mint, inp.program),
+                               output_account=ata(native.wallet, out.mint, out.program),
+                               account_rent=((inp.mint, native.account_rent(inp.mint, inp.program)),
+                                             (out.mint, native.account_rent(out.mint, out.program))))
+            decision = router.select(req, prices=prices(), block_height=height, hedge=hedge,
+                                     inflight_unknown=lambda: 'unresolved' if native.pending(con) else None)
         candidate = decision.winner
         if candidate is None:
             raise AdapterError(ErrorKind.REJECTED, 'no executable Solana route')
+        # An approved decision is consumed as-is.  It is not permission to
+        # reselect a candidate for another amount, mint, program, or decimal
+        # domain.
+        if getattr(decision, 'request_hash', None) != req.request_hash or candidate.request_hash != req.request_hash:
+            raise AdapterError(ErrorKind.IDENTITY, 'approved Solana route request differs from action')
+        for got, want, what in (
+                (candidate.side, req.side, 'side'),
+                (candidate.input_mint, req.input.mint, 'input mint'),
+                (candidate.output_mint, req.output.mint, 'output mint'),
+                (candidate.input_program, req.input.program, 'input program'),
+                (candidate.output_program, req.output.program, 'output program'),
+                (candidate.input_decimals, req.input.decimals, 'input decimals'),
+                (candidate.output_decimals, req.output.decimals, 'output decimals'),
+                (candidate.amount_in_raw, req.amount_in_raw, 'input amount')):
+            if got != want:
+                raise AdapterError(ErrorKind.IDENTITY, f'approved Solana route {what} differs from request')
         minimum = from_raw(candidate.effective_min_out, out.decimals)
         required = action.quantity if buy else bounds.get('min_receive')
         if not isinstance(required, D) or minimum < required:
@@ -113,10 +138,10 @@ def solana(native, router, *, token, quote_asset, journal, authorize, con, price
         if saved is None:
             raise AdapterError(ErrorKind.STALE, 'validated route not present; re-quote required')
         req, decision, _ = saved
-        if router.presign_check(decision, block_height=native.chain.block_height()):
+        if router.presign_check(decision, block_height=height()):
             raise AdapterError(ErrorKind.STALE, 'Solana route expired before signing')
         return native.swap(con, decision.winner, req, logical_action_id=prepared.quote.action.action_id,
-                           clip_ref=clip_ref(prepared.attempt_id), meta={'adapter_attempt': prepared.attempt_id},
+                           clip_ref=clip_ref(prepared.attempt_id), meta=dict(metadata or {}, adapter_attempt=prepared.attempt_id),
                            min_validity_heights=min_validity_heights, apply=apply)
 
     def resolve(spec, ref):

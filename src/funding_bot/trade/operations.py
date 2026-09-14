@@ -48,9 +48,146 @@ class ClipLifecycle:
     finish: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class EndDecision:
+    deal_state: str
+    intent_state: str
+    root_states: tuple[str, ...] = ()
+    fields: dict | None = None
+    reason: str | None = None
+    error: str | None = None
+
+
 class OperationController:
     def __init__(self, connection):
         self.con = connection
+
+    def admit(self, run):
+        """One CAS owns admission; both intent and root become running or neither."""
+        from .adapters.native_journal import exclusive_transaction
+        from .adapters.obligations import require_resolved
+        from .operation_roots import start_linked
+        with exclusive_transaction(self.con):
+            it = store.get_intent(self.con, run.iid)
+            deal = store.get_deal(self.con, run.did)
+            if it is None or it['status'] != store.IntentStatus.APPROVED:
+                return False
+            if deal is None or it['deal_id'] != run.did or any(
+                    it[k] != run.it[k] for k in ('spec_json', 'plan_json', 'kind')) or (
+                    deal['inst_json'] != run.deal['inst_json']):
+                raise store.StoreError('admission frozen context changed')
+            require_resolved(self.con, deal)
+            op = store.operation_of_intent(self.con, run.iid)
+            if (op['id'] if op else None) != run.op_id:
+                raise store.StoreError('admission root changed')
+            if not store.set_intent_status(self.con, run.iid, store.IntentStatus.RUNNING,
+                                           expect=store.IntentStatus.APPROVED):
+                raise store.StoreError('admission CAS failed')
+            if op is not None:
+                start_linked(self.con, it)
+            store.event(self.con, 'start', deal_id=run.did, intent_id=run.iid,
+                        intent_kind=run.kind, sim=run.legs.sim)
+        return True
+
+    def run_operation(self, run, execute, *, paused, refused):
+        """The sole outer execution lifecycle. Ports run outside transactions.
+
+        Report failures after terminal commit cannot transition money state back
+        to paused. Engine remains the sole queue/thread and execution-lock owner.
+        """
+        from .engine import Pause
+        from .keys import redact
+        try:
+            admitted = self.admit(run)
+        except Exception as exc:
+            refused('операция не начата: ' + redact(exc))
+            return
+        if not admitted:
+            return
+        try:
+            execute()
+        except Exception as exc:
+            current = store.get_intent(self.con, run.iid)
+            if current['status'] != store.IntentStatus.RUNNING:
+                # Propagate to Engine's reporting boundary without reclassifying
+                # an already committed operation or repeating native execution.
+                raise
+            stop = exc if isinstance(exc, Pause) else Pause(
+                'error', f'сбой исполнителя: {type(exc).__name__}: {redact(exc)}')
+            paused(stop)
+
+    def commit_end(self, run, decision: EndDecision, *, now=None):
+        """Commit root/intent/deal together; callers enrich reports afterwards.
+
+        No transition error is swallowed. Incompatible identity or a stale
+        intent rolls the complete transition back, including the root.
+        """
+        from .adapters.obligations import require_resolved
+        from .adapters.native_journal import exclusive_transaction
+        with exclusive_transaction(self.con):
+            it = store.get_intent(self.con, run.iid)
+            deal = store.get_deal(self.con, run.did)
+            if it is None or deal is None or it['deal_id'] != run.did:
+                raise store.StoreError('operation context no longer exists')
+            if any(it[k] != run.it[k] for k in ('spec_json', 'plan_json', 'kind')) or (
+                    deal['inst_json'] != run.deal['inst_json']):
+                raise store.StoreError('operation frozen context changed')
+            if it['status'] != store.IntentStatus.RUNNING:
+                raise store.StoreError('operation is no longer running')
+            op = store.operation_of_intent(self.con, run.iid)
+            if (op['id'] if op else None) != run.op_id:
+                raise store.StoreError('operation root changed')
+            if decision.intent_state == store.IntentStatus.DONE or decision.deal_state in (
+                    store.DealState.CLOSED, store.DealState.ABORTED):
+                require_resolved(self.con, deal)
+            for target in decision.root_states:
+                if op is None:
+                    raise store.StoreError('root transition without a root')
+                store.set_operation_state(self.con, op['id'], target, reason=decision.reason, now=now)
+            # An unresolved prerequisite before clip creation still owns the
+            # DRAFT. Preserve an active deal instead of abandoning its identity.
+            if deal['state'] == store.DealState.DRAFT and decision.deal_state == store.DealState.PAUSED:
+                store.set_deal_state(self.con, run.did, store.DealState.ENTERING, expect=deal['state'], now=now)
+            store.set_deal_state(self.con, run.did, decision.deal_state,
+                                 reason=decision.reason, now=now, **(decision.fields or {}))
+            if not store.set_intent_status(self.con, run.iid, decision.intent_state,
+                                           expect=store.IntentStatus.RUNNING, err=decision.error):
+                raise store.StoreError('operation terminal CAS failed')
+            store.event(self.con, 'operation_end', deal_id=run.did, intent_id=run.iid,
+                        operation_id=run.op_id, deal_state=str(decision.deal_state),
+                        intent_state=str(decision.intent_state), reason=decision.reason)
+
+    def pause(self, run, stop, *, progressed, empty, require_unprogressed_empty=False, now=None):
+        from .adapters.obligations import unresolved
+        deal = store.get_deal(self.con, run.did)
+        op = store.operation_of_intent(self.con, run.iid)
+        unknown = bool(unresolved(self.con, deal)) or stop.reason in (
+            'dex_unknown', 'perp_unknown', 'position_unknown', 'book_unknown')
+        if unknown:
+            target = store.DealState.HALTED_MISMATCH if stop.reason in (
+                'position_mismatch', 'book_unknown') and deal['state'] != store.DealState.DRAFT else store.DealState.PAUSED
+        elif deal['state'] == store.DealState.DRAFT:
+            target = store.DealState.ABORTED
+        elif stop.reason in ('position_mismatch', 'book_unknown'):
+            target = store.DealState.HALTED_MISMATCH
+        elif run.kind == 'entry' and empty and deal['state'] == store.DealState.ENTERING and (
+                not require_unprogressed_empty or not progressed):
+            target = store.DealState.ABORTED
+        else:
+            target = store.DealState.PAUSED
+        states = ()
+        if op is not None and op['state'] not in store.OP_DONE:
+            prefix = (store.OpState.APPROVED,) if op['state'] == store.OpState.PROPOSED else ()
+            if unknown:
+                states = (*prefix, store.OpState.PAUSED_UNKNOWN)
+            elif target == store.DealState.ABORTED or (require_unprogressed_empty and not progressed and not int(op['confirmed_raw'])):
+                states = (*prefix, store.OpState.STOPPED, store.OpState.ABANDONED)
+            else:
+                states = (*prefix, store.OpState.STOPPED if stop.reason in ('stop', 'terminate', 'drain')
+                          else store.OpState.PAUSED_RISK)
+        self.commit_end(run, EndDecision(target, store.IntentStatus.PARTIAL if progressed else store.IntentStatus.FAILED,
+                                        states, reason=stop.reason, error=stop.text), now=now)
+        return target
 
     def run_clips(self, program: ClipLifecycle):
         """One execution order for EVM/SOL and adapter-backed clip programs.

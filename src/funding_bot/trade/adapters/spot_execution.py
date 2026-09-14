@@ -119,3 +119,68 @@ def submit_evm(con, *, deal, clip_id, native, stable, stable_dec, token_in, toke
 def ensure_evm_allowance(native, token, amount_raw):
     """Native wallet journals approval separately, before a dependent swap."""
     return native.ensure_allowance(token, amount_raw, '')
+
+
+def sol_spec(deal, native, *, wallet=None):
+    """Frozen SOL identity view; no registry refresh during execution/recovery."""
+    inst = InstrumentSpec.from_json(deal['inst_json'])
+    cfg = owner.OwnerCfg.from_frozen(deal['owner_json'])
+    expected_wallet = cfg.get('wallets.sol_hl.solana_address')
+    actual_wallet = wallet or native.wallet
+    if (not inst.verified or not inst.identity_hash or inst.chain != 'solana'
+            or inst.token != deal['token'] or inst.token_dec != deal['token_dec']
+            or not expected_wallet or expected_wallet != actual_wallet):
+        raise AdapterError(ErrorKind.IDENTITY, 'Solana frozen instrument or wallet differs')
+    return LegSpec(deal['id'] + ':spot', 'inventory', 'long', 'sol_best', 'sol_best',
+                   actual_wallet, inst.token, f'{inst.chain}:{inst.token}', inst.identity_hash,
+                   inst.fs, D(1).scaleb(-inst.token_dec), D(1), inst.quote_mint, inst.quote_mint,
+                   Capabilities('dex', 'spot', 'solana', amount=True), network=inst.genesis_hash,
+                   decimals=inst.token_dec, quote_decimals=inst.quote_dec,
+                   metadata_revision='frozen:' + deal['id'], legacy_hash=inst.inst_hash())
+
+
+def submit_sol(con, *, deal, clip_id, native, router, decision, request, logical,
+               metadata, min_validity_heights, apply, authorize, clock, block_height, registry=None):
+    """Use the already approved/reselected route; do not choose a second route."""
+    from .spot_bindings import solana
+    from .contracts import from_raw
+    spec = sol_spec(deal, native)
+    side = 'BUY' if request.side == 'entry' else 'SELL'
+    token, quote_asset = (request.output, request.input) if side == 'BUY' else (request.input, request.output)
+    journal = SpotJournal(con, deal, clip_id, spec)
+    captured, errors = [], []
+    bindings = solana(native, router, token=token, quote_asset=quote_asset, journal=journal,
+                      authorize=authorize, con=con, prices=None, hedge=None, resolve_ref=None,
+                      read_executions=None, apply=apply, clip_ref=lambda _: str(clip_id),
+                      slippage_bps=request.slippage_bps, min_validity_heights=min_validity_heights,
+                      clock=clock, approved_selection=(request, decision), metadata=metadata,
+                      block_height=block_height)
+    send = bindings.submit
+    def submit(leg, prepared):
+        try:
+            outcome = send(leg, prepared)
+            captured.append(outcome)
+            return outcome
+        except Exception as exc:
+            errors.append(exc)
+            raise
+    bindings.submit = submit
+    adapter = (registry or production_registry()).build(spec, SimpleNamespace(for_leg=lambda _: bindings))
+    action = Action(logical, spec.leg_id, side,
+                    from_raw(1 if side == 'BUY' else request.amount_in_raw, spec.decimals))
+    bounds = {'spend': from_raw(request.amount_in_raw, spec.quote_decimals)} if side == 'BUY' else {'min_receive': D(0)}
+    prepared = adapter.prepare(logical, adapter.quote(action, bounds))
+    result = adapter.submit(prepared)
+    if result.terminal and captured:
+        with exclusive_transaction(con):
+            store.event(con, 'adapter_spot_terminal', deal_id=deal['id'], clip_id=clip_id,
+                        attempt_id=logical, status=result.status.value,
+                        native_ref=result.native_ref.id if result.native_ref else None)
+        return captured[0]
+    # Preserve the native presend/no-sign proof path owned by the caller. A
+    # signed/touched attempt remains UNKNOWN there and cannot release reserve.
+    if errors:
+        raise errors[0]
+    if captured:
+        return replace(captured[0], state='unknown', reason='common result unresolved')
+    raise AdapterError(ErrorKind.UNKNOWN, 'common Solana attempt unresolved')

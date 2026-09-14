@@ -115,6 +115,17 @@ def apply_swap(con, deal_id: str, clip_id: int, op_id: str | None, reserve_raw: 
     доказанного неисполнения. Неизвестный исход сюда не приходит: он держит резерв операции и клип DEX_UNKNOWN."""
     if out.state not in ("ok", "failed", "expired", "not_sent"):
         raise ValueError(f"исход {out.state!r} не применяется")
+    from .adapters.spot_execution import sol_spec
+    from .adapters.outcomes import sol_swap
+    from .adapters.contracts import Status
+    deal = store.get_deal(con, deal_id)
+    wallet = OwnerCfg.from_frozen(deal['owner_json']).get('wallets.sol_hl.solana_address')
+    clip = store.get_clip(con, clip_id)
+    intent = store.get_intent(con, clip['intent_id'])
+    normalized = sol_swap(out, sol_spec(deal, None, wallet=wallet),
+                          'BUY' if intent['kind'] == 'entry' else 'SELL')
+    if not normalized.terminal or normalized.status not in (Status.SETTLED, Status.REJECTED):
+        raise ValueError('Solana execution is not a proven terminal result')
     result = SpotSettlement(True, int(out.in_raw), int(out.out_raw)) if out.state == "ok" else SpotSettlement(False)
     with store.tx(con):
         OperationController(con).settle_spot(clip_id, result, operation_id=op_id, reserve_raw=int(reserve_raw))
@@ -1061,13 +1072,12 @@ class SolEngine:
         return self.e.conns.get()
 
     # --- вход в исполнение ---
-    def execute(self, it: dict, deal: dict, spec: dict) -> None:
+    def prepare_run(self, it: dict, deal: dict, spec: dict):
         con, iid = self.con, it["id"]
         inst = deal_instrument(con, deal)
         bad = inst_mismatch(deal, spec, inst)
         if bad:
             store.event(con, "inst_mismatch", deal_id=deal["id"], intent_id=iid, why=bad)
-            self._fail_op(it)
             self.e._fail(iid, bad)
             if deal["state"] == DealState.DRAFT:
                 store.set_deal_state(con, deal["id"], DealState.ABORTED, expect=DealState.DRAFT, reason="не начата")
@@ -1075,23 +1085,19 @@ class SolEngine:
         try:
             legs = legs_of(self.e.legs, deal)
         except ProfileDown as e:
-            self._fail_op(it)
             return self.e._fail(iid, f"связка Solana × Hyperliquid недоступна: {e.reason} — ничего не отправлено")
         if legs is None or (not legs.sim and not legs.can_send):
-            self._fail_op(it)
             return self.e._fail(iid, "живую сделку в этом режиме не двигаю: ключи связки не загружены")
         cfg = OwnerCfg.from_frozen(spec["owner"])
         self.e.holder.set(cfg)
         left = recover_deal(con, deal, legs)
         if left:                      # R12/X10: поверх неизвестного исхода — ничего нового
-            self._fail_op(it)
             return self.e._fail(iid, f"исход прошлой отправки неизвестен: {'; '.join(left)} — ничего не отправлено, "
                                      "сначала «позиции»")
         deal = store.get_deal(con, deal["id"])
         try:
             step = _step(legs.perp)
         except Exception as e:        # noqa — ничего не отправлено
-            self._fail_op(it)
             return self.e._fail(iid, f"мета {inst.perp_symbol} не прочитана: {redact(e)}")
         op = store.operation_of_intent(con, iid)
         if it["kind"] in ("entry", "exit"):
@@ -1107,34 +1113,15 @@ class SolEngine:
                     store.set_deal_state(con, deal["id"], DealState.ABORTED, expect=DealState.DRAFT,
                                          reason="не начата")
                 return
-        store.set_intent_status(con, iid, IntentStatus.RUNNING, expect=IntentStatus.APPROVED)
         run = SolRun(it=it, deal=deal, kind=it["kind"], spec=spec, plan=_plan(it), legs=legs, cfg=cfg, inst=inst,
                      step=step, op_id=op["id"] if op else None, started=self.e.clock())
-        store.event(con, "start", deal_id=run.did, intent_id=iid, intent_kind=run.kind, sim=legs.sim)
-        try:
-            if run.kind == "entry":
-                self._entry(run)
-            elif run.kind == "exit":
-                self._exit(run)
-            elif run.kind == "rehedge":
-                self._rehedge(run)
-            else:
-                raise Pause("changed", f"«{run.kind}» в пилоте выключен")
-        except Pause as p:
-            self._paused(run, p)
-        except Exception as e:        # noqa — неожиданное: пауза и сверка
-            log.exception("исполнение %s", iid)
-            self._paused(run, Pause("error", f"сбой исполнителя: {type(e).__name__}: {redact(e)}"))
+        return run
 
-    def _fail_op(self, it: dict) -> None:
-        op = store.operation_of_intent(self.con, it["id"])
-        if op is not None and op["state"] in (OpState.PROPOSED, OpState.APPROVED):
-            if int(op["reserved_raw"]):
-                _op_to(self.con, op["id"], OpState.APPROVED, OpState.PAUSED_UNKNOWN, reason="исход не выяснен")
-            else:
-                _op_to(self.con, op["id"], OpState.APPROVED, OpState.STOPPED, reason="не начата")
-                if not int(op["confirmed_raw"]):
-                    _op_to(self.con, op["id"], OpState.ABANDONED, reason="не начата")
+    def execute_program(self, run):
+        action = {"entry": self._entry, "exit": self._exit, "rehedge": self._rehedge}.get(run.kind)
+        if action is None:
+            raise Pause("changed", f"«{run.kind}» в пилоте выключен")
+        action(run)
 
     # --- ворота ---
     def guard(self, run: SolRun, *, entry: bool = False) -> None:
@@ -1194,16 +1181,6 @@ class SolEngine:
             raise Pause("busy", f"рынок уже занят другой активной сделкой: {e}") from None
         except store.BadTransition as e:
             raise Pause("state", f"сделка {run.did} в состоянии {d['state']}: {e}") from None
-
-    def _op_start(self, run: SolRun) -> None:
-        con = self.con
-        if not run.op_id:
-            raise Pause("state", "намерение без корневой операции — пришлите команду заново")
-        for o in con.execute("SELECT id, state FROM operations WHERE deal_id=? AND id<>? AND state IN ('PARTIAL', "
-                             "'STOPPED', 'PAUSED_RISK')", (run.did, run.op_id)).fetchall():
-            _op_to(con, o[0], OpState.ABANDONED, reason=f"новая операция {run.op_id}")
-        if not _op_to(con, run.op_id, OpState.RUNNING):
-            raise Pause("state", f"операция {run.op_id} не запускается (другая активна или исход неизвестен)")
 
     @staticmethod
     def _agent_gate(run: SolRun, what: str) -> None:
@@ -1280,8 +1257,13 @@ class SolEngine:
         def apply(o: SwapOutcome) -> None:
             apply_swap(con, run.did, clip_id, run.op_id, amount, o)
         try:
-            out = legs.spot.swap(con, w, req, logical_action_id=logical, clip_ref=str(clip_id), meta=meta,
-                                 min_validity_heights=_lim(run.cfg, "min_blockhash_validity_heights"), apply=apply)
+            from .adapters.spot_execution import submit_sol
+            out = submit_sol(con, deal=run.deal, clip_id=clip_id, native=legs.spot, router=legs.router,
+                             decision=dec, request=req, logical=logical, metadata=meta,
+                             min_validity_heights=_lim(run.cfg, "min_blockhash_validity_heights"), apply=apply,
+                             authorize=lambda leg, action: self.guard(run, entry=run.kind == "entry"),
+                             clock=self.e.clock, block_height=legs.block_height,
+                             registry=getattr(self.e.legs, 'adapters', None))
         except PresendRefused as e:
             apply(SwapOutcome("not_sent", None, None, reason=str(e)))
             store.event(con, "dex_not_sent", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, err=redact(e))
@@ -1444,7 +1426,6 @@ class SolEngine:
         con = self.con
         self.guard(run, entry=True)
         self._deal_to(run, DealState.ENTERING)
-        self._op_start(run)
         self._hl_preflight(run)
         amount = int(run.spec["amount_raw"])
         self._run_spot_clips(run, amount, self._entry_hedge)
@@ -1511,7 +1492,6 @@ class SolEngine:
                             f"кошелёк {wal} против журнала {T0} — выход не начинаю")
             self._agent_gate(run, "спот не продаю")    # продажа без откупа шорта оставила бы голый шорт
         self._deal_to(run, DealState.EXITING)
-        self._op_start(run)
         op = store.get_operation(con, run.op_id) if run.op_id else None
         amount = min(T0, store.operation_remaining(op)) if op else T0
         self._run_spot_clips(run, amount, self._exit_hedge)
@@ -1625,11 +1605,13 @@ class SolEngine:
         fields = {"carry": _delta(run.inst, T, S)}
         if new == DealState.CLOSED:
             fields["dust"] = T
-        self.e._set_deal(run.did, new, now=self.e.clock(), **fields)     # часы исполнения: граница окна учёта HL
-        _op_to(con, run.op_id, op_state, reason=None if op_state != OpState.PARTIAL else "остаток после выхода")
         if run.kind == "exit" and new != DealState.CLOSED:
             store.event(con, "exit_residual", deal_id=run.did, intent_id=run.iid, tokens=T, short=S)
-        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if op_state == OpState.PARTIAL else IntentStatus.DONE)
+        from .operations import EndDecision
+        OperationController(con).commit_end(run, EndDecision(
+            new, IntentStatus.PARTIAL if op_state == OpState.PARTIAL else IntentStatus.DONE,
+            (op_state,) if run.op_id else (), fields,
+            reason=None if op_state != OpState.PARTIAL else "остаток после выхода"), now=self.e.clock())
         warn = []
         if run.t_swap is not None:
             naked_ms = int((self.e.clock() - run.t_swap) * 1000)
@@ -1741,33 +1723,11 @@ class SolEngine:
     # --- пауза ---
     def _paused(self, run: SolRun, p: Pause) -> None:
         con = self.con
-        deal = store.get_deal(con, run.did)
         bk = deal_book(con, run.did)
         progressed = self.e._progressed(run.iid)
-        empty = bk.tokens_raw == 0 and bk.short == 0
-        if deal["state"] == DealState.DRAFT:
-            target = DealState.ABORTED
-        elif p.reason in ("position_mismatch", "book_unknown"):
-            target = DealState.HALTED_MISMATCH
-        elif run.kind == "entry" and empty and deal["state"] == DealState.ENTERING and not progressed:
-            target = DealState.ABORTED
-        else:
-            target = DealState.PAUSED
-        self.e._set_deal(run.did, target, reason=p.reason, now=self.e.clock())
-        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if progressed else IntentStatus.FAILED, err=p.text)
-        op = store.get_operation(con, run.op_id) if run.op_id else None
-        if op is not None:
-            if op["state"] == OpState.PROPOSED:
-                _op_to(con, run.op_id, OpState.APPROVED)
-            unknown = p.reason in _UNKNOWN_REASONS or op["reserved_raw"] != "0"
-            if unknown:
-                _op_to(con, run.op_id, OpState.PAUSED_UNKNOWN, reason=p.reason)
-            elif not progressed and not int(op["confirmed_raw"]):
-                _op_to(con, run.op_id, OpState.STOPPED, OpState.ABANDONED, reason=p.reason)
-            elif p.reason in ("stop", "terminate"):
-                _op_to(con, run.op_id, OpState.STOPPED, reason=p.reason)
-            else:
-                _op_to(con, run.op_id, OpState.PAUSED_RISK, reason=p.reason)
+        target = OperationController(con).pause(run, p, progressed=progressed,
+                                                empty=bk.tokens_raw == 0 and bk.short == 0,
+                                                require_unprogressed_empty=True, now=self.e.clock())
         store.event(con, "paused", deal_id=run.did, intent_id=run.iid, reason=p.reason, text=p.text, state=str(target))
         dl = _delta(run.inst, bk.tokens(run.dec), bk.short) if bk.known else None
         if dl is not None and ZERO <= dl < _tokens_per_step(run.inst, run.step):

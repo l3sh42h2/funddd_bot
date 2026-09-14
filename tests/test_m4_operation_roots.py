@@ -210,6 +210,14 @@ def test_approving_independent_root_abandons_resolved_old_root_atomically(con):
 def test_unresolved_old_root_blocks_new_approval_and_rolls_back(con, old_state, reserve):
     d = deal(con)
     old_id = old_active(con, d, state=old_state, reserve=reserve)
+    if reserve:
+        before = (row_count(con, "intents"), row_count(con, "operations"))
+        with pytest.raises(store.StoreError, match="unresolved execution"):
+            roots.propose(con, deal=d, kind="entry", spec=spec("entry", APPROVAL_1),
+                          plan=plan(d["id"], "entry", 100), profile_id="bsc_okx_aster", chat=None)
+        assert before == (row_count(con, "intents"), row_count(con, "operations"))
+        assert store.get_operation(con, old_id)["state"] == old_state
+        return
     iid, nonce = roots.propose(
         con, deal=d, kind="entry", spec=spec("entry", APPROVAL_1), plan=plan(d["id"], "entry", 100),
         profile_id="bsc_okx_aster", chat=None,

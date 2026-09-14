@@ -963,7 +963,9 @@ def test_halt_promises_auto_unwind_only_when_it_is_scheduled(tmp_path, monkeypat
         assert store.approve_intent(e.con, p.intent_id, p.nonce)
         store.set_intent_status(e.con, p.intent_id, IntentStatus.RUNNING, expect=IntentStatus.APPROVED)
         store.set_deal_state(e.con, p.deal_id, DealState.ENTERING)
-        run = SimpleNamespace(did=p.deal_id, iid=p.intent_id, kind="entry", dec=18, f=FILT, legs=e.legs_sim,
+        run = SimpleNamespace(did=p.deal_id, iid=p.intent_id, it=store.get_intent(e.con, p.intent_id),
+                              op_id=store.operation_of_intent(e.con, p.intent_id)["id"],
+                              kind="entry", dec=18, f=FILT, legs=e.legs_sim,
                               symbol=SYMBOL, cfg=cfg, deal=store.get_deal(e.con, p.deal_id), seq=1, n_total=1)
         with monkeypatch.context() as m:
             m.setattr(engine_mod, "deal_book", lambda con, did: naked)

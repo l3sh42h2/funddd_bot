@@ -1439,6 +1439,9 @@ class Desk:
         if is_sol_deal(deal):
             return self.sol().propose_resume(deal, chat)
         con = self.conns.get()
+        from .adapters.obligations import unresolved
+        if unresolved(con, deal):
+            raise Refused(v.refused('исход прошлой отправки неизвестен — сначала «позиции»'))
         if deal["state"] == DealState.HALTED_MISMATCH:
             from . import reconcile
             legs = self._deal_legs(deal)
@@ -1825,15 +1828,26 @@ class Engine:
 
     def _fail(self, iid: str, text: str, expect=IntentStatus.APPROVED) -> None:
         con = self.conns.get()
-        try:
-            store.set_intent_status(con, iid, IntentStatus.FAILED, expect=expect, err=text)
+        from .adapters.obligations import unresolved
+        with store.tx(con):
+            it = store.get_intent(con, iid)
+            if it is None or it['status'] != expect:
+                return
+            deal = store.get_deal(con, it['deal_id'])
+            pending = unresolved(con, deal)
             op = store.operation_of_intent(con, iid)
-            if op and op['state'] == store.OpState.APPROVED and not int(op['reserved_raw']):
-                store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason=text)
-                if not int(op['confirmed_raw']):
-                    store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason=text)
-        except store.StoreError as e:
-            log.error("намерение %s → failed: %s", iid, e)
+            if op and op['state'] == store.OpState.APPROVED:
+                if pending:
+                    store.set_operation_state(con, op['id'], store.OpState.PAUSED_UNKNOWN, reason=text)
+                else:
+                    store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason=text)
+                    if not int(op['confirmed_raw']):
+                        store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason=text)
+            if pending and deal['state'] == DealState.DRAFT:
+                store.set_deal_state(con, deal['id'], DealState.ENTERING, expect=DealState.DRAFT)
+                store.set_deal_state(con, deal['id'], DealState.PAUSED, reason='unresolved prerequisite')
+            if not store.set_intent_status(con, iid, IntentStatus.FAILED, expect=expect, err=text):
+                raise store.StoreError('refusal CAS failed')
         self.hooks.report(_views().refused(text))
 
     def _execute(self, iid: str) -> None:
@@ -1846,8 +1860,25 @@ class Engine:
             return self._fail(iid, "служба останавливается — план не начат, пришлите команду после рестарта")
         deal = store.get_deal(con, it["deal_id"])
         spec = json.loads(it["spec_json"])
-        if is_sol_deal(deal):                  # связка SOL × HL: ноги — по сделке, не legs(sim); BSC ниже не меняется
-            return self._sol().execute(it, deal, spec)
+        if is_sol_deal(deal):
+            policy = self._sol()
+            run = policy.prepare_run(it, deal, spec)
+        else:
+            policy = self
+            run = self._prepare_run(it, deal, spec)
+        if run is None:
+            return
+        OperationController(con).run_operation(
+            run, lambda: policy.execute_program(run), paused=lambda stop: policy._paused(run, stop),
+            refused=lambda text: self._fail(iid, text))
+
+    def execute_program(self, run):
+        if run.kind != "undo":
+            self._perp_ab(run)
+        {"entry": self._entry, "exit": self._exit, "rehedge": self._rehedge, "undo": self._undo}[run.kind](run)
+
+    def _prepare_run(self, it, deal, spec):
+        con, iid = self.conns.get(), it['id']
         # инструмент намерения = инструмент сделки (ревью 13.09, Н2) — до ног, записи RUNNING и любых чтений сети
         inst = deal_instrument(con, deal)
         bad = self._inst_mismatch(deal, spec, inst)
@@ -1873,7 +1904,6 @@ class Engine:
             return self._fail(iid, f"счёт исполнения не подтверждён: {redact(e)}")
         cfg = OwnerCfg.from_frozen(spec["owner"])
         self.holder.set(cfg)
-        store.set_intent_status(con, iid, IntentStatus.RUNNING, expect=IntentStatus.APPROVED)
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
         try:
             f = legs.perp.filters(deal["symbol"])
@@ -1886,7 +1916,7 @@ class Engine:
             evm_spec(deal, legs.spot, stable, int(sdec), continuation_evidence=continuity)
         except Exception as e:                 # noqa — ничего не отправлено
             self._fail(iid, f"фильтры {deal['symbol']} не прочитаны: {redact(e)}",
-                       expect=IntentStatus.RUNNING)
+                       expect=IntentStatus.APPROVED)
             return
         run = Run(it=it, deal=deal, kind=it["kind"], spec=spec, plan=plan_from_json(it["plan_json"]), legs=legs,
                   cfg=cfg, token=deal["token"], dec=int(deal["token_dec"]), symbol=deal["symbol"], stable=stable,
@@ -1895,24 +1925,12 @@ class Engine:
         run.op_id = op['id'] if op else None
         run.inst = inst                        # единицы сделки (ревью 13.09, С1): токены ↔ контракты через m
         run.m, run.m_known = inst.m, m_known(inst)
-        store.event(con, "start", deal_id=run.did, intent_id=iid, intent_kind=run.kind, sim=legs.sim)
         if run.kind in MAIN_KINDS and not spec.get("perp_only"):
             fresh = self._requote(run)
             if fresh is None:
                 return
             run.plan = fresh
-        try:
-            if run.op_id:
-                from .operation_roots import start_linked
-                start_linked(con, store.get_intent(con, iid))
-            if run.kind != "undo":
-                self._perp_ab(run)             # «auto» без чисел плана — пауза до первого действия, а не посреди клипа
-            {"entry": self._entry, "exit": self._exit, "rehedge": self._rehedge, "undo": self._undo}[run.kind](run)
-        except Pause as p:
-            self._paused(run, p)
-        except Exception as e:                 # noqa — неожиданное: пауза и сверка, а не «продолжить как-нибудь»
-            log.exception("исполнение %s", iid)
-            self._paused(run, Pause("error", f"сбой исполнителя: {type(e).__name__}: {redact(e)}"))
+        return run
 
     @staticmethod
     def _inst_mismatch(deal: dict, spec: dict, inst: InstrumentSpec) -> str | None:
@@ -2126,45 +2144,12 @@ class Engine:
         except store.BadTransition as e:
             log.error("сделка %s: %s", did, e)
 
-    def _root_stopped(self, run, reason):
-        if not getattr(run, "op_id", None):
-            return
-        con = self.conns.get()
-        op = store.get_operation(con, run.op_id)
-        if op['state'] in store.OP_DONE:
-            return
-        if int(op['reserved_raw']):
-            target = store.OpState.PAUSED_UNKNOWN
-        elif reason in ('stop', 'terminate', 'drain'):
-            target = store.OpState.STOPPED
-        else:
-            target = store.OpState.PAUSED_RISK
-        store.set_operation_state(con, run.op_id, target, reason=reason)
-
     def _paused(self, run: Run, p: Pause) -> None:
         con = self.conns.get()
-        self._root_stopped(run, p.reason)
-        deal = store.get_deal(con, run.did)
         bk = deal_book(con, run.did)
         progressed = self._progressed(run.iid)
-        empty = bk.tokens_raw == 0 and bk.short == 0
-        if deal["state"] == DealState.DRAFT:
-            target = DealState.ABORTED
-        elif p.reason in ("position_mismatch", "book_unknown"):
-            target = DealState.HALTED_MISMATCH
-        elif run.kind == "entry" and empty and deal["state"] == DealState.ENTERING:
-            target = DealState.ABORTED          # ничего не куплено и не продано — сделки нет
-        else:
-            target = DealState.PAUSED
-        if target == DealState.ABORTED:
-            from .operation_roots import abandon_unstarted
-            with store.tx(con):
-                abandon_unstarted(con, run.did)
-                self._set_deal(run.did, target, reason=p.reason)
-        else:
-            self._set_deal(run.did, target, reason=p.reason)
-        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if progressed else IntentStatus.FAILED,
-                                err=p.text)
+        target = OperationController(con).pause(run, p, progressed=progressed,
+                                                empty=bk.tokens_raw == 0 and bk.short == 0)
         store.event(con, "paused", deal_id=run.did, intent_id=run.iid, reason=p.reason, text=p.text,
                     state=str(target))
         delta = bk.delta(run.dec) if bk.known else None
@@ -2919,20 +2904,22 @@ class Engine:
             new, fields = DealState.CLOSED, {"carry": bk.delta(run.dec), "dust": bk.tokens(run.dec)}
         else:
             new, fields = DealState.OPEN, {"carry": bk.delta(run.dec)}
-        self._set_deal(run.did, new, **fields)
         if run.kind == "exit" and run.spec.get("all") and not run.spec.get("perp_only") and new != DealState.CLOSED:
             store.event(con, "exit_residual", deal_id=run.did, intent_id=run.iid, tokens=bk.tokens(run.dec),
                         short=bk.short, m=bk.m if bk.m_known else None)  # роутер DEX вернул часть токенов: остаток
             #                                                                 захеджирован (ревью 13.09, С2)
         partial = False
+        root_states = ()
         if run.op_id:
             op = store.get_operation(con, run.op_id)
             if int(op['reserved_raw']):
                 raise Pause('book_unknown', 'операция имеет неразрешённый резерв')
             partial = store.operation_remaining(op) > 0
             state = store.OpState.PARTIAL if partial else (store.OpState.OPEN if run.kind == 'entry' else store.OpState.CLOSED)
-            store.set_operation_state(con, run.op_id, state)
-        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if partial else IntentStatus.DONE)
+            root_states = (state,)
+        from .operations import EndDecision
+        OperationController(con).commit_end(run, EndDecision(
+            new, IntentStatus.PARTIAL if partial else IntentStatus.DONE, root_states, fields))
         snapshot, cost, liq = self._final(run, finished, closed=new == DealState.CLOSED)
         store.event(con, "final", deal_id=run.did, intent_id=run.iid, cost_usd=cost, state=str(new), sim=run.legs.sim,
                     **liq)                     # порог тревоги ликвидации замораживается на входе («позиции» его читают)
