@@ -11,19 +11,20 @@ from funding_bot.trade.types import Book, Filters, PerpInstrument
 class CexPerp:
     venue = "gate"
 
-    def __init__(self, *, available=D("100"), position=D("-2")):
+    def __init__(self, *, available=D("100"), position=D("-2"), multiplier=D(1), ask=D("10")):
         self.available, self.position_value = available, position
+        self.multiplier, self.ask = multiplier, ask
         self.calls = []
 
     def instrument(self, symbol):
-        return PerpInstrument(symbol, "ASSET", "ASSET", D(1), "USDT", "PERPETUAL")
+        return PerpInstrument(symbol, "ASSET", "ASSET", self.multiplier, "USDT", "PERPETUAL")
 
     def filters(self, symbol):
         return Filters(D(".01"), D("1"), D("1"), D("1000"), D("1000"), D(".01"), frozenset({"IOC"}))
 
     def book(self, symbol, limit):
         self.calls.append("book")
-        return Book(((D("9"), D("10")),), ((D("10"), D("10")),), 1)
+        return Book(((self.ask - 1, D("10")),), ((self.ask, D("10")),), 1)
 
     def available_margin(self):
         self.calls.append("margin")
@@ -58,6 +59,47 @@ def test_cex_missing_margin_refuses_before_setup_or_send():
         entry(perp, request())
     assert "setup" not in perp.calls
     assert "position" not in perp.calls
+
+
+def test_cex_fee_is_absolute_not_a_rate_at_the_margin_boundary():
+    # q=2 contracts, ask=10 contract-USDT, 10x: margin 2; taker fee 2;
+    # reserve 1.  4.9 passed with the old ``+ rate`` bug and must now refuse.
+    perp = CexPerp(available=D("4.9"))
+    with pytest.raises(PreflightRefused, match="маржи"):
+        entry(perp, request())
+    assert "position" not in perp.calls and not any(isinstance(x, tuple) for x in perp.calls)
+
+
+def test_cex_contract_price_and_capacity_are_not_multiplied_twice():
+    # m=100 is already represented by two contracts at 100 USDC each.  The
+    # required 41 = 2*100/10 + 2*100*10% + 1 reserve, not 4,001.
+    perp = CexPerp(available=D(41), multiplier=D(100), ask=D(100))
+    result = entry(perp, request(multiplier=D(100)))
+    assert result.margin_required == D(40)
+    assert perp.calls[-1] == ("setup", 10, "ISOLATED")
+
+
+def test_hl_fee_is_absolute_not_a_rate_at_the_margin_boundary():
+    seen = {}
+
+    class Hl:
+        def identity(self):
+            return NS(fullcoin="PERP", is_delisted=False, asset=7)
+        def book(self, *_):
+            return Book(((D(9), D(10)),), ((D(10), D(10)),), 1)
+        def entry_margin_refusals(self, need, reserve):
+            seen["need"] = need
+            return ["недостаточно"] if need > D(3) else []
+        def position(self, _):
+            return D("-2")
+        def setup(self, *_):
+            raise AssertionError("setup after insufficient margin")
+
+    with pytest.raises(hl_preflight.PreflightRefused, match="недостаточно"):
+        hl_preflight.entry(Hl(), NS(perp_symbol="PERP", perp_asset_id=7, m=D(100)), sim=False,
+                           leverage=10, capacity=D(2), fee_rate=lambda: D(".1"), reserve=D(1),
+                           expected_short=D(2), book_levels=20)
+    assert seen["need"] == D(4)
 
 
 def test_hl_entry_delegates_existing_validator(monkeypatch):

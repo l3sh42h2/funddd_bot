@@ -152,7 +152,7 @@ def test_partial_exit_and_foreign_profile_are_honest_refusals(tmp_path):
         t = sends(tg)[-1][2]
         assert "частичный выход в пилоте выключен" in t.lower() and not plans(tg), (cmd, t)
     say(w, bot, sender, "выход ANSEM bsc")
-    assert "связки Solana × Hyperliquid" in sends(tg)[-1][2]
+    assert "профиля sol_best_hyperliquid" in sends(tg)[-1][2]
     assert store.get_deal(w.con, prop.deal_id)["state"] == DealState.OPEN
 
 

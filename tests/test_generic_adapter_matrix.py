@@ -68,6 +68,19 @@ def test_two_futures_opposite_directions_distinct_currencies(tmp_path, reverse):
     assert quantities == ([D(-2), D(2)] if reverse else [D(2), D(-2)])
 
 
+@pytest.mark.parametrize('first_multiplier,second_multiplier', [(D(1), D(1000)), (D(1000), D(1))])
+def test_perp_contract_multiplier_preserves_underlying_target_and_native_quantity(
+        tmp_path, first_multiplier, second_multiplier):
+    a = spec('fixture_cex_perp', 'lead', 'long', multiplier=first_multiplier)
+    b = spec('fixture_dex_perp', 'hedge', 'short', multiplier=second_multiplier)
+    con, did, plan, iid, coordinator, transports = setup(tmp_path, a, b)
+    assert coordinator.execute(iid).state == store.OpState.OPEN
+    assert [t.sent[0][2].quantity for t in transports] == [D(2) / first_multiplier, D(2) / second_multiplier]
+    assert [D(x['qty']) for x in leg_accounting.rebuild(con, deal_id=did)['legs']] == [D(2), D(-2)]
+    root = store.get_operation(con, plan.operation_id)
+    assert root['confirmed_raw'] == root['target_raw'] and root['reserved_raw'] == '0'
+
+
 def test_leading_ack_loss_reopen_resolves_without_duplicate(tmp_path):
     a, b = spec('fixture_sol_spot', 'lead', 'long'), spec('fixture_cex_perp', 'hedge', 'short', venue='gate')
     con, did, plan, iid, coordinator, transports = setup(tmp_path, a, b)
@@ -96,11 +109,37 @@ def test_base_fee_changes_hedge_actual_quantity(tmp_path):
     assert sum(D(x['qty']) for x in leg_accounting.rebuild(con, deal_id=did)['legs']) == 0
 
 
-@pytest.mark.parametrize('first,second', [('fixture_cex_spot', 'fixture_cex_perp'),
-    ('fixture_evm_spot', 'fixture_dex_perp'), ('fixture_sol_spot', 'fixture_cex_perp'),
-    ('fixture_cex_perp', 'fixture_dex_perp')])
-def test_entry_then_exit_uses_owned_two_leg_inventory(tmp_path, first, second):
-    a, b = spec(first, 'lead', 'long'), spec(second, 'hedge', 'short')
+@pytest.mark.parametrize('resolve,busy', [(False, False), (True, True), (True, False)])
+def test_positions_resolves_exact_interrupted_generic_attempt_without_new_send(tmp_path, resolve, busy):
+    from funding_bot.trade import reconcile
+    a, b = spec('fixture_sol_spot', 'lead', 'long'), spec('fixture_cex_perp', 'hedge', 'short', venue='gate')
+    con, did, plan, iid, coordinator, transports = setup(tmp_path, a, b)
+    transports[0].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    con.close()
+    con = store.connect(tmp_path / 'trade.db')
+    def factory(c, intent, deal, frozen):
+        journals = [EventAttemptJournal(c, deal_id=did, intent_id=intent['id'],
+                    operation_id=plan.operation_id, leg_id=s.leg_id) for s in plan.legs]
+        return context(plan.legs, transports, journals)
+    rows, matched, _ = reconcile.positions(con, lambda sim: None, now=time.time(),
+        busy_deal=did if busy else None, resolve=resolve,
+        generic_registry=registry(), generic_context_factory=factory)
+    assert [len(x.sent) for x in transports] == [1, 0]
+    assert matched is not True  # No second-leg execution has been proven.
+    op = store.get_operation(con, plan.operation_id)
+    if resolve and not busy:
+        assert op['state'] == store.OpState.PAUSED_RISK and op['reserved_raw'] == '0'
+        assert D(rows[0]['generic_legs']['legs'][0]['qty']) == 2
+    else:
+        assert op['state'] == store.OpState.PAUSED_UNKNOWN and int(op['reserved_raw']) > 0
+
+
+@pytest.mark.parametrize('first,second,reverse', [('fixture_cex_spot', 'fixture_cex_perp', False),
+    ('fixture_evm_spot', 'fixture_dex_perp', False), ('fixture_sol_spot', 'fixture_cex_perp', False),
+    ('fixture_cex_perp', 'fixture_dex_perp', False), ('fixture_cex_perp', 'fixture_dex_perp', True)])
+def test_entry_then_exit_uses_owned_two_leg_inventory(tmp_path, first, second, reverse):
+    a, b = spec(first, 'lead', 'short' if reverse else 'long'), spec(second, 'hedge', 'long' if reverse else 'short')
     con, did, plan, iid, coordinator, transports = setup(tmp_path, a, b)
     assert coordinator.execute(iid).state == store.OpState.OPEN
     exit_plan = make_plan(a, b, operation_id='op-exit', kind='exit')
@@ -113,7 +152,11 @@ def test_entry_then_exit_uses_owned_two_leg_inventory(tmp_path, first, second):
     assert outcome.state == store.OpState.CLOSED
     assert store.get_deal(con, did)['state'] == store.DealState.CLOSED
     assert all(D(x['qty']) == 0 for x in leg_accounting.rebuild(con, deal_id=did)['legs'])
-    assert all(x[2].reduce_only for x in transports[1].sent if x[2].side == 'BUY')
+    for leg, transport in zip((a, b), transports):
+        assert transport.positions[leg.scope] == 0
+        close = transport.sent[-1][2]
+        assert close.side == ('SELL' if leg.direction == 'long' else 'BUY')
+        assert close.reduce_only == (leg.capabilities.market_kind == 'perpetual')
 
 
 def test_generic_dashboard_reads_two_legs_without_legacy_exchange_assumptions(tmp_path):

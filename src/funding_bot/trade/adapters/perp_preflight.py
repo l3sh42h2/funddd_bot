@@ -36,8 +36,9 @@ class PreflightRequest:
     margin_type: str = "ISOLATED"
 
     def __post_init__(self):
-        # capacity is normalized underlying quantity; callers must apply the
-        # frozen contract multiplier before constructing this request.
+        # capacity is native contract quantity.  The adapter book prices one
+        # contract, so the frozen multiplier is validated independently and
+        # must not be applied to this margin calculation a second time.
         for name in ('multiplier', 'capacity'):
             value = getattr(self, name)
             if not isinstance(value, D) or not value.is_finite() or value <= 0:
@@ -88,6 +89,36 @@ def agent_gate(perp, *, venue: str, sim: bool, what: str) -> None:
     """Use HL agent validation only for HL; CEX auth is gated by native ioc()."""
     if venue == "hyperliquid":
         hl_preflight.agent_gate(perp, sim=sim, what=what)
+
+
+def ingest_history(con, deal, perp, *, now: float | None = None) -> dict | None:
+    """Read venue-native accounting history only where that adapter defines it.
+
+    The legacy Hyperliquid journal is deliberately isolated here.  CEX
+    adapters have no compatible fills/funding history port yet, so they yield
+    no synthetic error and do not receive a Hyperliquid-specific call.
+    """
+    if getattr(perp, "venue", None) != "hyperliquid":
+        return None
+    from .. import sol_ledger
+    return sol_ledger.ingest(con, deal, perp, now=now)
+
+
+def finality_hashes(con, deal, perp, intent_id: str, *, now: float | None = None) -> tuple[str, ...]:
+    """Return immutable native-finality links for adapters that expose them."""
+    if getattr(perp, "venue", None) != "hyperliquid":
+        return ()
+    from .. import sol_ledger
+    sol_ledger.ingest(con, deal, perp, now=now)
+    scope = sol_ledger.scope_of(deal)
+    cloids = [row[0] for row in con.execute(
+        "SELECT cloid FROM hl_order_attempts WHERE intent_id=? AND cloid IS NOT NULL", (intent_id,))]
+    if scope is None or not cloids:
+        return ()
+    placeholders = ",".join("?" * len(cloids))
+    return tuple(dict.fromkeys(row[0] for row in con.execute(
+        f"SELECT hash FROM hl_fills WHERE network=? AND account=? AND coin=? AND cloid IN ({placeholders}) AND hash IS "
+        f"NOT NULL ORDER BY time, tid", (*scope, *cloids))))
 
 
 def inspect(perp, request: PreflightRequest, *, inst=None, venue: str | None = None) -> PreflightResult:
@@ -191,7 +222,8 @@ def entry(perp, request: PreflightRequest, *, inst=None, venue: str | None = Non
     if rate is None:
         raise PreflightRefused("fee_unknown", "ставка комиссии перпа не подтверждена")
     try:
-        need = margin_for(request.capacity, book.asks[0][0], D(lev), rate)
+        notional = request.capacity * book.asks[0][0]
+        need = margin_for(request.capacity, book.asks[0][0], D(lev), notional * rate)
         available = perp.available_margin()
     except Exception as e:
         raise PreflightRefused("margin", f"маржа {venue} не прочитана: {redact(e)}") from None

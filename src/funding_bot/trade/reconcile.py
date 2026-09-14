@@ -560,7 +560,9 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
                     continue
             from ..core.leg_report import build
             proof = generic_recovery.check(con, d, registry=generic_registry,
-                context_factory=generic_context_factory if d['id'] != busy_deal else None, now=now)
+                context_factory=generic_context_factory if d['id'] != busy_deal else None, now=now,
+                resolve=resolve and d['id'] != busy_deal)
+            d = store.get_deal(con, d['id'])
             rows.append(dict(deal_id=d['id'], coin=d['coin'], state=d['state'], chain=None,
                 perp_venue=None, sim=bool(d['sim']), reason=d.get('reason'), generic_legs=build(con, deal_id=d['id'])))
             verdicts.append(proof.matched)

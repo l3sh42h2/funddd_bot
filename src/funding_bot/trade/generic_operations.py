@@ -19,7 +19,7 @@ from . import store
 from .adapters.contracts import Action, AdapterError, ErrorKind, NativeRef, Prepared, Result, Status
 from .operation_plan import LegBound, OperationPlan
 from .operation_roots import _generic_identity, generic_propose
-from .operations import OperationController
+from .operations import EndDecision, OperationController
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
 
 
@@ -148,15 +148,20 @@ class GenericOperationCoordinator:
         self._require_exit_ownership(run, plan)
         self._activate_deal(run, plan)
         run.deal = store.get_deal(self.con, run.did)
-        if not self.lifecycle.admit(run):
-            raise store.StoreError("generic operation was not admitted")
-        try:
+        def program():
             if plan.kind == "rehedge":
                 return self._run_rehedge(run, plan, op, pair)
             return self._run(run, plan, op, pair)
-        except Exception as exc:
-            self._fail_after_admission(run, f"generic execution refused: {type(exc).__name__}")
-            raise
+
+        # Generic plans use exactly the same admission/error boundary as EVM
+        # and SOL.  ``propagate`` preserves the direct API's failure signal;
+        # Engine remains free to report it at its outer boundary.
+        return self.lifecycle.run_operation(
+            run, program,
+            paused=lambda stop: self._fail_after_admission(run, stop.text),
+            refused=lambda _text: None,
+            propagate=True,
+        )
 
     def resume(self, intent_id: str) -> GenericExecution:
         """Resolve a previously sent generic attempt; this method never submits.
@@ -189,15 +194,15 @@ class GenericOperationCoordinator:
 
     def _recover_unsent(self, run, op) -> GenericExecution:
         """A crash before dispatch has a durable local proof of no external send."""
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
-            if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN:
-                raise store.StoreError("generic unsent recovery root changed")
-            store.set_operation_state(self.con, op["id"], store.OpState.RUNNING,
-                                      expect=store.OpState.PAUSED_UNKNOWN, reason="generic no dispatch proof")
-            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
-            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
-                                      expect=store.OpState.RUNNING, reason="generic recovery before dispatch")
+        def proof(_it, _deal, current):
+            if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN or self._sent_attempts(run.iid):
+                raise store.StoreError("generic unsent recovery proof changed")
+
+        def settle(current):
+            store.operation_settle(self.con, current["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
+
+        self._transition(run, (store.OpState.RUNNING, store.OpState.STOPPED), None,
+                         reason="generic recovery before dispatch", recovery=True, settle=settle, proof=proof)
         return GenericExecution(op["id"], run.iid, None, None, store.OpState.STOPPED)
 
     def _recover_resolved(self, run, plan: OperationPlan, op: dict, results: dict[str, Result]) -> GenericExecution:
@@ -211,37 +216,33 @@ class GenericOperationCoordinator:
         balanced = (lead is not None and hedge_result is not None and self._proven_execution(lead)
                     and self._proven_execution(hedge_result)
                     and self._balanced_book(op["id"], leading, hedge))
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
+        def proof(_it, _deal, current):
             if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN:
                 raise store.StoreError("generic recovery root changed")
+            if not all(result is not None and result.terminal and not result.provisional and
+                       result.status != Status.UNKNOWN for result in results.values()):
+                raise store.StoreError("generic recovery lacks terminal result proof")
+
+        def settle(current):
             executed_raw = 0 if lead is None or lead.executed_quantity is None else _raw(
                 lead.executed_quantity, int(current["target_decimals"]))
-            store.set_operation_state(self.con, op["id"], store.OpState.RUNNING,
-                                      expect=store.OpState.PAUSED_UNKNOWN, reason="generic attempt resolved")
-            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+            store.operation_settle(self.con, current["id"], released_raw=int(current["reserved_raw"]),
                                    executed_raw=executed_raw)
-            if balanced:
-                current = store.get_operation(self.con, op["id"])
-                if plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
-                    store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
-                                              expect=store.OpState.RUNNING,
-                                              reason="generic recovered exit leaves parent position")
-                    return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PAUSED_RISK)
-                state = store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN
-                if store.operation_remaining(current) != 0:
-                    state = store.OpState.PARTIAL
-                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING,
-                                          reason="generic recovered terminal result")
-                deal = store.get_deal(self.con, run.did)
-                if deal is not None and state in (store.OpState.OPEN, store.OpState.CLOSED):
-                    target = store.DealState.OPEN if state == store.OpState.OPEN else store.DealState.CLOSED
-                    if deal["state"] != target:
-                        store.set_deal_state(self.con, run.did, target, expect=deal["state"])
-                return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
-            store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
-                                      expect=store.OpState.RUNNING, reason="generic recovery is unbalanced")
-        return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PAUSED_RISK)
+
+        state = store.OpState.PAUSED_RISK
+        reason = "generic recovery is unbalanced"
+        if balanced:
+            if plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
+                reason = "generic recovered exit leaves parent position"
+            else:
+                remaining = int(op["target_raw"]) - int(op["confirmed_raw"]) - (
+                    0 if lead is None or lead.executed_quantity is None else _raw(lead.executed_quantity, int(op["target_decimals"])))
+                state = (store.OpState.PARTIAL if remaining else
+                         (store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN))
+                reason = "generic recovered terminal result"
+        self._transition(run, (store.OpState.RUNNING, state), None, reason=reason, recovery=True,
+                         settle=settle, proof=proof)
+        return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
 
     def _load(self, intent_id: str, *, required):
         intent = store.get_intent(self.con, intent_id)
@@ -422,16 +423,21 @@ class GenericOperationCoordinator:
             if result is None or current is None:
                 raise store.StoreError("generic rehedge finished without a result/root")
             raw = 0 if result.executed_quantity is None else _raw(result.executed_quantity, int(current["target_decimals"]))
-            with store.tx(self.con):
-                current = store.get_operation(self.con, op["id"])
-                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=raw)
-                final = store.get_operation(self.con, op["id"])
-                state = store.OpState.OPEN if store.operation_remaining(final) == 0 else store.OpState.PARTIAL
-                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING,
-                                          reason="generic rehedge applied")
-                self._end_intent_and_deal(run, plan,
-                                          store.IntentStatus.DONE if state == store.OpState.OPEN else store.IntentStatus.PARTIAL,
-                                          state)
+            remaining = int(current["target_raw"]) - int(current["confirmed_raw"]) - raw
+            if remaining < 0:
+                raise store.StoreError("generic rehedge exceeds frozen root target")
+            state = store.OpState.OPEN if remaining == 0 else store.OpState.PARTIAL
+
+            def proof(_it, _deal, _root):
+                if not self._proven_execution(result):
+                    raise store.StoreError("generic rehedge final transition lacks terminal proof")
+
+            def settle(root):
+                store.operation_settle(self.con, root["id"], released_raw=int(root["reserved_raw"]), executed_raw=raw)
+
+            self._transition(run, (state,),
+                             store.IntentStatus.DONE if state == store.OpState.OPEN else store.IntentStatus.PARTIAL,
+                             reason="generic rehedge applied", settle=settle, proof=proof)
 
         try:
             self.shared.run_hedge(HedgeProgram(run.iid, prepare, submit, apply, verify, finish))
@@ -607,12 +613,18 @@ class GenericOperationCoordinator:
     def _record_result(self, run, op, leg, side: str, result: Result) -> None:
         if not result.terminal or result.provisional or result.status == Status.UNKNOWN:
             raise store.StoreError("unknown result cannot be applied")
+        attempt_id = self._sent_attempts(run.iid).get(leg.leg_id)
+        if attempt_id is None:
+            raise store.StoreError("generic result has no dispatched attempt identity")
+        if result.native_ref is None:
+            raise store.StoreError("generic result has no native receipt identity")
         from .leg_accounting import record_result
         with store.tx(self.con):
             record_result(self.con, result, leg, operation_id=op["id"], side=side,
                           deal_id=run.did, intent_id=run.iid)
             store.event(self.con, EVENT_RESULT, deal_id=run.did, intent_id=run.iid,
-                        operation_id=op["id"], leg_id=leg.leg_id, attempt_id=result.native_ref.id,
+                        operation_id=op["id"], leg_id=leg.leg_id, attempt_id=attempt_id,
+                        native_ref_kind=result.native_ref.kind, native_ref_id=result.native_ref.id,
                         status=str(result.status), executed_quantity=None if result.executed_quantity is None
                         else str(result.executed_quantity), terminal=True)
 
@@ -636,51 +648,54 @@ class GenericOperationCoordinator:
             return self._pause_risk(run, op, lead, hedge_result, "generic proven exposures differ")
         root_scale = int(op["target_decimals"])
         executed_raw = _raw(lead.executed_quantity, root_scale)
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
-            if current is None or current["reserved_raw"] == "0":
-                raise store.StoreError("generic pair has no reserve to settle")
-            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+        current = store.get_operation(self.con, op["id"])
+        if current is None or current["reserved_raw"] == "0":
+            raise store.StoreError("generic pair has no reserve to settle")
+        remaining = int(current["target_raw"]) - int(current["confirmed_raw"]) - executed_raw
+        if remaining < 0:
+            raise store.StoreError("generic pair exceeds frozen root target")
+        if remaining == 0 and plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
+            return self._pause_risk(run, op, lead, hedge_result, "generic exit leaves proven parent position")
+        state = (store.OpState.PARTIAL if remaining else
+                 (store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN))
+        intent_state = store.IntentStatus.PARTIAL if state == store.OpState.PARTIAL else store.IntentStatus.DONE
+
+        def proof(_it, _deal, _root):
+            if not self._proven_execution(lead) or not self._proven_execution(hedge_result):
+                raise store.StoreError("generic final transition lacks terminal two-leg proof")
+
+        def settle(root):
+            store.operation_settle(self.con, root["id"], released_raw=int(root["reserved_raw"]),
                                    executed_raw=executed_raw)
-            final = store.get_operation(self.con, op["id"])
-            if store.operation_remaining(final) == 0:
-                if plan.kind == "exit" and not self._parent_is_flat(run.did, plan):
-                    return self._pause_risk(run, op, lead, hedge_result,
-                                            "generic exit leaves proven parent position")
-                state = store.OpState.CLOSED if plan.kind == "exit" else store.OpState.OPEN
-                store.set_operation_state(self.con, op["id"], state, expect=store.OpState.RUNNING)
-                self._end_intent_and_deal(run, plan, store.IntentStatus.DONE, state)
-                return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
-            store.set_operation_state(self.con, op["id"], store.OpState.PARTIAL, expect=store.OpState.RUNNING,
-                                      reason="generic partial pair")
-            self._end_intent_and_deal(run, plan, store.IntentStatus.PARTIAL, store.OpState.PARTIAL)
-        return GenericExecution(op["id"], run.iid, lead, hedge_result, store.OpState.PARTIAL)
+
+        self._transition(run, (state,), intent_state,
+                         reason="generic partial pair" if state == store.OpState.PARTIAL else None,
+                         settle=settle, proof=proof)
+        return GenericExecution(op["id"], run.iid, lead, hedge_result, state)
 
     def _finish_no_execution(self, run, op, result):
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
-            store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
-            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED, expect=store.OpState.RUNNING,
-                                      reason="generic leading leg did not execute")
-            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
-                                    expect=store.IntentStatus.RUNNING, err="generic leading leg did not execute")
+        def settle(root):
+            store.operation_settle(self.con, root["id"], released_raw=int(root["reserved_raw"]), executed_raw=0)
+        self._transition(run, (store.OpState.STOPPED,), store.IntentStatus.FAILED,
+                         reason="generic leading leg did not execute", settle=settle)
         return GenericExecution(op["id"], run.iid, result, None, store.OpState.STOPPED)
 
     def _release_unsent(self, run, op, reason: str) -> None:
         """Prepare failed before a dispatch event, so releasing this reserve is proven safe."""
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
-            if current is None or current["state"] != store.OpState.RUNNING:
-                return
-            if current["reserved_raw"] != "0":
-                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]), executed_raw=0)
-            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
-                                      expect=store.OpState.RUNNING, reason=reason)
-            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
-                                    expect=store.IntentStatus.RUNNING, err=reason)
-            deal = store.get_deal(self.con, run.did)
-            if deal is not None and deal["state"] in (store.DealState.ENTERING, store.DealState.EXITING):
-                store.set_deal_state(self.con, run.did, store.DealState.PAUSED, expect=deal["state"], reason=reason)
+        current = store.get_operation(self.con, op["id"])
+        if current is None or current["state"] != store.OpState.RUNNING:
+            return
+
+        def proof(_it, _deal, _root):
+            if self._sent_attempts(run.iid):
+                raise store.StoreError("generic unsent release has dispatch evidence")
+
+        def settle(root):
+            if root["reserved_raw"] != "0":
+                store.operation_settle(self.con, root["id"], released_raw=int(root["reserved_raw"]), executed_raw=0)
+
+        self._transition(run, (store.OpState.STOPPED,), store.IntentStatus.FAILED,
+                         reason=reason, settle=settle, proof=proof)
 
     def _fail_after_admission(self, run, reason: str) -> None:
         """A synchronous refusal cannot leave an admitted root running.
@@ -697,14 +712,10 @@ class GenericOperationCoordinator:
         self._release_unsent(run, op, reason)
 
     def _stop_without_reserve(self, run, op, reason: str) -> None:
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
+        def proof(_it, _deal, current):
             if current is None or current["state"] != store.OpState.RUNNING or current["reserved_raw"] != "0":
                 raise store.StoreError("generic no-action root is not safely stoppable")
-            store.set_operation_state(self.con, op["id"], store.OpState.STOPPED,
-                                      expect=store.OpState.RUNNING, reason=reason)
-            store.set_intent_status(self.con, run.iid, store.IntentStatus.FAILED,
-                                    expect=store.IntentStatus.RUNNING, err=reason)
+        self._transition(run, (store.OpState.STOPPED,), store.IntentStatus.FAILED, reason=reason, proof=proof)
 
     def _balanced_book(self, operation_id: str, leading, hedge) -> bool:
         from .leg_accounting import rebuild
@@ -721,49 +732,41 @@ class GenericOperationCoordinator:
         return all(values.get((leg.leg_id, leg.fingerprint), Decimal(0)) == 0 for leg in plan.legs)
 
     def _pause_unknown(self, run, reason: str) -> None:
-        with store.tx(self.con):
-            op = store.operation_of_intent(self.con, run.iid)
-            if op is not None and op["state"] == store.OpState.RUNNING:
-                store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_UNKNOWN,
-                                          expect=store.OpState.RUNNING, reason=reason)
-            intent = store.get_intent(self.con, run.iid)
-            if intent is not None and intent["status"] == store.IntentStatus.RUNNING:
-                store.set_intent_status(self.con, run.iid, store.IntentStatus.PARTIAL,
-                                        expect=store.IntentStatus.RUNNING, err=reason)
-            deal = store.get_deal(self.con, run.did)
-            if deal is not None and deal["state"] in (store.DealState.ENTERING, store.DealState.EXITING):
-                store.set_deal_state(self.con, run.did, store.DealState.PAUSED, expect=deal["state"], reason=reason)
+        intent = store.get_intent(self.con, run.iid)
+        if intent is None:
+            raise store.StoreError("generic unknown intent disappeared")
+        recovering = intent["status"] != store.IntentStatus.RUNNING
+        self._transition(run, (store.OpState.PAUSED_UNKNOWN,),
+                         None if recovering else store.IntentStatus.PARTIAL,
+                         reason=reason, recovery=recovering)
 
     def _pause_risk(self, run, op, lead, hedge, reason: str) -> GenericExecution:
-        with store.tx(self.con):
-            current = store.get_operation(self.con, op["id"])
-            if current is not None and current["reserved_raw"] != "0":
+        def settle(root):
+            if root["reserved_raw"] != "0":
                 # Known terminal results may release the admission reserve; the
                 # persisted facts retain the unhedged exposure for manual action.
                 executed_raw = 0 if lead is None or lead.executed_quantity is None else _raw(
-                    lead.executed_quantity, int(current["target_decimals"]))
-                store.operation_settle(self.con, op["id"], released_raw=int(current["reserved_raw"]),
+                    lead.executed_quantity, int(root["target_decimals"]))
+                store.operation_settle(self.con, root["id"], released_raw=int(root["reserved_raw"]),
                                        executed_raw=executed_raw)
-            store.set_operation_state(self.con, op["id"], store.OpState.PAUSED_RISK,
-                                      expect=store.OpState.RUNNING, reason=reason)
-            self._end_intent_and_deal(run, _plan(run.it["plan_json"]), store.IntentStatus.PARTIAL,
-                                      store.OpState.PAUSED_RISK, reason=reason)
+        self._transition(run, (store.OpState.PAUSED_RISK,), store.IntentStatus.PARTIAL,
+                         reason=reason, settle=settle)
         return GenericExecution(op["id"], run.iid, lead, hedge, store.OpState.PAUSED_RISK)
 
-    def _end_intent_and_deal(self, run, plan: OperationPlan, intent_state, root_state, *, reason=None) -> None:
-        intent = store.get_intent(self.con, run.iid)
-        if intent is None or intent["status"] != store.IntentStatus.RUNNING:
-            raise store.StoreError("generic terminal intent changed")
-        if not store.set_intent_status(self.con, run.iid, intent_state, expect=store.IntentStatus.RUNNING, err=reason):
-            raise store.StoreError("generic terminal intent CAS failed")
-        deal = store.get_deal(self.con, run.did)
-        if deal is None:
-            raise store.StoreError("generic deal changed")
-        if root_state == store.OpState.OPEN:
-            target = store.DealState.OPEN
-        elif root_state == store.OpState.CLOSED:
-            target = store.DealState.CLOSED
+    def _transition(self, run, root_states, intent_state, *, reason=None, fields=None,
+                    recovery: bool = False, settle=None, proof=None) -> None:
+        """Use the shared frozen-context terminal transaction for every generic path."""
+        final_root = root_states[-1]
+        if final_root == store.OpState.OPEN:
+            deal_state = store.DealState.OPEN
+        elif final_root == store.OpState.CLOSED:
+            deal_state = store.DealState.CLOSED
         else:
-            target = store.DealState.PAUSED
-        if deal["state"] != target:
-            store.set_deal_state(self.con, run.did, target, expect=deal["state"], reason=reason)
+            deal_state = store.DealState.PAUSED
+        states = ((store.IntentStatus.RUNNING,) if not recovery else
+                  (store.IntentStatus.RUNNING, store.IntentStatus.PARTIAL, store.IntentStatus.INTERRUPTED))
+        self.lifecycle.commit_transition(
+            run, EndDecision(deal_state, intent_state, tuple(root_states), fields=fields, reason=reason,
+                             error=reason),
+            intent_statuses=states, settle=settle, proof=proof,
+        )

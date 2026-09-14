@@ -52,7 +52,9 @@ class ClipLifecycle:
 @dataclass(frozen=True)
 class EndDecision:
     deal_state: str
-    intent_state: str
+    # Recovery may settle a root while preserving an already-interrupted
+    # intent.  Normal callers always supply a terminal IntentStatus.
+    intent_state: str | None
     root_states: tuple[str, ...] = ()
     fields: dict | None = None
     reason: str | None = None
@@ -93,7 +95,7 @@ class OperationController:
                         intent_kind=run.kind, sim=run.legs.sim)
         return True
 
-    def run_operation(self, run, execute, *, paused, refused):
+    def run_operation(self, run, execute, *, paused, refused, propagate: bool = False):
         """The sole outer execution lifecycle. Ports run outside transactions.
 
         Report failures after terminal commit cannot transition money state back
@@ -105,11 +107,13 @@ class OperationController:
             admitted = self.admit(run)
         except Exception as exc:
             refused('операция не начата: ' + redact(exc))
-            return
+            if propagate:
+                raise
+            return None
         if not admitted:
-            return
+            return None
         try:
-            execute()
+            return execute()
         except Exception as exc:
             current = store.get_intent(self.con, run.iid)
             if current['status'] != store.IntentStatus.RUNNING:
@@ -119,6 +123,9 @@ class OperationController:
             stop = exc if isinstance(exc, Pause) else Pause(
                 'error', f'сбой исполнителя: {type(exc).__name__}: {redact(exc)}')
             paused(stop)
+            if propagate:
+                raise
+            return None
 
     def commit_end(self, run, decision: EndDecision, *, now=None):
         """Commit root/intent/deal together; callers enrich reports afterwards.
@@ -126,6 +133,26 @@ class OperationController:
         No transition error is swallowed. Incompatible identity or a stale
         intent rolls the complete transition back, including the root.
         """
+        return self.commit_transition(run, decision, now=now,
+                                      intent_statuses=(store.IntentStatus.RUNNING,))
+
+    def commit_transition(self, run, decision: EndDecision, *, intent_statuses: tuple[str, ...],
+                          settle: Callable[[dict], None] | None = None,
+                          proof: Callable[[dict, dict, dict | None], None] | None = None,
+                          now=None):
+        """Guard one terminal or recovery transition in the common lifecycle.
+
+        ``commit_end`` remains the legacy RUNNING-intent wrapper.  Recovery can
+        retain an interrupted/partial intent by passing ``intent_state=None``;
+        its root settlement and all state mutations still share this one frozen
+        context transaction.  ``proof`` is a pure database/result check, never
+        a network call.  It is required by callers which settle a previously
+        UNKNOWN generic attempt; a zero reserve alone is not proof of outcome.
+        """
+        if not intent_statuses or any(not isinstance(state, str) for state in intent_statuses):
+            raise ValueError('transition needs explicit expected intent states')
+        if decision.intent_state is not None and not isinstance(decision.intent_state, str):
+            raise ValueError('transition intent state must be a string or None')
         from .adapters.obligations import require_resolved
         from .adapters.native_journal import exclusive_transaction
         with exclusive_transaction(self.con):
@@ -137,15 +164,26 @@ class OperationController:
                     any(deal[k] != run.deal[k] for k in ('inst_json', 'owner_json', 'chain', 'token',
                                                     'token_dec', 'symbol', 'perp_venue', 'sim'))):
                 raise store.StoreError('operation frozen context changed')
-            if it['status'] != store.IntentStatus.RUNNING:
-                raise store.StoreError('operation is no longer running')
+            if it['status'] not in intent_statuses:
+                if intent_statuses == (store.IntentStatus.RUNNING,):
+                    raise store.StoreError('operation is no longer running')
+                raise store.StoreError('operation intent state changed')
             op = store.operation_of_intent(self.con, run.iid)
             if (op['id'] if op else None) != run.op_id:
                 raise store.StoreError('operation root changed')
+            if proof is not None:
+                proof(it, deal, op)
+            if settle is not None:
+                if op is None:
+                    raise store.StoreError('root settlement without a root')
+                settle(op)
             if decision.intent_state == store.IntentStatus.DONE or decision.deal_state in (
                     store.DealState.OPEN, store.DealState.CLOSED, store.DealState.ABORTED) or any(
                         state in (store.OpState.OPEN, store.OpState.CLOSED, store.OpState.ABANDONED)
                         for state in decision.root_states):
+                # Generic finality first settles only after its explicit
+                # terminal-result proof.  The unresolved gate then observes
+                # the post-settlement state; a failed gate rolls it back.
                 require_resolved(self.con, deal)
             for target in decision.root_states:
                 if op is None:
@@ -157,12 +195,15 @@ class OperationController:
                 store.set_deal_state(self.con, run.did, store.DealState.ENTERING, expect=deal['state'], now=now)
             store.set_deal_state(self.con, run.did, decision.deal_state,
                                  reason=decision.reason, now=now, **(decision.fields or {}))
-            if not store.set_intent_status(self.con, run.iid, decision.intent_state,
-                                           expect=store.IntentStatus.RUNNING, err=decision.error):
-                raise store.StoreError('operation terminal CAS failed')
+            resulting_intent = it['status']
+            if decision.intent_state is not None:
+                if not store.set_intent_status(self.con, run.iid, decision.intent_state,
+                                               expect=it['status'], err=decision.error):
+                    raise store.StoreError('operation terminal CAS failed')
+                resulting_intent = decision.intent_state
             store.event(self.con, 'operation_end', deal_id=run.did, intent_id=run.iid,
                         operation_id=run.op_id, deal_state=str(decision.deal_state),
-                        intent_state=str(decision.intent_state), reason=decision.reason)
+                        intent_state=str(resulting_intent), reason=decision.reason)
 
     def pause(self, run, stop, *, progressed, empty, require_unprogressed_empty=False, now=None):
         from .adapters.obligations import unresolved

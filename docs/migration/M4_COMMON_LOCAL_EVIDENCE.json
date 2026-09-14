@@ -1,0 +1,31 @@
+{
+  "status": "local_candidate_only",
+  "baseline_release": "0f9037cf72de-f6e1e96f711e",
+  "targeted": {
+    "passed": 703,
+    "seconds": 18.63
+  },
+  "mac_javascriptcore": {
+    "passed": 8,
+    "seconds": 0.29
+  },
+  "differential": {
+    "baseline": "/private/tmp/funding-m4-evm-0f9037c",
+    "candidate": "/Users/admin/Documents/hyper/funding_bot_migration",
+    "equal": true,
+    "fixtures": "/private/tmp/funding-m4-evm-0f9037c",
+    "fixtures_sha256": "ac38718a06227cb41d766c65da44e92fffd6de58f791e7333e574455d2a34810",
+    "network_allowed": false,
+    "scenarios": [
+      "evm_entry_partial_full_exit",
+      "sol_entry_full_exit"
+    ],
+    "source_sha256": {
+      "baseline": "4a596a17b81f14e41746fddbc488b9b798b59100cb7199f26c252dd010270ea0",
+      "candidate": "2c235bc3fb3fe639bd10d42591a286dde504cd4521352c7374ee21bdf9aa8ab5"
+    }
+  },
+  "independent_review": "Claude assigned by owner; pending",
+  "linux_artifact": "pending",
+  "production_changed": false
+}

@@ -14,7 +14,8 @@ def check(con, legs_fn, *, resolve=True):
         from ..trade import generic_recovery
         if generic_recovery.is_generic(deal):
             result = generic_recovery.check(con, deal, registry=getattr(legs_fn, 'adapters', None),
-                                            context_factory=getattr(legs_fn, 'generic_context_factory', None))
+                                            context_factory=getattr(legs_fn, 'generic_context_factory', None),
+                                            resolve=resolve)
             if result.matched is not True:
                 blockers.append('position_unverified')
             if result.hedged is not True:

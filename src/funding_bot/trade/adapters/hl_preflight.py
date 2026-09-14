@@ -31,7 +31,13 @@ def entry(perp, inst, *, sim, leverage, capacity, fee_rate, reserve, expected_sh
         raise PreflightRefused('owner_missing', 'плечо perp.hyperliquid.leverage не задано')
     if not sim:
         book = perp.book(inst.perp_symbol, book_levels)
-        need = margin_for(capacity, book.asks[0][0], D(leverage), fee_rate()) if book.asks else None
+        rate = fee_rate()
+        if (not isinstance(rate, D) or not rate.is_finite() or rate < 0):
+            raise PreflightRefused('fee_unknown', 'ставка комиссии перпа не подтверждена')
+        # ``capacity`` is contracts and the native book reports contract
+        # price.  margin_for expects its last term as an absolute fee.
+        fee = capacity * book.asks[0][0] * rate if book.asks else None
+        need = margin_for(capacity, book.asks[0][0], D(leverage), fee) if book.asks else None
         if need is None or need <= 0:
             raise PreflightRefused('margin', 'маржа под шорт не посчитана (пустые аски или нулевой объём)')
         refusals = perp.entry_margin_refusals(need, reserve)

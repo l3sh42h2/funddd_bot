@@ -24,7 +24,26 @@ class Check:
     detail: str
 
 
-def check(con, deal, *, registry=None, context_factory=None, now=None):
+def check(con, deal, *, registry=None, context_factory=None, now=None, resolve=False):
+    op = store.active_operation(con, deal['id'])
+    if (resolve and registry is not None and context_factory is not None and op is not None
+            and op['state'] == store.OpState.PAUSED_UNKNOWN and int(op['reserved_raw']) > 0):
+        # Resolve the exact interrupted attempt, never the most recent proposal
+        # or a new quote. Manual positions/drain may recover receipts but cannot
+        # gain fresh authority to send the missing hedge.
+        interrupted = con.execute(
+            'SELECT i.* FROM intents i JOIN operation_intents oi ON oi.intent_id=i.id '
+            'WHERE oi.operation_id=? ORDER BY oi.seq DESC LIMIT 1', (op['id'],)).fetchone()
+        if interrupted is None:
+            return Check(None, None, None, 'не найдена исходная операция для сверки')
+        try:
+            from .generic_operations import GenericOperationCoordinator
+            intent = dict(interrupted)
+            ctx = context_factory(con, intent, deal, json.loads(intent['spec_json']))
+            GenericOperationCoordinator(con, registry, ctx).resume(intent['id'])
+        except Exception as exc:
+            return Check(None, None, None, f'исход исполнения не подтверждён: {type(exc).__name__}')
+        deal = store.get_deal(con, deal['id'])
     rows = con.execute('SELECT * FROM intents WHERE deal_id=? ORDER BY created DESC,rowid DESC', (deal['id'],)).fetchall()
     intent = next((dict(x) for x in rows if json.loads(x['spec_json'] or '{}').get('generic_operation_v1')), None)
     if intent is None:

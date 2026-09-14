@@ -1,7 +1,8 @@
 # M4 — общий координатор
 
 - Исполнитель: Codex, назначенный пользователем; финальное независимое ревью пользователь передаёт Claude.
-- Статус: in_progress. Обновлено 14.09.2026 после EVM release 19:25:10 UTC.
+- Статус: review. Обновлено 15.09.2026: реализация подготовлена к независимой приёмке;
+  итоговый Linux artifact profile ещё требуется. Ниже сохранена история промежуточных срезов.
 - База: принятый и установленный 0f9037cf72de88131dcbcf8129bfd9455973dcba.
 - Ветка: codex/migration-m4-m5.
 - ТЗ: docs/migration/M4_COMMON_COORDINATOR_TZ.md.
@@ -10,8 +11,9 @@
 - Инварианты: неизменные frozen identity, один operation root/native journal,
   UNKNOWN блокирует замену, approved bounds не расширяются. Новые live-пары,
   resize и SL не включаются.
-- C1: независимые фабрики и scoped credentials в работе.
-- C2–C5: не завершены. Выкат общего координатора не выполнен.
+- C1–C4: реализация и профильная матрица подключены; C5: локальные проверки пройдены,
+  immutable Linux profile и независимое ревью ещё не приняты. Выкат не выполнен.
+- Актуальная карта и оставшиеся работы: docs/migration/M4_COMMON_COORDINATOR_RESULT.md.
 - Перед выпуском: независимое ревью, immutable Linux profile, fresh production
   compatibility audit, штатный deploy с reader gates.
 
@@ -117,3 +119,27 @@ shared lifecycle/generic matrix — **649 passed / 18.98 s**. Native SOL×Gate/A
 Generic normal execution использует общий TwoLegProgram, rehedge — HedgeProgram. Частичный остаток
 продолжает прежний root с неизменной identity обеих ног; plan/approval fingerprint обновляется отдельно.
 После доказанного ACK loss новый вход не повторяется; новая коррекция требует свежего approved плана.
+
+
+## Кандидат приёмки 15.09.2026
+
+Один OperationController теперь выполняет generic admission и все terminal/recovery
+транзакции; settlement проверяется внутри frozen-context транзакции до unresolved gate.
+Native attempt ID и venue order ID сохраняются раздельно. SOL CEX entry/exit/rehedge/
+UNKNOWN и EVM Gate partial-exit resume/restart проходят actual Desk/Engine.
+
+Профиль M4/SOL C2/C3/legacy engine/M3/preflight/shared/generic/RH Gate:
+**703 passed / 18.63 s**. Отдельный Mac JavaScriptCore: **8 passed / 0.29 s**.
+Offline differential старого принятого EVM source и нового source на одинаковых
+фикстурах: равны qty/books/clips/roots/orders/fees для EVM entry/partial/full exit и
+SOL entry/full exit. Скрипт запрещает сетевые соединения и фиксирует source hashes.
+Это не полный исторический PnL-аудит. JSON доказательства — M4_COMMON_LOCAL_EVIDENCE.json.
+
+Попутно исправлен доказанный preflight bug: в маржу включается абсолютная комиссия,
+а не её ставка. На недостаточной марже возможен новый правильный отказ до отправки.
+USDC/USDT не приравниваются; SOL legacy policy с несовместимым collateral отказывает.
+
+Модели: два GPT-5.6 Terra high (native lifecycle/preflight и generic durable lifecycle),
+основной Codex — интеграция, leg cash/DTO/recovery, матрица и проверка совместимости.
+Точные суммарные затраты токенов и время всей реализации недоступны. Ревью Claude
+владельцем назначено, результат не получен; этот патчноут не означает приёмку/выкат.

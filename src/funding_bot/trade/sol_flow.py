@@ -1,20 +1,20 @@
-"""Потоки связки sol_best_hyperliquid для Desk и Engine (ТЗ SOL×HL §6–§11; объём пилота — план приёмки):
+"""Потоки SOL-спот × замороженный перп-профиль для Desk и Engine:
 лонг токена в Solana за USDC через лучший из проверенных маршрутов (Jupiter Build V2 / OKX V6; Jupiter Order — только
-показ) × шорт Hyperliquid dex:МОНЕТА. BSC/Aster сюда не заходит: Desk и Engine передают сюда только сделки и команды
-этой связки (runtime.is_sol_deal), глобальные CHAIN/VENUE здесь не используются вовсе.
+показ) × шорт замороженного перп-инструмента. Desk и Engine передают сюда только Solana-сделки
+(runtime.is_sol_deal), глобальные CHAIN/VENUE здесь не используются вовсе.
 
 Инструмент — из реестра (instruments.json), не из таблицы коллектора: mint с регистром, программа токена, USDC,
-Fs/Fp, dex:МОНЕТА и scope счёта HL замораживаются в сделке (schema 2) и сверяются перед каждым действием.
+Fs/Fp, native symbol и scope счёта замораживаются в сделке (schema 2) и сверяются перед каждым действием.
 
 Вход — ОДИН клип (пилот): корневая операция (бюджет USDC, неизменна) → свежий сбор маршрутов у кнопки и проверка,
-что победитель в одобренных границах (reselect_allowed) → проверки HL ДО свопа (режим счёта, маржа нужного dex,
+что победитель в одобренных границах (reselect_allowed) → native preflight ДО свопа (режим счёта, маржа,
 isolated/плечо, чужая позиция) → своп (sol_exec: запись-до, подпись проверенных байтов, одна отправка, finalized-чек)
 → хедж только по фактическому приходу: target = floor(T·Fs/Fp, h), SELL IOC на target − S в пределах одобренной
 ёмкости (излишек сверх неё — PAUSED_RISK, продажа излишка в пилоте выключена) → сверка → OPEN.
 Выход — полный: продаются токены СДЕЛКИ (не кошелька), затем BUY reduceOnly на S − target(T_остаток) по факту
 списания (роутер вернул часть — остаток остаётся захеджирован, сделка не CLOSED). Пыль закрывает сделку только в
 обеих границах владельца (токены и USDC).
-UNKNOWN Solana или HL — пауза без новых действий; исход выясняют только чтения и те же подписанные байты
+UNKNOWN Solana или перпа — пауза без новых действий; исход выясняют только чтения и те же подписанные байты
 (recover_deal — перед любым новым действием и в сверке). «Стоп» после свопа хедж доделывает (hedge=True), новый
 своп не начинает. Добор, «продолжить» частичного выхода, «откат» и аварийные авто-действия в пилоте выключены —
 честный отказ с подсказкой команды.
@@ -59,6 +59,13 @@ def _sv():
 
 def _lim(cfg: OwnerCfg, name: str, profile: str = SOL_HL) -> Any:
     return cfg.get(f"limits.{profile}.{name}")
+
+
+def _margin_reserve(cfg: OwnerCfg, profile: str) -> Any:
+    """Frozen-perp reserve in its verified collateral currency (currently USDC)."""
+    # The persisted owner schema calls this legacy value ``hl``.  It is only
+    # consumed after the native preflight has proved the frozen USDC quote.
+    return _lim(cfg, "min_hl_margin_reserve_usdc", profile)
 
 
 def _raw(x: D, dec: int) -> int:
@@ -238,8 +245,8 @@ def _settle_terminal_clip(con, did: str, c: Mapping, legs: SolLegs) -> str | Non
 
 
 def _abort_empty(con, did: str, legs: SolLegs) -> bool:
-    """Сделка на паузе, в которой доказанно ничего не исполнено (своп истёк/откатился/не отправлен, заявок HL с
-    исполнением нет, книга 0/0, позиция HL прочитана = 0) — снимается, как пустой ENTERING при перезапуске: иначе
+    """Сделка на паузе, в которой доказанно ничего не исполнено (своп истёк/откатился/не отправлен, заявок перпа с
+    исполнением нет, книга 0/0, позиция перпа прочитана = 0) — снимается, как пустой ENTERING при перезапуске: иначе
     она навсегда занимает рынок, а «выход», «дохедж» и «продолжить» ей отказывают. Не трогает то, что исполняется."""
     d = store.get_deal(con, did)
     if d is None or d["state"] != DealState.PAUSED or legs.sim:
@@ -277,7 +284,7 @@ def _abort_empty(con, did: str, legs: SolLegs) -> bool:
 
 def recover_deal(con, deal: Mapping, legs: SolLegs) -> list[str]:
     """Исход прошлых отправок сделки — ДО любого нового действия (X10, R12): попытки Solana (резолвер и те же байты),
-    клипы DEX_SENT без подписанной попытки (не уходили — DEX_REVERTED), заявки HL (settle по сохранённому cloid).
+    клипы DEX_SENT без подписанной попытки (не уходили — DEX_REVERTED), заявки перпа (settle по сохранённому id).
     Возвращает то, что осталось неизвестным (пусто — можно действовать)."""
     did = deal["id"]
     left: list[str] = []
@@ -384,13 +391,13 @@ def recover_deal(con, deal: Mapping, legs: SolLegs) -> list[str]:
 
 def check_deal(con, deal: Mapping, legs: SolLegs | None, *, resolve: bool = True, down: str | None = None):
     """Сверка сделки связки (для reconcile): книга по журналу против кошелька Solana (≥, свои токены владельца — не
-    сделки) и позиции HL (=). Нельзя прочитать — None «не сверена», а не «флэт». down — почему ноги не собраны
+    сделки) и позиции перпа (=). Нельзя прочитать — None «не сверена», а не «флэт». down — почему ноги не собраны
     (сбой сборки: RPC, ключ); None — связки в процессе нет вовсе."""
     from .reconcile import DealCheck
     did = deal["id"]
     if legs is None:
         what = f"не собрана: {down}" if down else "не подключена"
-        return DealCheck(did, None, f"связка Solana × Hyperliquid {what} — не сверена", deal_book(con, did))
+        return DealCheck(did, None, f"связка Solana × {deal['perp_venue']} {what} — не сверена", deal_book(con, did))
     problems = recover_deal(con, deal, legs) if resolve else []
     bk = deal_book(con, did)
     if not problems and store.get_deal(con, did)["state"] == DealState.ABORTED:
@@ -400,7 +407,7 @@ def check_deal(con, deal: Mapping, legs: SolLegs | None, *, resolve: bool = True
     try:
         step = _step(legs.perp, inst.perp_symbol)
     except Exception as e:              # noqa
-        problems.append(f"мета HL: {type(e).__name__}")
+        problems.append(f"мета {deal['perp_venue']}: {type(e).__name__}")
     if bk.known:
         delta = _delta(inst, bk.tokens(int(deal["token_dec"])), bk.short)
         hedged = None if step is None else ZERO <= delta < _tokens_per_step(inst, step)
@@ -417,25 +424,27 @@ def check_deal(con, deal: Mapping, legs: SolLegs | None, *, resolve: bool = True
     if problems or not bk.known:
         return DealCheck(did, None, "; ".join(problems) or (bk.why or "книга неизвестна"), bk, wal, pos, hedged, delta)
     if wal is None or pos is None:
-        what = " и ".join(x for x, y in (("кошелёк", wal), ("позиция HL", pos)) if y is None)
+        what = " и ".join(x for x, y in (("кошелёк", wal), (f"позиция {deal['perp_venue']}", pos)) if y is None)
         return DealCheck(did, None, f"не прочитано: {what}", bk, wal, pos, hedged, delta)
     mism = []
     if wal < bk.tokens_raw:
         mism.append(f"в кошельке {_h(wal, int(deal['token_dec']))} < по журналу {bk.tokens(int(deal['token_dec']))} "
                     f"{deal['coin']}")
     if pos != -bk.short:
-        mism.append(f"позиция HL {pos} ≠ журнал {-bk.short}")
+        mism.append(f"позиция {deal['perp_venue']} {pos} ≠ журнал {-bk.short}")
     if resolve:                       # ручные/чужие исполнения на рынке сделки: не наш child fill — расхождение (§11)
-        from . import sol_ledger
-        got = sol_ledger.ingest(con, deal, legs.perp)
-        foreign = sol_ledger.ledger(con, deal, fee_rate=None).foreign_fills
-        if foreign:
-            mism.append(f"на {deal['symbol']} исполнения не заявками сделки ({len(foreign)}) — ручные или чужие")
-        elif got["errors"]:
-            log.warning("учёт HL %s: %s", did, "; ".join(got["errors"])[:200])
+        from .adapters.perp_preflight import ingest_history
+        got = ingest_history(con, deal, legs.perp)
+        if got is not None:
+            from . import sol_ledger
+            foreign = sol_ledger.ledger(con, deal, fee_rate=None).foreign_fills
+            if foreign:
+                mism.append(f"на {deal['symbol']} исполнения не заявками сделки ({len(foreign)}) — ручные или чужие")
+            elif got["errors"]:
+                log.warning("учёт перпа %s: %s", did, "; ".join(got["errors"])[:200])
     if mism:
         return DealCheck(did, False, "; ".join(mism), bk, wal, pos, hedged, delta)
-    return DealCheck(did, True, f"кошелёк и позиция HL — как в журнале", bk, wal, pos, hedged, delta, step=step)
+    return DealCheck(did, True, f"кошелёк и позиция {deal['perp_venue']} — как в журнале", bk, wal, pos, hedged, delta, step=step)
 
 
 # --- Desk: предложения связки (поток заданий; только чтение сети) -----------------------------------------------------
@@ -482,7 +491,7 @@ class SolDesk:
         try:
             lg = legs_of(self.d.legs, deal)
         except ProfileDown as e:
-            raise self.refuse(f"связка Solana × Hyperliquid недоступна: {e.reason}") from None
+            raise self.refuse(f"связка Solana × {deal['perp_venue']} недоступна: {e.reason}") from None
         if lg is None:
             raise self.refuse("живую сделку в этом режиме не трогаю: ключи связки не загружены")
         return lg
@@ -561,7 +570,7 @@ class SolDesk:
             params = PairParams(fs=inst.fs, fp=inst.fp, step=step, perp_fee_rate=legs.fee_rate(),
                                 min_notional=_min_notional(perp, inst.perp_symbol), exit_close_qty=close_qty,
                                 leverage=None if lev is None else D(lev),
-                                margin_reserve=_lim(cfg, "min_hl_margin_reserve_usdc", self.profile),
+                                margin_reserve=_margin_reserve(cfg, self.profile),
                                 available_margin=available if side == "entry" else None)
             return HedgeContext(book=perp.book(inst.perp_symbol, BOOK_LEVELS), params=params, now_wall=self.d.clock())
         return make
@@ -671,7 +680,7 @@ class SolDesk:
             if pos is None:
                 raise self.refuse(f"позиция {inst.perp_symbol} не прочитана — вход не начинаю")
             if pos != 0:
-                raise self.refuse(f"на счёте HL уже есть позиция {inst.perp_symbol} {pos} (не этой сделки) — вход "
+                raise self.refuse(f"на счёте {venue} уже есть позиция {inst.perp_symbol} {pos} (не этой сделки) — вход "
                                   "запрещён")
             try:
                 from .adapters.perp_preflight import agent_gate
@@ -717,7 +726,7 @@ class SolDesk:
         v = _views()
         mb = _lim(cfg, "min_entry_basis_all_in_bps", self.profile)
         if rc.basis_all_in_bps is None:
-            notes.append("курсовой с издержками неизвестен (расход или ставка HL не известны)")
+            notes.append("курсовой с издержками неизвестен (расход или ставка перпа не известны)")
         elif mb is not None and rc.basis_all_in_bps < D(mb):
             notes.append(f"курсовой с издержками {v.pct(rc.basis_all_in_bps / 100, 2, sign=True)} ниже порога "
                          f"{v.pct(D(mb) / 100, 2, sign=True)}")
@@ -733,7 +742,7 @@ class SolDesk:
         if rc.qty_min is not None and rc.qty_min * cap < min_notional:
             raise self.refuse(f"при минимальном выходе шорт {rc.qty_min} меньше минимального ордера {venue} "
                               f"{min_notional} $ — не увеличиваю шорт ради минимума (U17)")
-        reserve = _lim(cfg, "min_hl_margin_reserve_usdc", self.profile)
+        reserve = _margin_reserve(cfg, self.profile)
         margin_need = None
         if lev is not None and avail is not None and reserve is not None:
             need = margin_for(rc.capacity, book.asks[0][0], D(lev), legs.fee_rate()) + D(reserve)
@@ -809,7 +818,7 @@ class SolDesk:
                 store.set_deal_state(con, old, DealState.ABORTED, expect=DealState.DRAFT, reason="заменён новым планом")
             except store.StoreError as e:
                 log.warning("черновик %s не снят: %s", old, e)
-        # время сделки — те же часы, что у исполнения и журналов HL: окно учёта fills/фандинга сделки от него
+        # время сделки — те же часы, что у исполнения и журналов перпа: окно учёта fills/фандинга сделки от него
         did = store.create_deal(con, coin=rec.display_symbol, chain=inst.chain, token=inst.token,
                                 token_dec=int(inst.token_dec), perp_venue=inst.perp_venue, symbol=inst.perp_symbol,
                                 leg_usd=cmd.usdc, owner_json=cfg.frozen_json(), sim=sim, inst=inst, now=self.d.clock())
@@ -897,10 +906,11 @@ class SolDesk:
                 raise self.refuse(f"позиция {inst.perp_symbol} не прочитана — выход не начинаю")
             if pos != -S:             # U18: формула выхода — только к согласованному S
                 raise self.refuse(f"позиция {inst.perp_venue} {pos} ≠ журнал сделки {-S} — сначала «позиции»")
-            if inst.perp_venue == "hyperliquid":
-                bad = perp.agent_refusals()
-                if bad:               # продажа спота без откупа шорта оставила бы голый шорт
-                    raise self.refuse("; ".join(bad) + " — выход не начинаю")
+            try:
+                from .adapters.perp_preflight import agent_gate
+                agent_gate(perp, venue=inst.perp_venue, sim=sim, what="выход не начинаю")
+            except Exception as e:
+                raise self.refuse(f"авторизация {inst.perp_venue}: {redact(e)} — выход не начинаю") from None
         units = int(bk.tokens_raw)
         req = self.request(legs, inst, "exit", units, cfg, "exit")
         dec = legs.router.select(req, prices=self.prices(legs), block_height=legs.block_height,
@@ -1025,7 +1035,7 @@ class SolDesk:
         if not sim:
             pos = legs.perp.position(inst.perp_symbol)
             if pos is None or pos != -S:
-                raise self.refuse(f"позиция HL {pos} ≠ журнал сделки {-S} — сначала «позиции»")
+                raise self.refuse(f"позиция {inst.perp_venue} {pos} ≠ журнал сделки {-S} — сначала «позиции»")
         spec = {"kind": "rehedge", "profile": self.profile, "coin": deal["coin"], "token": inst.token,
                 "token_dec": int(deal["token_dec"]), "symbol": inst.perp_symbol, "sim": sim, "owner": cfg.frozen_json(),
                 "instrument": inst.as_dict(), "inst_hash": inst.inst_hash(), "side": side, "qty": qty}
@@ -1035,14 +1045,14 @@ class SolDesk:
         except Exception:             # noqa
             pass
         plan = Plan(deal_id=deal["id"], kind="rehedge", coin=deal["coin"], spot="auto·solana",
-                    perp=f"hyperliquid·{inst.perp_dex}", symbol=inst.perp_symbol,
+                    perp=f"{inst.perp_venue}·{inst.perp_dex}".rstrip("·"), symbol=inst.perp_symbol,
                     leg_usd=(abs(d) * px * inst.fs / inst.fp) if px else ZERO, clips=[], est={"delta": d},
                     inputs={"inst_hash": inst.inst_hash()}, missing_owner_keys=list(cfg.profile_live_missing(self.profile)),
                     expires=self.d.clock() + tconfig.PLAN_TTL_S)
         iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="rehedge", spec=spec, plan=plan, chat=chat)
         superseded = store.supersede_intents(con, deal["id"], keep=iid)
         text = v.fix_plan(v.FixPlanView(intent_id=iid, kind="rehedge", coin=deal["coin"], deal_id=deal["id"], delta=d,
-                                        qty=qty, side=side, usd=plan.leg_usd, perp_venue="hyperliquid", step=step,
+                                        qty=qty, side=side, usd=plan.leg_usd, perp_venue=inst.perp_venue, step=step,
                                         sim=sim, m=inst.m))
         return Proposal(iid, nonce, deal["id"], "rehedge", text, plan, superseded=tuple(superseded))
 
@@ -1146,7 +1156,7 @@ class SolEngine:
         try:
             legs = legs_of(self.e.legs, deal)
         except ProfileDown as e:
-            return self.e._fail(iid, f"связка Solana × Hyperliquid недоступна: {e.reason} — ничего не отправлено")
+            return self.e._fail(iid, f"связка Solana × {deal['perp_venue']} недоступна: {e.reason} — ничего не отправлено")
         if legs is None or (not legs.sim and not legs.can_send):
             return self.e._fail(iid, "живую сделку в этом режиме не двигаю: ключи связки не загружены")
         cfg = OwnerCfg.from_frozen(spec["owner"])
@@ -1239,7 +1249,7 @@ class SolEngine:
             if d["state"] == DealState.OPEN and new == DealState.ENTERING:
                 store.set_deal_state(con, run.did, DealState.PAUSED, reason="продолжение входа")
             store.set_deal_state(con, run.did, new)
-        except store.StoreBusy as e:  # G04: второй владелец той же net-позиции HL не создаётся
+        except store.StoreBusy as e:  # G04: второй владелец той же net-позиции перпа не создаётся
             raise Pause("busy", f"рынок уже занят другой активной сделкой: {e}") from None
         except store.BadTransition as e:
             raise Pause("state", f"сделка {run.did} в состоянии {d['state']}: {e}") from None
@@ -1253,7 +1263,7 @@ class SolEngine:
             raise Pause(e.code, str(e)) from None
 
     def _perp_preflight(self, run: SolRun) -> None:
-        """Use the neutral boundary; HL retains its existing exact validator."""
+        """Use the neutral boundary; venue-specific validation remains at the adapter edge."""
         from .adapters.perp_preflight import entry, PreflightRefused, PreflightRequest
         try:
             venue = run.deal["perp_venue"]
@@ -1261,7 +1271,7 @@ class SolEngine:
                 symbol=run.symbol, quote_currency=run.inst.quote_asset, multiplier=run.inst.m,
                 leverage=run.cfg.get(f"perp.{venue}.leverage"),
                 capacity=D(str(run.spec.get("hedge_capacity") or 0)), fee_rate=run.legs.fee_rate,
-                reserve=_lim(run.cfg, "min_hl_margin_reserve_usdc", run.inst.profile_id),
+                reserve=_margin_reserve(run.cfg, run.inst.profile_id),
                 expected_position=None if deal_book(self.con, run.did).short is None else -deal_book(self.con, run.did).short,
                 sim=run.legs.sim, book_levels=BOOK_LEVELS), inst=run.inst, venue=venue)
         except PreflightRefused as e:
@@ -1333,10 +1343,7 @@ class SolEngine:
 
         try:
             from .adapters.spot_execution import submit_sol
-            # A native adapter may explicitly decline the optional paired
-            # binding; its durable individual bindings still use the same
-            # frozen clip and OperationController lifecycle.
-            context = None if getattr(legs.perp, "compose_with_spot", True) is False else self.e._compose_context(
+            context = self.e._compose_context(
                 run, clip_id, account=legs.account_id, authorize=lambda *_: self._agent_gate(run, "hedge"))
             out = submit_sol(con, deal=run.deal, clip_id=clip_id, native=legs.spot, router=legs.router,
                              decision=dec, request=req, logical=logical, metadata=meta,
@@ -1508,9 +1515,9 @@ class SolEngine:
                     break
                 self.e.sleep(1.0)
             if pos is None:
-                raise Pause("position_unknown", "позиция HL не прочитана — ноги не сверить")
+                raise Pause("position_unknown", f"позиция {run.deal['perp_venue']} не прочитана — ноги не сверить")
             if pos != -bk.short:
-                raise Pause("position_mismatch", f"позиция HL {pos} ≠ журнал сделки {-bk.short}")
+                raise Pause("position_mismatch", f"позиция {run.deal['perp_venue']} {pos} ≠ журнал сделки {-bk.short}")
         return bk
 
     # --- вход ---
@@ -1631,7 +1638,7 @@ class SolEngine:
         if not run.legs.sim:
             pos = run.legs.perp.position(run.symbol)
             if pos is None or pos != -bk.short:
-                raise Pause("position_mismatch", f"позиция HL {pos} ≠ журнал сделки {-bk.short}")
+                raise Pause("position_mismatch", f"позиция {run.deal['perp_venue']} {pos} ≠ журнал сделки {-bk.short}")
         qty = min(qty, D(str(run.spec["qty"])))
         result: dict[str, HedgeResult] = {}
         def submit(clip_id, action):
@@ -1656,7 +1663,11 @@ class SolEngine:
         hedged = dl is not None and ZERO <= dl < _tokens_per_step(run.inst, run.step)
         if bk.known and bk.short == 0 and bk.tokens_raw == 0:
             new = DealState.CLOSED
-        elif hedged and last and last["status"] == IntentStatus.DONE:
+        # A rehedge may complete a deliberately paused entry/exit.  Its
+        # preceding operation is recorded PARTIAL because the original
+        # result was unsafe at the time, but a proven current invariant makes
+        # the remaining position an ordinary OPEN deal again.
+        elif hedged and last and last["status"] in (IntentStatus.DONE, IntentStatus.PARTIAL):
             new = DealState.OPEN
         else:
             new = DealState.PAUSED
@@ -1720,7 +1731,7 @@ class SolEngine:
             if lim is not None and naked_ms > int(lim):
                 warn.append(f"нога была без хеджа {_views().dur(naked_ms / 1000)} — дольше лимита "
                             f"{_views().dur(int(lim) / 1000)}")
-        hashes = self._hl_hashes(run)           # заодно добор fills/фандинга HL в учёт (факт комиссии, H15)
+        hashes = self._perp_hashes(run)          # native finality links where the adapter exposes them
         pnl = None
         if new == DealState.CLOSED:              # итог сделки по накопительной книге (G10): каждое событие — один раз
             pnl = self._deal_total(run)
@@ -1743,26 +1754,16 @@ class SolEngine:
         except Exception as e:        # noqa — текст не мешает исполнению
             log.warning("прогресс %s: %s", run.iid, type(e).__name__)
 
-    def _hl_hashes(self, run: SolRun) -> tuple[str, ...]:
-        """Хэши fills HL заявок этого намерения (ссылки в итоге). Сначала добор fills/фандинга счёта в учёт; сбой —
-        без ссылок (учёт догрузит сверка или оценка)."""
+    def _perp_hashes(self, run: SolRun) -> tuple[str, ...]:
+        """Immutable finality links supplied by the frozen native adapter."""
         if run.legs.sim or not run.perp_filled:
             return ()
-        from . import sol_ledger
         con = self.con
         try:
-            sol_ledger.ingest(con, store.get_deal(con, run.did), run.legs.perp, now=self.e.clock())
-            sc = sol_ledger.scope_of(run.deal)
-            cl = [r[0] for r in con.execute("SELECT cloid FROM hl_order_attempts WHERE intent_id=? AND cloid IS NOT "
-                                            "NULL", (run.iid,))]
-            if sc is None or not cl:
-                return ()
-            q = ",".join("?" * len(cl))
-            return tuple(dict.fromkeys(r[0] for r in con.execute(
-                f"SELECT hash FROM hl_fills WHERE network=? AND account=? AND coin=? AND cloid IN ({q}) AND hash IS "
-                f"NOT NULL ORDER BY time, tid", (*sc, *cl))))
+            from .adapters.perp_preflight import finality_hashes
+            return finality_hashes(con, store.get_deal(con, run.did), run.legs.perp, run.iid, now=self.e.clock())
         except Exception as e:        # noqa
-            log.warning("fills HL %s: %s", run.iid, type(e).__name__)
+            log.warning("fills перпа %s: %s", run.iid, type(e).__name__)
             return ()
 
     def _deal_total(self, run: SolRun) -> tuple[D | None, bool]:
@@ -1779,7 +1780,7 @@ class SolEngine:
             return None, False
 
     def _costs(self, run: SolRun) -> tuple[D | None, D | None, D | None]:
-        """(сеть Solana в SOL, она же в USDC по цене SOL, комиссия HL по ставке) клипа этого намерения."""
+        """(сеть Solana в SOL, она же в USDC по цене SOL, комиссия перпа по ставке) клипа этого намерения."""
         o = run.swap
         if o is None:
             return None, None, None
