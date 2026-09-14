@@ -64,6 +64,10 @@ def _live_db(path, monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(tm, "store", old)
         deal = tm.dqa9q(con)
+        # Original fixture omitted wallet configuration; an executable migrated
+        # position must retain the wallet selected when it was opened.
+        con.execute('UPDATE deals SET owner_json=? WHERE id=?',
+                    (json.dumps({'values': {'wallets.bsc': fx.WALLET}}), 'DQA9Q'))
     assert old.set_deal_inst(con, "DQA9Q", eng.legacy_instrument(con, deal, now=tm.NOW).to_json())
     return old, con
 
@@ -79,7 +83,7 @@ def test_fresh_db_is_schema_2_and_reconnect_changes_nothing(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (3, 2)
+    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (4, 2)
     assert NEW_TABLES | set(LEGACY_TABLES) <= _tables(con)
     assert [r[1] for r in con.execute("PRAGMA table_info(deals)")][-2:] == ["inst_json", "perp_scope"]
     before = _objects(con)
@@ -139,11 +143,18 @@ def test_dqa9q_after_migration_exits_as_before(tmp_path, monkeypatch):
     reconcile.startup(e.con, e.legs, now=tm.NOW)
     chk = reconcile.check_deal(e.con, store.get_deal(e.con, "DQA9Q"), e.legs_live)
     assert chk.matched is True and chk.hedged is True and chk.delta == D("0.151")
+    from funding_bot.trade.adapters.execution_scope import bind_legacy
+    row = dict(e.con.execute('SELECT * FROM perp_orders').fetchone())
+    e.perp._signed_ok = lambda *a, **kw: dict(
+        clientOrderId=row['client_id'], symbol=row['symbol'], side=row['side'], origQty=row['qty'],
+        price=row['price'], reduceOnly=bool(row['reduce_only']), orderId=row['order_id'],
+        executedQty=row['executed_qty'], cumQuote=row['cum_quote'])
+    bind_legacy(e.con, store.get_deal(e.con, 'DQA9Q'), e.perp)
     x = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
     assert "не подтверждён" not in x.html
     assert json.loads(store.get_intent(e.con, x.intent_id)["spec_json"])["inst_hash"] == DQA9Q_HASH
     fx.run_approved(e, x)
-    assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.CLOSED and e.perp.pos == 0
+    assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.CLOSED and e.perp.pos == 0, e.hooks.reports
 
 
 def test_migration_failure_leaves_no_half_schema(tmp_path, monkeypatch):
@@ -173,7 +184,7 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     tm.dqa9q(con)
-    con.execute("UPDATE schema_version SET version=4, min_reader=4")
+    con.execute("UPDATE schema_version SET version=5, min_reader=5")
     objs, rows = _objects(con), _dump(con)
     with pytest.raises(store.SchemaTooNew, match="не запускаюсь"):
         store.connect(p)
@@ -190,7 +201,7 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     con.execute("UPDATE schema_version SET min_reader=2")
     store.connect(p).close()
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (4, 2)
+    assert (info["version"], info["min_reader"]) == (5, 2)
     con.close()
 
 

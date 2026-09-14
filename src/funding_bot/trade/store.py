@@ -90,7 +90,7 @@ CREATE TRIGGER IF NOT EXISTS deal_marks_no_update BEFORE UPDATE ON deal_marks BE
 # --- схема 2: версия, ворота, журналы SOL×HL ---------------------------------------------------------------------
 # Версия схемы и ворота (M06): код откажется стартовать, если min_reader БД больше его SCHEMA_VERSION — старый код на
 # БД со сделками, которых он не понимает, выбрал бы не те ноги. min_reader только растёт (require_reader).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MIN_READER = 2
 
 # состояния trade/solana/journal.AttemptState для частичных индексов (журнал сверяет их с собой при открытии)
@@ -512,6 +512,14 @@ def _migrate(con, now: float | None = None) -> None:
         if row is not None and row[0] >= SCHEMA_VERSION:
             return
         _run_ddl(con, SCHEMA_V2)
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS execution_account_binding_once "
+                    "ON exec_events(deal_id) WHERE kind='execution_account_binding_v1'")
+        con.execute("CREATE TRIGGER IF NOT EXISTS execution_account_binding_no_update "
+                    "BEFORE UPDATE ON exec_events WHEN OLD.kind='execution_account_binding_v1' "
+                    "BEGIN SELECT RAISE(ABORT, 'immutable execution account'); END")
+        con.execute("CREATE TRIGGER IF NOT EXISTS execution_account_binding_no_delete "
+                    "BEFORE DELETE ON exec_events WHEN OLD.kind='execution_account_binding_v1' "
+                    "BEGIN SELECT RAISE(ABORT, 'immutable execution account'); END")
         for t, c, d in _JOURNAL_COLUMNS["hl"]:
             _ensure_column(con, t, c, d)
         con.execute("INSERT INTO schema_version(id, version, min_reader, updated, note) VALUES(1, ?, ?, ?, ?) "

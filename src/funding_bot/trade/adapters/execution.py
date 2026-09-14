@@ -33,6 +33,8 @@ def recover_not_submitted(con, *, deal, clip_id, native, account, client_id):
     """
     if con.in_transaction:
         raise AdapterError(ErrorKind.CONFIG, 'recovery cannot join a caller transaction')
+    _account_gate(con, deal, native, account)
+    native = _connection_native(native, con, account)
     with exclusive_transaction(con):
         row = store.get_perp_order(con, client_id)
         if row is None or row['clip_id'] != clip_id or row['symbol'] != deal['symbol']:
@@ -75,8 +77,13 @@ def submit_ioc(con, *, deal, clip_id, native, account, fill_venue, client_id,
     expected_venue = ('sim:' if deal['sim'] else '') + deal['perp_venue']
     if fill_venue != expected_venue or native.venue != deal['perp_venue']:
         raise AdapterError(ErrorKind.IDENTITY, 'native venue differs from frozen deal')
+    _account_gate(con, deal, native, account)
+    native = _connection_native(native, con, account)
+    from .execution_scope import continuation_identity, check_continuation_action
+    check_continuation_action(con, deal, intent, side, quantity, reduce_only)
     spec = map_perpetual(deal, account=account, filters=native.filters(deal['symbol']),
-                         metadata_revision='frozen:' + deal['id'])
+                         metadata_revision='frozen:' + deal['id'],
+                         continuation_evidence=continuation_identity(con, deal, intent['kind']))
     attach = getattr(native, 'bind_execution_journal', None)
     barrier = attach(con, account) if callable(attach) else None
     journal = PerpJournal(con, clip_id=clip_id, fill_venue=fill_venue, spec=spec, send_barrier=barrier)
@@ -129,6 +136,21 @@ class RecoveryScope:
     quote_currency: str
 
 
+def _account_gate(con, deal, native, account):
+    # SOL retains its frozen account ID and native HL journal. EVM legacy
+    # accounts require an independent durable execution binding.
+    inst = InstrumentSpec.from_json(deal['inst_json'])
+    if not deal['sim'] and inst.chain != 'solana':
+        from .execution_scope import account_for
+        if account_for(con, deal, native) != account:
+            raise AdapterError(ErrorKind.IDENTITY, 'caller differs from proven execution account')
+
+
+def _connection_native(native, con, account):
+    factory = getattr(native, 'execution_view', None)
+    return factory(con, account) if callable(factory) else native
+
+
 def settle_ioc(con, *, deal, native, account, client_id, **recovery):
     """Resolve native evidence, including old attempts, through the same Result v2 gate.
 
@@ -145,6 +167,7 @@ def settle_ioc(con, *, deal, native, account, client_id, **recovery):
     persisted = store.get_deal(con, deal['id'])
     if persisted is None or persisted['inst_json'] != deal['inst_json']:
         raise AdapterError(ErrorKind.IDENTITY, 'recovery frozen instrument differs')
+    _account_gate(con, deal, native, account)
     inst = InstrumentSpec.from_json(persisted['inst_json'])
     if (inst.perp_symbol != row['symbol'] or inst.perp_venue != native.venue or not inst.quote_asset or
             (inst.perp_account and inst.perp_account != account)):
@@ -166,6 +189,7 @@ def settle_ioc(con, *, deal, native, account, client_id, **recovery):
                           (inst.perp_venue, inst.perp_network, account, inst.perp_dex, inst.perp_symbol),
                           inst.quote_asset)
     fill = native.settle_unknown(inst.perp_symbol, client_id, **recovery)
+    _account_gate(con, deal, native, account)
     if fill.client_id != client_id:
         raise AdapterError(ErrorKind.IDENTITY, 'native recovery returned another attempt')
     if fill.status == 'NOT_FOUND':

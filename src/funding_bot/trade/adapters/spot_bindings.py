@@ -6,34 +6,38 @@ Solana retains validator, router final checks and atomic receipt application.
 import json
 import time
 from decimal import Decimal as D
-from .contracts import AdapterError, ErrorKind, Quote, Observation
+from .contracts import AdapterError, ErrorKind, Quote, Observation, from_raw
 from .native import Bindings
 
 
 def _raw(value, decimals):
     if not isinstance(value, D) or not value.is_finite() or value <= 0:
         raise AdapterError(ErrorKind.INVALID, 'positive Decimal input amount required')
-    raw = value * D(10) ** decimals
-    if raw != raw.to_integral_value():
+    numerator, denominator = value.as_integer_ratio()
+    raw, remainder = divmod(numerator * 10 ** decimals, denominator)
+    if remainder:
         raise AdapterError(ErrorKind.INVALID, 'input amount is off raw token units')
     return int(raw)
 
 
 def evm(native, *, quote_token, quote_decimals, journal, authorize, resolve_row, read_executions,
         clip_ref, clock=time.time):
-    def quote(spec, action, bounds):
+    def scope(spec):
         if native.wallet.lower() != spec.account.lower() or str(native.ci) != spec.network:
             raise AdapterError(ErrorKind.IDENTITY, 'EVM native scope mismatch')
         if spec.quote_decimals is not None and (spec.quote_decimals != quote_decimals or
                                                 spec.quote_currency.lower() != quote_token.lower()):
             raise AdapterError(ErrorKind.IDENTITY, 'EVM counter-asset identity or decimals mismatch')
+
+    def quote(spec, action, bounds):
+        scope(spec)
         buy = action.side == 'BUY'
         token_in, token_out = (quote_token, spec.instrument) if buy else (spec.instrument, quote_token)
         din, dout = (quote_decimals, spec.decimals) if buy else (spec.decimals, quote_decimals)
         amount = bounds.get('spend') if buy else action.quantity
         raw = _raw(amount, din)
         build = native.build_swap(token_in, token_out, raw, preflight=False)
-        minimum = D(build.min_receive) / D(10) ** dout
+        minimum = from_raw(build.min_receive, dout)
         required = action.quantity if buy else bounds.get('min_receive')
         if not isinstance(required, D) or minimum < required:
             raise AdapterError(ErrorKind.REJECTED, 'route does not meet minimum receive')
@@ -41,12 +45,14 @@ def evm(native, *, quote_token, quote_decimals, journal, authorize, resolve_row,
         return Quote(action, clock() + 5, amount, minimum, token_in, token_out, json.dumps(payload, sort_keys=True))
 
     def submit(spec, prepared):
+        scope(spec)
         p = json.loads(prepared.quote.native)
         # Allowance is a separate native journaled action; never hide approve inside a swap attempt.
         return native.swap(p['token_in'], p['token_out'], p['amount'], clip_ref(prepared.attempt_id),
                            approved_min_receive=p['minimum'])
 
     def resolve(spec, ref):
+        scope(spec)
         row, side = resolve_row(spec, ref)
         if row['chain'] != native.chain or row['wallet'].lower() != spec.account.lower():
             raise AdapterError(ErrorKind.IDENTITY, 'EVM receipt scope mismatch')
@@ -55,7 +61,7 @@ def evm(native, *, quote_token, quote_decimals, journal, authorize, resolve_row,
     def observe(spec):
         balances = native.balances(spec.instrument)
         raw = balances.get('token')
-        qty = None if raw is None else D(raw) / D(10) ** spec.decimals
+        qty = None if raw is None else from_raw(raw, spec.decimals)
         return Observation(qty, clock(), 'EVM:balanceOf', 'unknown' if qty is None else 'authoritative')
 
     return Bindings(native, journal, authorize, quote, submit, resolve, observe, read_executions, clock=clock)
@@ -89,7 +95,7 @@ def solana(native, router, *, token, quote_asset, journal, authorize, con, price
         candidate = decision.winner
         if candidate is None:
             raise AdapterError(ErrorKind.REJECTED, 'no executable Solana route')
-        minimum = D(candidate.effective_min_out) / D(10) ** out.decimals
+        minimum = from_raw(candidate.effective_min_out, out.decimals)
         required = action.quantity if buy else bounds.get('min_receive')
         if not isinstance(required, D) or minimum < required:
             raise AdapterError(ErrorKind.REJECTED, 'Solana route below approved minimum')
@@ -119,7 +125,7 @@ def solana(native, router, *, token, quote_asset, journal, authorize, con, price
 
     def observe(spec):
         raw = native.token_balance(token.mint, token.program)
-        qty = None if raw is None else D(raw) / D(10) ** token.decimals
+        qty = None if raw is None else from_raw(raw, token.decimals)
         return Observation(qty, clock(), 'Solana:tokenAccounts', 'unknown' if qty is None else 'authoritative')
 
     return Bindings(native, journal, authorize, quote, submit, resolve, observe, read_executions, clock=clock)

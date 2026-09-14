@@ -2,12 +2,13 @@
   "format_version": 1,
   "ipc_version": 1,
   "dto_version": 3,
-  "schema_version": 3,
+  "schema_version": 4,
   "min_reader": 2,
   "compatible_readers": [
     1,
     2,
-    3
+    3,
+    4
   ],
   "components": [
     "collector",

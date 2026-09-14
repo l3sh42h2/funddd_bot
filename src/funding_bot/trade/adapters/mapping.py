@@ -32,19 +32,19 @@ def map_legacy(deal, *, spot_account, perp_account, filters, spot_quote, network
     return spot, perp
 
 
-def map_perpetual(deal, *, account, filters, metadata_revision):
+def map_perpetual(deal, *, account, filters, metadata_revision, continuation_evidence=None):
     """Map one frozen leg without requiring a spot wallet, route or network RPC."""
     inst = InstrumentSpec.from_json(deal['inst_json'])
     if deal.get('symbol', inst.perp_symbol) != inst.perp_symbol or deal.get('perp_venue', inst.perp_venue) != inst.perp_venue:
         raise AdapterError(ErrorKind.IDENTITY, 'deal differs from frozen perpetual instrument')
-    if not inst.verified or not (inst.ident_ev or inst.identity_hash):
+    if not inst.verified or not (inst.ident_ev or inst.identity_hash or continuation_evidence):
         raise AdapterError(ErrorKind.IDENTITY, 'historical instrument has no verified identity proof')
     if inst.perp_account and inst.perp_account != account:
         raise AdapterError(ErrorKind.IDENTITY, 'historical perpetual account differs')
     if not inst.quote_asset:
         raise AdapterError(ErrorKind.IDENTITY, 'perpetual quote currency unknown')
     common = dict(asset_id=f'{inst.chain}:{inst.token}',
-                  identity_evidence=inst.identity_hash or inst.ident_ev,
+                  identity_evidence=inst.identity_hash or inst.ident_ev or continuation_evidence,
                   legacy_hash=inst.inst_hash(), metadata_revision=metadata_revision)
     return LegSpec(str(deal['id']) + ':perp', 'hedge', 'short', inst.perp_venue, inst.perp_venue,
                    account, inst.perp_symbol, multiplier=inst.fp, step=filters.step, tick=filters.tick,

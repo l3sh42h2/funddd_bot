@@ -160,6 +160,14 @@ def _dqa9q_env(tmp_path, *, old_db: bool = True):
     прежней версии (без колонки) открывается новым кодом."""
     e = fx.live_env(tmp_path)
     tm.dqa9q(e.con)
+    # Accounting fixture has no credentials/config. Execution fixture must freeze
+    # its synthetic wallet at construction; production JSON is never rewritten.
+    e.con.execute('UPDATE deals SET owner_json=? WHERE id=?', (e.loader().frozen_json(), 'DQA9Q'))
+    row = dict(e.con.execute('SELECT * FROM perp_orders').fetchone())
+    e.perp._signed_ok = lambda *a, **kw: dict(
+        clientOrderId=row['client_id'], symbol=row['symbol'], side=row['side'], origQty=row['qty'],
+        price=row['price'], reduceOnly=bool(row['reduce_only']), orderId=row['order_id'],
+        executedQty=row['executed_qty'], cumQuote=row['cum_quote'])
     if old_db:
         e.con.execute("ALTER TABLE deals DROP COLUMN inst_json")
         store._COLS.pop("deals", None)
@@ -196,6 +204,8 @@ def test_dqa9q_backfill_on_startup_writes_verified_m1_once(tmp_path):
 def test_dqa9q_is_picked_up_without_manual_steps_full_exit(tmp_path):
     e = _dqa9q_env(tmp_path)
     reconcile.startup(e.con, e.legs, now=tm.NOW)
+    from funding_bot.trade.adapters.execution_scope import prepare_active_accounts
+    prepare_active_accounts(e.con, e.legs)
     deal = store.get_deal(e.con, "DQA9Q")
     chk = reconcile.check_deal(e.con, deal, e.legs_live)
     assert chk.matched is True and chk.hedged is True and chk.delta == D("0.151")
@@ -215,6 +225,8 @@ def test_dqa9q_is_picked_up_without_manual_steps_full_exit(tmp_path):
 def test_dqa9q_partial_exit_keeps_legs_even(tmp_path):
     e = _dqa9q_env(tmp_path)
     reconcile.startup(e.con, e.legs, now=tm.NOW)
+    from funding_bot.trade.adapters.execution_scope import prepare_active_accounts
+    prepare_active_accounts(e.con, e.legs)
     fx.run_approved(e, e.desk.propose_exit("DQA9Q", D(100), False, chat=fx.OWNER))
     bk = eng.deal_book(e.con, "DQA9Q")
     assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.OPEN
@@ -267,7 +279,7 @@ def _legacy(e, did, variant):
 
 @pytest.mark.parametrize("variant,why", [("ratio", "единицы не сходятся"), ("name", "множитель в имени"),
                                          ("naked", "нет исполненного шорта")])
-def test_unverified_legacy_deal_can_close_but_not_grow(tmp_path, variant, why):
+def test_corrupted_bound_deal_cannot_close_or_grow(tmp_path, variant, why):
     e, p = _partial_entry(tmp_path)
     did = p.deal_id
     _legacy(e, did, variant)
@@ -294,7 +306,8 @@ def test_unverified_legacy_deal_can_close_but_not_grow(tmp_path, variant, why):
     assert chk.matched is True
     rows, _m, _p = reconcile.positions(e.con, e.legs, now=time.time())
     assert [r["deal_id"] for r in rows] == [did]
-    # закрыть можно: полный выход (ноги ровно) или откат (голый лонг)
+    # A post-binding mutation is not genuine legacy evidence. Even a disposal
+    # proposal must fail before touching either independently scoped account.
     if variant == "naked":
         prop = e.desk.propose_fix("undo", did, chat=fx.OWNER)
     else:
@@ -302,8 +315,9 @@ def test_unverified_legacy_deal_can_close_but_not_grow(tmp_path, variant, why):
         assert "⚠️ Инструмент сделки не подтверждён: " in fx.flat(prop.html), "⚠️ в плане неподтверждённой сделки"
         assert fx.html_ok(prop.html) and not fx.RAW_NUM.search(prop.html)
     fx.run_approved(e, prop)
-    assert store.get_deal(e.con, did)["state"] == DealState.CLOSED
-    assert e.perp.pos == 0 and e.spot.bal[fx.TOKEN] < 10 ** 18
+    assert fx.sends(e) == before
+    assert store.get_intent(e.con, prop.intent_id)['status'] == IntentStatus.FAILED
+    assert store.get_deal(e.con, did)['state'] != DealState.CLOSED
 
 
 def test_broken_inst_json_is_unverified_with_reason(tmp_path):
@@ -342,7 +356,7 @@ def test_approved_sell_rehedge_pauses_before_send_when_instrument_unverified(tmp
     before = fx.sends(e)
     fx.run_approved(e, fix)
     assert fx.sends(e) == before
-    assert store.get_deal(e.con, p.deal_id)["reason"] == "inst_unverified"
+    assert 'счёт исполнения не подтверждён' in store.get_intent(e.con, fix.intent_id)['err']
     assert store.get_intent(e.con, fix.intent_id)["status"] == IntentStatus.FAILED
     assert cabinet.reason_text("inst_unverified") == "инструмент сделки не подтверждён"
 
@@ -360,8 +374,7 @@ def test_approved_partial_exit_sends_nothing_when_instrument_unverified(tmp_path
     fx.run_approved(e, x)
     assert fx.sends(e) == before and e.spot.approvals == appr
     assert store.get_intent(e.con, x.intent_id)["status"] == IntentStatus.FAILED
-    if second_layer:
-        assert store.get_deal(e.con, p.deal_id)["reason"] == "inst_unverified"
+    assert 'счёт исполнения не подтверждён' in store.get_intent(e.con, x.intent_id)['err']
 
 
 def test_approved_entry_more_pauses_before_send_when_instrument_unverified(tmp_path):
@@ -374,7 +387,7 @@ def test_approved_entry_more_pauses_before_send_when_instrument_unverified(tmp_p
     fx.run_approved(e, more)
     assert fx.sends(e) == before
     d = store.get_deal(e.con, p.deal_id)
-    assert d["state"] == DealState.PAUSED and d["reason"] == "limit"
+    assert d["state"] == DealState.PAUSED and d["reason"] == "stop"
 
 
 # ==== 7. вход пишет спецификацию; каждое намерение несёт отпечаток =======================================================

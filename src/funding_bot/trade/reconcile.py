@@ -33,6 +33,8 @@ from .keys import redact
 from .runtime import ProfileDown, is_sol_deal, legs_of
 from .store import ClipState, DealState, DexTxState, PerpOrderState
 
+from .adapters.evm_recovery import _resolve_nonce, _refetch_amounts
+
 log = logging.getLogger(__name__)
 D = Decimal
 ZERO = D(0)
@@ -91,54 +93,6 @@ def _tokens_by_clip(con, deal: dict) -> dict[int, tuple[str, str]]:
 
 
 # --- 1. транзакции DEX ------------------------------------------------------------------------------------
-def _resolve_nonce(con, spot, chain: str, wallet: str, nonce: int, tok: dict) -> str | None:
-    """Одна nonce-группа (своп, его bump и cancel): замайниться могла только одна. None — всё решено; иначе текст,
-    почему исход неизвестен."""
-    group = store.dex_txs_on_nonce(con, chain, wallet, nonce)
-    mined_before = [g for g in group if g["state"] in MINED]
-    open_ = [g for g in group if g["state"] in UNRESOLVED_TX]
-    if not open_:
-        return None
-    res: dict[str, tuple[dict, Any]] = {}
-    for g in open_:
-        row = dict(g)
-        row["token_in"], row["token_out"] = tok.get(g["clip_id"], (None, None))
-        try:
-            res[g["tx_hash"]] = (g, spot.resolve(row))
-        except Exception as e:                 # noqa — не прочитали: исход неизвестен, ничего не меняем
-            return f"tx {g['tx_hash'][:10]}…: чек не прочитан ({redact(e)[:120]})"
-    states = {h: str(getattr(r, "tx_state", "") or "") for h, (_g, r) in res.items()}
-    mined = [h for h, st in states.items() if st in MINED]
-    for h in mined:
-        g, r = res[h]
-        ok = states[h] == DexTxState.MINED_OK
-        swapish = g["kind"] in ("swap", "bump")
-        store.dex_tx_resolve(con, h, states[h], block=int(getattr(r, "block", 0) or 0) or None, status=1 if ok else 0,
-                             gas_used=getattr(r, "gas_used", None), eff_gas_price=getattr(r, "eff_gas_price", None),
-                             amount_in=int(r.amount_in) if (ok and swapish) else None,
-                             amount_out=int(r.amount_out) if (ok and swapish) else None,
-                             err=(getattr(r, "note", "") or None))
-    if mined or mined_before:
-        for h in states:
-            if h not in mined:
-                store.dex_tx_resolve(con, h, DexTxState.REPLACED, err="на nonce замайнена другая наша транзакция")
-        return None
-    sts = set(states.values())
-    if sts == {str(DexTxState.DROPPED)}:
-        for h in states:
-            store.dex_tx_resolve(con, h, DexTxState.DROPPED)
-        return None
-    if str(DexTxState.REPLACED) in sts and sts <= {str(DexTxState.REPLACED), str(DexTxState.DROPPED)}:
-        for h in states:
-            store.dex_tx_resolve(con, h, DexTxState.REPLACED, err=FOREIGN_NONCE)
-        return f"nonce {nonce}: {FOREIGN_NONCE} — ключ кошелька у кого-то ещё?"
-    for h, st in states.items():                # ещё в пуле или сеть не ответила — ждать, не трогать
-        g = res[h][0]
-        if st == DexTxState.SENT and g["state"] == DexTxState.SIGNED:
-            store.dex_tx_sent(con, h)
-        elif st != DexTxState.SENT and g["state"] != DexTxState.UNKNOWN:
-            store.dex_tx_resolve(con, h, DexTxState.UNKNOWN)
-    return f"nonce {nonce}: транзакция ещё в пуле или сеть не ответила — исход неизвестен"
 
 
 def resolve_txs(con, deal: dict, spot) -> list[str]:
@@ -189,8 +143,15 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
         if ok is not None and (ok["amount_in"] is None or ok["amount_out"] is None):
             ok = _refetch_amounts(con, legs.spot, ok, tok.get(cid, (None, None)))
         if ok is not None and ok["amount_in"] is not None and ok["amount_out"] is not None:
+            from .adapters.evm_recovery import stored_settlement
+            try:
+                outcome = stored_settlement(con, deal, legs.spot, ok,
+                                            store.get_intent(con, c['intent_id'])['kind'])
+            except Exception as error:
+                out.append(f"клип {cid}: чек не подтверждён ({redact(error)[:120]})")
+                continue
             OperationController(con).settle_spot(
-                cid, SpotSettlement(True, int(ok["amount_in"]), int(ok["amount_out"])), **root)
+                cid, outcome, **root)
             store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st, now="DEX_OK", tx=ok["tx_hash"])
             continue
         unknown = ok is not None or any(t["state"] in UNRESOLVED_TX for t in txs) \
@@ -207,20 +168,6 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
     return out
 
 
-def _refetch_amounts(con, spot, row: dict, tokens: tuple) -> dict | None:
-    """MINED_OK без сумм (упали между чеком и записью сумм): перечитать чек и дописать суммы из логов."""
-    r = dict(row)
-    r["token_in"], r["token_out"] = tokens
-    try:
-        res = spot.resolve(r)
-    except Exception as e:                     # noqa
-        log.warning("сверка: чек %s не перечитан: %s", row["tx_hash"], redact(e))
-        return row
-    if str(getattr(res, "tx_state", "")) != DexTxState.MINED_OK or not res.amount_out:
-        return row
-    store.dex_tx_resolve(con, row["tx_hash"], DexTxState.MINED_OK, amount_in=int(res.amount_in),
-                         amount_out=int(res.amount_out))
-    return store.get_dex_tx(con, row["tx_hash"])
 
 
 # --- 3. заявки перпа --------------------------------------------------------------------------------------
@@ -257,9 +204,14 @@ def resolve_orders(con, deal: dict, legs: Legs) -> list[str]:
         pos_before = -short_known if len(sent) == 1 else None
         since_ms = int(float(r["sent_ts"] or time.time()) * 1000)
         try:
-            fn = getattr(perp, "settle_unknown", None)
-            f = fn(deal["symbol"], cid, pos_before=pos_before, since_ms=since_ms, known_order_ids=frozenset(known_ids)) \
-                if fn is not None else perp.query(deal["symbol"], cid)
+            from .adapters.execution import settle_ioc, recover_not_submitted
+            from .adapters.execution_scope import account_for
+            account = account_for(con, deal, perp)
+            if recover_not_submitted(con, deal=deal, clip_id=r['clip_id'], native=perp,
+                                     account=account, client_id=cid):
+                continue
+            f = settle_ioc(con, deal=deal, native=perp, account=account, client_id=cid,
+                           pos_before=pos_before, since_ms=since_ms, known_order_ids=frozenset(known_ids))
         except Exception as e:                 # noqa
             out.append(f"заявка {cid}: не запрошена ({redact(e)[:120]})")
             continue
@@ -271,7 +223,7 @@ def resolve_orders(con, deal: dict, legs: Legs) -> list[str]:
             continue
         if r["state"] == PerpOrderState.SENT:
             store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=getattr(perp, "last_error", None))
-        if f.status == "NOT_FOUND" and fn is not None:
+        if f.status == "NOT_FOUND":
             store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED,
                                     err=("-2013 трижды, позиция и сделки неизменны — не выставлена (сверка)"
                                          if getattr(perp, "venue", "aster") == "aster" else

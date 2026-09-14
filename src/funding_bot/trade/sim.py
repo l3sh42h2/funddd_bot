@@ -46,6 +46,8 @@ class SimSpot:
                  wallet_known: bool = True, clock: Callable[[], float] = time.time):
         self.inner = inner
         self.chain = inner.chain
+        from .tconfig import chain_index
+        self.ci = chain_index(self.chain)
         self.wallet = inner.wallet
         self.stable = getattr(inner, "stable", None)
         self.stable_dec = getattr(inner, "stable_dec", None)
@@ -113,7 +115,13 @@ class SimSpot:
             self.guard_notes.append(note)
             log.warning("sim: %s", note)
 
-    def swap(self, token_in: str, token_out: str, amount_units: int, clip_ref: str) -> SwapResult:
+    def build_swap(self, token_in, token_out, amount_units, *, preflight=False):
+        from types import SimpleNamespace
+        q = self.quote(token_in, token_out, amount_units)
+        return SimpleNamespace(min_receive=q.amount_out)
+
+    def swap(self, token_in: str, token_out: str, amount_units: int, clip_ref: str, *,
+             approved_min_receive=None) -> SwapResult:
         amount = int(amount_units)
         if amount <= 0:
             raise ValueError("сумма свопа ≤ 0")
@@ -124,6 +132,8 @@ class SimSpot:
             raise GuardError("honeypot", "OKX помечает токен как honeypot")
         if q.amount_out <= 0:
             raise RuntimeError("котировка без выхода: маршрута нет")
+        if approved_min_receive is not None and q.amount_out < approved_min_receive:
+            raise RuntimeError('simulated route below approved minimum')
         gas_usd = None if q.gas_usd is None else float(q.gas_usd)
         px = self.native_px() if self.native_px is not None else None
         gas_wei = 0

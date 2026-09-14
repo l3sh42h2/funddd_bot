@@ -4,11 +4,34 @@ The same SQLite connection owns claim, signature evidence and no-send recovery.
 No network read is performed while recovering under the writer transaction.
 """
 import json
+from types import MethodType
+from pathlib import Path
+from threading import Lock
 from decimal import Decimal as D
 from .contracts import AdapterError, ErrorKind
 from .. import store
 
 BARRIER = 'mandatory-signed-callback-v1'
+_OWNER_LOCK = Lock()
+
+
+class ExecutionView:
+    """Connection-local fence; transport state, budgets and caches stay shared."""
+    def __init__(self, native):
+        object.__setattr__(self, '_native', native)
+        object.__setattr__(self, '_execution_fence', None)
+
+    def __getattr__(self, name):
+        value = getattr(self._native, name)
+        if isinstance(value, MethodType) and value.__self__ is self._native:
+            return MethodType(value.__func__, self)
+        return value
+
+    def __setattr__(self, name, value):
+        if name == '_execution_fence':
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._native, name, value)
 
 
 class SigningFence:
@@ -72,9 +95,27 @@ class SigningFence:
 
 class JournalBoundIoc:
     """Legacy IOC stays unchanged until core explicitly binds this native instance."""
+    def execution_view(self, con, account):
+        """Connection-owned signing boundary sharing only the native transport.
+
+        Startup and executor run on different SQLite connections. A
+        transport view avoids rebinding a live fence to the other connection;
+        native caches/HTTP budget/locks remain shared with the parent.
+        """
+        view = ExecutionView(self)
+        view.bind_execution_journal(con, account)
+        return view
+
     def bind_execution_journal(self, con, account):
         if con.in_transaction:
             raise AdapterError(ErrorKind.CONFIG, 'bind account before opening writer transaction')
+        main = next((row[2] for row in con.execute('PRAGMA database_list') if row[1] == 'main'), '')
+        identity = ('file', str(Path(main).resolve())) if main else ('memory', id(con))
+        with _OWNER_LOCK:
+            previous = getattr(self, '_execution_owner_db', None)
+            if previous is not None and previous != identity:
+                raise AdapterError(ErrorKind.IDENTITY, 'native execution owner cannot switch database')
+            self._execution_owner_db = identity
         # Gate performs an authenticated account read here, never in absent().
         if not account or self.history_account() != account:
             raise AdapterError(ErrorKind.IDENTITY, 'native execution account is unproven')

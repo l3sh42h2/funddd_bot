@@ -36,7 +36,8 @@ def bind(native, *, journal, authorize, attempt_lookup, on_signed, clock=time.ti
         if action.quantity < filt.min_qty or action.quantity > filt.max_qty_limit:
             raise AdapterError(ErrorKind.INVALID, 'native quantity limits')
         value = price * action.quantity
-        if value < filt.min_notional and not (action.reduce_only and spec.venue == 'hyperliquid'):
+        close_exempt = action.reduce_only and spec.venue in {'aster', 'gate', 'hyperliquid'}
+        if value < filt.min_notional and not close_exempt:
             raise AdapterError(ErrorKind.INVALID, 'native minimum notional')
         # IOC quantity/price bounds; fees are deliberately not declared known here.
         buy = action.side == 'BUY'

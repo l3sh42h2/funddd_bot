@@ -549,7 +549,13 @@ class Bot:
     def startup(self) -> reconcile.StartupReport:
         """Сверка на старте и сообщения «♻️ … сам не продолжаю». Ничего не отправляет на площадки."""
         con = self.conns.get()
-        rep = reconcile.startup(con, self.legs, now=self.clock())
+        from ..trade.adapters.execution_scope import prepare_active_accounts
+        from ..trade.engine import backfill_instruments
+        now = self.clock()
+        backfilled = backfill_instruments(con, now=now)
+        prepare_active_accounts(con, self.legs)
+        rep = reconcile.startup(con, self.legs, now=now)
+        rep.inst_backfill[:0] = backfilled
         for iid in rep.expired:
             self._close_plan(iid, "expired")
         for dr in rep.deals:

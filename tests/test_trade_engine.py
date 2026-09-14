@@ -9,7 +9,7 @@ hedge=True). Сбой процесса — исключение Crash(BaseExcept
 """
 from __future__ import annotations
 import re, subprocess, sys, threading, time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal as D, ROUND_FLOOR
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from funding_bot.trade.keys import ModeForbidden
 from funding_bot.trade.sim import SimPerp, SimSpot
 from funding_bot.trade.store import ClipState, DealState, DexTxState, IntentStatus, PerpOrderState
 from funding_bot.trade.types import Book, DexQuote, Filters, PerpFill, PerpInstrument, SwapResult
+from funding_bot.trade.adapters.signing_fence import JournalBoundIoc
 from funding_bot.tg import auth, views
 from funding_bot.tg.bot import Bot, Jobs
 from funding_bot.tg.sender import Sender, html_ok, to_plain
@@ -40,7 +41,7 @@ OWNER = 111
 FILT = Filters(tick=D("0.00001"), step=D(1), min_qty=D(1), max_qty_limit=D(800000), max_qty_market=D(80000),
                min_notional=D(5), tifs=frozenset({"GTC", "IOC", "GTX"}))
 TABLE = {"ts": 0, "sf_rows": [{"base": "AIW3", "spot_ex": "okxdex", "perp_ex": "aster", "spot": f"56:{TOKEN}",
-                               "perp": SYMBOL, "ident": "same", "mismatch": False, "period": 1,
+                               "perp": SYMBOL, "ident": "same", "ident_ev": "fixture:verified", "mismatch": False, "period": 1,
                                "spot_label": "okx·bsc"}]}
 
 
@@ -221,12 +222,14 @@ class Resolved:
     gas_usd: float | None = None
     nonce: int = 0
     note: str = ""
+    tx_hash: str = ''
 
 
 class LiveSpot:
     """SpotLeg «live». swap проходит ворота EvmWallet (пауза → отказ до подписи; bump/cancel тут не нужны).
     crash: before_sign | after_send (своп исполнен в цепи, процесс умер) | pending | dropped | pool."""
     chain = "bsc"
+    ci = '56'
 
     def __init__(self, market: Market, env):
         self.m, self.env = market, env
@@ -264,7 +267,10 @@ class LiveSpot:
         self.bal[t_in.lower()] = self.bal.get(t_in.lower(), 0) - a_in
         self.bal[t_out.lower()] = self.bal.get(t_out.lower(), 0) + a_out
 
-    def swap(self, t_in, t_out, amount, clip_ref):
+    def build_swap(self, t_in, t_out, amount, *, preflight=False):
+        return SimpleNamespace(min_receive=self.quote(t_in, t_out, amount).amount_out)
+
+    def swap(self, t_in, t_out, amount, clip_ref, *, approved_min_receive=None):
         _mode, paused = self.env.mode_state()
         if paused:
             raise ModeForbidden("пауза («стоп»): новые отправки запрещены")
@@ -295,7 +301,7 @@ class LiveSpot:
         return SwapResult(h, "ok", amount, q.amount_out, 150_000 * 50_000_000, 0.01, 101, self.nonce)
 
     def resolve(self, row):
-        return self.resolutions[row["tx_hash"]]
+        return replace(self.resolutions[row["tx_hash"]], tx_hash=row['tx_hash'])
 
 
 class Klines:
@@ -306,7 +312,12 @@ class Klines:
         return [[i, "0", "0", "0", str(PX + (D("0.00001") if i % 2 else 0)), "0"] for i in range(61)]
 
 
-class LivePerp:
+class LivePerp(JournalBoundIoc):
+    ioc_partial_terminal = True
+
+    def history_account(self):
+        return 'acct:v1:' + self.venue + ':fixture'
+
     """PerpLeg «live» с воротами AsterTrade: на паузе проходит только hedge=True. script — поведение очередной
     заявки: fill | unknown_filled (исполнена, ответ потерян) | unknown_lost (не дошла) | crash_after_fill |
     crash_lost. crash="before_sign" — процесс умер до подписи (nonce не записан)."""
@@ -371,6 +382,8 @@ class LivePerp:
         return f
 
     def ioc(self, symbol, side, qty, px_cap, client_id, reduce_only, *, hedge=False, on_signed=None):
+        on_signed = self._ioc_callback(on_signed, symbol=symbol, side=side, quantity=qty,
+                                       price=px_cap, client_id=client_id, reduce_only=reduce_only)
         _mode, paused = self.env.mode_state()
         if paused and not hedge:
             raise ModeForbidden("пауза («стоп»): новые отправки запрещены")

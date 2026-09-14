@@ -73,6 +73,8 @@ class PerpJournal:
             proof = self._check(prepared)
             row = store.get_perp_order(self.con, prepared.attempt_id)
             if row is None:
+                if self.spec.capabilities.network_family is None and self.spec.venue in ('aster', 'gate'):
+                    store.require_reader(self.con, 4)
                 store.perp_order_intent(self.con, clip_id=self.clip_id, client_id=prepared.attempt_id,
                                         venue=self.fill_venue, symbol=self.spec.instrument, side=a.side,
                                         reduce_only=a.reduce_only, tif='IOC', price=price, qty=a.quantity)

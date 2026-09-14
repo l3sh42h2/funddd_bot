@@ -1120,6 +1120,8 @@ class Desk:
             deal_id = store.create_deal(con, coin=coin, chain=pair.chain, token=pair.token, token_dec=pair.token_dec,
                                         perp_venue=perp_s, symbol=pair.symbol, leg_usd=usd,
                                         owner_json=cfg.frozen_json(), sim=sim, inst=inst)
+            from .adapters.execution_scope import bind_draft
+            bind_draft(con, store.get_deal(con, deal_id), ctx['legs'].perp)
         else:                                  # перекотировка черновика (bot.requote): тот же инструмент — или новый вход
             raw = (store.get_deal(con, deal_id) or {}).get("inst_json")
             if not raw:
@@ -1864,12 +1866,24 @@ class Engine:
                 return self._fail(iid, f"живую сделку в этом режиме не двигаю: {why}")
         if legs is None or (not legs.sim and not legs.can_send):
             return self._fail(iid, "живую сделку в этом режиме не двигаю: ключи live не загружены")
+        try:
+            from .adapters.execution_scope import account_for
+            account_for(con, deal, legs.perp)
+        except Exception as e:
+            return self._fail(iid, f"счёт исполнения не подтверждён: {redact(e)}")
         cfg = OwnerCfg.from_frozen(spec["owner"])
         self.holder.set(cfg)
         store.set_intent_status(con, iid, IntentStatus.RUNNING, expect=IntentStatus.APPROVED)
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
         try:
             f = legs.perp.filters(deal["symbol"])
+            from .adapters.mapping import map_perpetual
+            from .adapters.execution_scope import continuation_identity
+            continuity = continuation_identity(con, deal, it['kind'])
+            map_perpetual(deal, account=account_for(con, deal, legs.perp), filters=f,
+                          metadata_revision='frozen:' + deal['id'], continuation_evidence=continuity)
+            from .adapters.spot_execution import evm_spec
+            evm_spec(deal, legs.spot, stable, int(sdec), continuation_evidence=continuity)
         except Exception as e:                 # noqa — ничего не отправлено
             self._fail(iid, f"фильтры {deal['symbol']} не прочитаны: {redact(e)}",
                        expect=IntentStatus.RUNNING)
@@ -2236,7 +2250,8 @@ class Engine:
             return
         from .evm import SentUnknown
         try:
-            res = run.legs.spot.ensure_allowance(token, need, "")
+            from .adapters.spot_execution import ensure_evm_allowance
+            res = ensure_evm_allowance(run.legs.spot, token, need)
         except SentUnknown as e:
             raise Pause("approve_unknown", f"approve: исход неизвестен ({e})") from None
         except Exception as e:                 # noqa — до отправки (гард, режим, узел отверг)
@@ -2259,7 +2274,11 @@ class Engine:
         OperationController(con).begin_spot(clip_id, operation_id=run.op_id,
                                               reserve_raw=int(units) if run.op_id else None, retry_reverted=True)
         try:
-            res = run.legs.spot.swap(t_in, t_out, int(units), str(clip_id))
+            from .adapters.spot_execution import submit_evm
+            res = submit_evm(con, deal=run.deal, clip_id=clip_id, native=run.legs.spot,
+                             stable=run.stable, stable_dec=run.sdec, token_in=t_in, token_out=t_out,
+                             amount_raw=int(units), clock=self.clock, authorize=lambda *_: self._authorize_child(run),
+                             registry=getattr(self.legs, 'adapters', None))
         except Exception as e:                 # noqa
             if isinstance(e, SentUnknown) or (not run.legs.sim and self._dex_touched(clip_id)):
                 store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
@@ -2371,23 +2390,29 @@ class Engine:
         attempt, rerounded = 1, False
         while True:
             cid = store.client_order_id(run.did, run.letter, clip_id, child, attempt)
-            store.perp_order_intent(con, clip_id=clip_id, client_id=cid, venue=run.legs.fill_venue, symbol=run.symbol,
-                                    side=side, reduce_only=ro, tif="IOC", price=cap, qty=q)
             since_ms = int(self.clock() * 1000)
             try:
-                fill = perp.ioc(run.symbol, side, q, cap, cid, ro, hedge=True,
-                                on_signed=lambda n, c=cid: store.perp_order_sent(con, c, sign_nonce=n))
+                from .adapters.execution import submit_ioc
+                from .adapters.execution_scope import account_for
+                account = account_for(con, run.deal, perp)
+                fill = submit_ioc(con, deal=run.deal, clip_id=clip_id, native=perp,
+                                  account=account, fill_venue=run.legs.fill_venue, client_id=cid,
+                                  side=side, quantity=q, price=cap, reduce_only=ro, clock=self.clock,
+                                  authorize=lambda *_: self._authorize_child(run),
+                                  registry=getattr(self.legs, 'adapters', None))
             except Exception as e:             # noqa — до отправки: ворота, бюджет, параметры, сбой записи-до
                 row = store.get_perp_order(con, cid)
-                if row is not None and row["state"] == PerpOrderState.INTENT:
-                    store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=f"{type(e).__name__}: {e}")
+                if row is None or row['state'] in (PerpOrderState.INTENT, PerpOrderState.NOT_PLACED):
+                    if row is not None and row['state'] == PerpOrderState.INTENT:
+                        store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=f"{type(e).__name__}: {e}")
                     raise Pause("perp_refused", f"заявка {cid} не отправлена: {type(e).__name__}: {redact(e)}") from None
                 fill = PerpFill(cid, None, "UNKNOWN", ZERO, ZERO, ZERO, 0)
             if fill.status == "UNKNOWN":
                 store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=getattr(perp, "last_error", None))
                 store.event(con, "perp_unknown", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, cid=cid)
-                s = perp.settle_unknown(run.symbol, cid, pos_before=pos_before, since_ms=since_ms,
-                                        known_order_ids=frozenset(known))
+                from .adapters.execution import settle_ioc
+                s = settle_ioc(con, deal=run.deal, native=perp, account=account, client_id=cid,
+                               pos_before=pos_before, since_ms=since_ms, known_order_ids=frozenset(known))
                 if s.status == "NOT_FOUND":
                     store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED,
                                             err="адаптер доказал: не найдена, позиция и сделки неизменны — не выставлена")
@@ -2419,6 +2444,14 @@ class Engine:
                 raise Pause(reason, f"{v.VENUE_LABEL.get(perp.venue, perp.venue)} {c}: "
                                     f"{getattr(perp, 'last_error', '') or 'отказ'}")
             return fill
+
+    def _authorize_child(self, run):
+        # A stop between the two legs must still permit the approved hedge.
+        # Native mode/budget/signing guards remain mandatory after this check.
+        intent = store.get_intent(self.conns.get(), run.iid)
+        if (intent is None or intent['status'] != IntentStatus.RUNNING or
+                intent['deal_id'] != run.did or (not run.legs.sim and not run.legs.can_send)):
+            raise Pause('perp_refused', 'исполнение не имеет действующего одобренного намерения')
 
     # --- общие куски потоков ---
     def _stopping(self) -> bool:

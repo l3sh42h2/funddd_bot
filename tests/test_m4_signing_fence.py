@@ -23,6 +23,8 @@ def setup(tmp_path, venue):
                           ident_ev='synthetic:verified', verified=True)
     did = store.create_deal(con, coin='TEST', chain='bsc', token=inst.token, token_dec=18,
                             perp_venue=venue, symbol=symbol, leg_usd=D(100), owner_json='{}', sim=False, inst=inst)
+    from funding_bot.trade.adapters.execution_scope import bind_draft
+    bind_draft(con, store.get_deal(con, did), native)
     iid, _ = store.create_intent(con, deal_id=did, kind='entry', spec={'inst_hash':inst.inst_hash()}, plan={})
     clip = store.create_clip(con, iid, 1, 100)
     cid = store.client_order_id(did, 'e', clip, 1, 1)
@@ -91,7 +93,39 @@ def test_foreign_account_and_db_cannot_rebind_or_prove_absence(tmp_path,venue):
     with pytest.raises(AdapterError): native.bind_execution_journal(other,proof['account'])
     with store.tx(other):
         assert not native.submission_absent(params[0],params[4],proof['account'],proof_con=other)
-    assert not recover_not_submitted(con,**dict(proof,account='other'))
+    with pytest.raises(AdapterError):
+        recover_not_submitted(con,**dict(proof,account='other'))
+    assert store.get_perp_order(con,params[4])['state']=='SENT'
+
+
+@pytest.mark.parametrize('venue', ['aster', 'gate'])
+def test_connection_views_keep_fences_separate_and_transport_budget_shared(tmp_path, venue):
+    con, native, fake, journal, params, proof = setup(tmp_path, venue)
+    other = store.connect(tmp_path / 'trade.db')
+    first = native.execution_view(con, proof['account'])
+    second = native.execution_view(other, proof['account'])
+    assert first._execution_fence.con is con
+    assert second._execution_fence.con is other
+    first.backoff_until = 12345
+    assert native.backoff_until == second.backoff_until == 12345
+    with pytest.raises(AdapterError):
+        first.bind_execution_journal(other, proof['account'])
+    assert second._execution_fence.con is other
+    other.close()
+
+
+@pytest.mark.parametrize('venue', ['aster', 'gate'])
+def test_copied_journal_cannot_create_second_execution_authority(tmp_path, venue):
+    con, native, fake, journal, params, proof = setup(tmp_path, venue)
+    copied = store.connect(tmp_path / 'copy.db')
+    con.backup(copied)
+    before = sum(r.method == 'POST' for r in fake.sent)
+    with pytest.raises(AdapterError):
+        native.execution_view(copied, proof['account'])
+    assert sum(r.method == 'POST' for r in fake.sent) == before
+    assert store.get_perp_order(con, params[4])['sign_nonce'] is None
+    assert store.get_perp_order(copied, params[4])['sign_nonce'] is None
+    copied.close()
 
 
 @pytest.mark.parametrize('venue',['aster','gate'])

@@ -50,6 +50,12 @@ def decimal(value, name, *, positive=False):
     return value
 
 
+def from_raw(raw: int, decimals: int):
+    """Scale integer token units without Decimal context rounding."""
+    parts = D(raw).as_tuple()
+    return D((parts.sign, parts.digits, parts.exponent - decimals))
+
+
 @dataclass(frozen=True)
 class Capabilities:
     venue_kind: str
@@ -142,7 +148,9 @@ class Action:
         decimal(self.quantity, 'quantity', positive=True)
         if not self.action_id or self.leg_id != spec.leg_id or self.side not in {'BUY', 'SELL'}:
             raise AdapterError(ErrorKind.INVALID, 'invalid action identity/side')
-        if self.quantity % spec.step:
+        qn, qd = self.quantity.as_integer_ratio()
+        sn, sd = spec.step.as_integer_ratio()
+        if (qn * sd) % (qd * sn):
             raise AdapterError(ErrorKind.INVALID, 'quantity is off step')
         if self.reduce_only and not spec.capabilities.reduce_only:
             raise AdapterError(ErrorKind.UNSUPPORTED, 'native reduce-only unavailable')
@@ -222,7 +230,7 @@ class RawAmount:
 
     @property
     def amount(self):
-        return D(self.raw) / D(10) ** self.decimals
+        return from_raw(self.raw, self.decimals)
 
 
 @dataclass(frozen=True)

@@ -28,7 +28,7 @@ E6, E18 = 10 ** 6, 10 ** 18
 GFILT = Filters(tick=D("0.0001"), step=D(1), min_qty=D(1), max_qty_limit=D(1000000), max_qty_market=D(100000),
                 min_notional=D(1), tifs=frozenset({"GTC", "IOC"}))
 TABLE_RH = {"ts": 0, "sf_rows": [{"base": "FATCOIN", "spot_ex": "okxdex", "perp_ex": "gate", "spot": f"4663:{FAT}",
-                                  "perp": SYM, "ident": "same", "mismatch": False, "period": 4,
+                                  "perp": SYM, "ident": "same", "ident_ev": "fixture:verified", "mismatch": False, "period": 4,
                                   "spot_label": "okx·rh"}]}
 
 
@@ -87,6 +87,7 @@ class MarketRH:
 
 class RHSpot(fx.LiveSpot):
     chain = "robinhood"
+    ci = '4663'
 
     def __init__(self, market, env):
         super().__init__(market, env)
