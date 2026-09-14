@@ -1,0 +1,96 @@
+{
+  "fixture_version": 1,
+  "name": "solana_known_multiplier_account_pages",
+  "oracle_base_sha": "95354c4",
+  "expected_oracle_sha256": "a031e9ec5affc065b36ff5b9bc00b11e2d136302ee89c95cdac842b928947eb8",
+  "synthetic": true,
+  "family": "solana",
+  "as_of_ms": 1789363600000,
+  "quote_decimals": 6,
+  "quote_asset": "USDC",
+  "fee_rate": "0.000675",
+  "native_price_quote": "150",
+  "tables": {
+    "deals": [
+      {
+        "id": "DSOLK1",
+        "created": 1789360000.0,
+        "state": "CLOSED",
+        "coin": "SYN",
+        "chain": "solana",
+        "token": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+        "token_dec": 6,
+        "perp_venue": "hyperliquid",
+        "symbol": "para:SYN",
+        "leg_usd": "5",
+        "owner_json": "{}",
+        "sim": 0,
+        "carry": "0",
+        "dust": "0",
+        "updated": 1789363600.0,
+        "inst_json": "{\"chain\":\"solana\",\"contract_type\":\"PERPETUAL\",\"genesis_hash\":\"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d\",\"ident_ev\":\"synthetic\",\"identity_expires_at\":\"2099-01-01T00:00:00Z\",\"identity_hash\":\"sha256:synthetic\",\"identity_status\":\"reviewed_override\",\"instrument_id\":\"synthetic_sol_hl_v1\",\"instrument_version\":1,\"network\":\"solana-mainnet\",\"period_h\":\"1\",\"perp_account\":\"hyperliquid:mainnet:synthetic-master:0xabc123:para\",\"perp_asset_id\":999999,\"perp_base_asset\":\"SYN\",\"perp_collateral\":\"token:0\",\"perp_dex\":\"para\",\"perp_network\":\"mainnet\",\"perp_symbol\":\"para:SYN\",\"perp_venue\":\"hyperliquid\",\"profile_id\":\"sol_best_hyperliquid\",\"px_ratio\":\"1\",\"quote_asset\":\"USDC\",\"quote_dec\":6,\"quote_mint\":\"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\",\"quote_program\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"schema\":2,\"source\":\"fixture:frozen\",\"spot_units_per_token\":\"1\",\"token\":\"9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump\",\"token_dec\":6,\"token_extensions\":[\"metadataPointer\"],\"token_program\":\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"units_per_contract\":\"1000\",\"verified\":true,\"verified_ts\":1789360000.0,\"why\":null}",
+        "perp_scope": "hyperliquid|mainnet|hyperliquid:mainnet:synthetic-master:0xabc123:para|para|para:SYN"
+      }
+    ],
+    "intents": [
+      {"id": "ESOLK1", "deal_id": "DSOLK1", "kind": "entry", "status": "done", "created": 1789360000.0},
+      {"id": "XSOLK1", "deal_id": "DSOLK1", "kind": "exit", "status": "done", "created": 1789363500.0}
+    ],
+    "clips": [
+      {"id": 11, "intent_id": "ESOLK1", "seq": 1, "state": "BALANCED", "planned_in": "5000000", "dex_in": "5000000", "dex_out": "2000000", "perp_qty": "0.002", "perp_quote": "5.1"},
+      {"id": 12, "intent_id": "XSOLK1", "seq": 1, "state": "BALANCED", "planned_in": "2000000", "dex_in": "2000000", "dex_out": "6000000", "perp_qty": "0.002", "perp_quote": "5.4"}
+    ],
+    "perp_orders": [
+      {"id": 11, "clip_id": 11, "client_id": "fb-DSOLK1-e01-c1-a1", "venue": "hl:mainnet:0xabc123:para", "symbol": "para:SYN", "side": "SELL", "state": "FILLED", "order_id": 501, "executed_qty": "0.002", "avg_price": "2550", "cum_quote": "5.1"},
+      {"id": 12, "clip_id": 12, "client_id": "fb-DSOLK1-x01-c1-a1", "venue": "hl:mainnet:0xabc123:para", "symbol": "para:SYN", "side": "BUY", "state": "FILLED", "order_id": 502, "executed_qty": "0.002", "avg_price": "2700", "cum_quote": "5.4"}
+    ],
+    "hl_order_attempts": [
+      {"client_id": "fb-DSOLK1-e01-c1-a1", "cloid": "0x00000000000000000000000000000101", "kind": "order", "network": "mainnet", "master": "synthetic-master", "account": "0xAbC123", "signer": "synthetic-signer", "dex": "para", "fullcoin": "para:SYN", "asset": 999999, "side": "SELL", "sz": "0.002", "px": "2550", "reduce_only": 0, "nonce": 1001, "action_json": "{}", "action_hash": "sha256:action-entry", "state": "FILLED", "created": 1789360100.0, "deal_id": "DSOLK1", "intent_id": "ESOLK1", "clip_id": 11},
+      {"client_id": "fb-DSOLK1-x01-c1-a1", "cloid": "0x00000000000000000000000000000102", "kind": "order", "network": "mainnet", "master": "synthetic-master", "account": "0xabc123", "signer": "synthetic-signer", "dex": "para", "fullcoin": "para:SYN", "asset": 999999, "side": "BUY", "sz": "0.002", "px": "2700", "reduce_only": 1, "nonce": 1002, "action_json": "{}", "action_hash": "sha256:action-exit", "state": "FILLED", "created": 1789363500.0, "deal_id": "DSOLK1", "intent_id": "XSOLK1", "clip_id": 12}
+    ],
+    "fee_events": [
+      {"id": 1, "ts": 1789360100.0, "origin_kind": "sol_swap", "origin_ref": "synthetic-entry-signature", "idx": 0, "deal_id": "DSOLK1", "clip_id": 11, "kind": "network_total", "asset": "native:solana", "decimals": 9, "amount_raw": "5000", "included": 0, "estimated": 0, "refundable": 0, "superseded": 0},
+      {"id": 2, "ts": 1789363500.0, "origin_kind": "sol_swap", "origin_ref": "synthetic-exit-signature", "idx": 0, "deal_id": "DSOLK1", "clip_id": 12, "kind": "network_total", "asset": "native:solana", "decimals": 9, "amount_raw": "6000", "included": 0, "estimated": 0, "refundable": 0, "superseded": 0},
+      {"id": 3, "ts": 1789360100.0, "origin_kind": "sol_swap", "origin_ref": "synthetic-entry-signature", "idx": 1, "deal_id": "DSOLK1", "clip_id": 11, "kind": "provider_fee", "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "decimals": 6, "amount_raw": "2000", "included": 0, "estimated": 0, "refundable": 0, "superseded": 0},
+      {"id": 4, "ts": 1789360100.0, "origin_kind": "sol_swap", "origin_ref": "synthetic-entry-signature", "idx": 2, "deal_id": "DSOLK1", "clip_id": 11, "kind": "rent_deposit", "asset": "native:solana", "decimals": 9, "amount_raw": "2039280", "included": 0, "estimated": 0, "refundable": 1, "superseded": 0},
+      {"id": 5, "ts": 1789363500.0, "origin_kind": "sol_swap", "origin_ref": "synthetic-exit-signature", "idx": 1, "deal_id": "DSOLK1", "clip_id": 12, "kind": "rent_refund", "asset": "native:solana", "decimals": 9, "amount_raw": "2039280", "included": 0, "estimated": 0, "refundable": 1, "superseded": 0}
+    ],
+    "ingest_cursors": [
+      {"scope": "hl:mainnet:0xabc123:para:SYN:fills", "watermark_ms": 1789363600000, "complete": 1, "updated": 1789363600.0},
+      {"scope": "hl:mainnet:0xabc123:para:SYN:funding", "watermark_ms": 1789363600000, "complete": 1, "updated": 1789363600.0}
+    ],
+    "operations": [
+      {"id": "OSOLK1", "deal_id": "DSOLK1", "profile_id": "sol_best_hyperliquid", "inst_hash": "cbad1e45a2347250", "mode": "live", "side": "exit", "target_kind": "token_raw_to_sell", "target_asset": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump", "target_decimals": 6, "target_raw": "2000000", "confirmed_raw": "2000000", "reserved_raw": "0", "approval_version": 1, "state": "CLOSED", "created": 1789363400.0, "updated": 1789363600.0}
+    ],
+    "operation_intents": [{"intent_id": "XSOLK1", "operation_id": "OSOLK1", "seq": 1}]
+  },
+  "ingest_batches": {
+    "hl_fills": [
+      {"rows": [
+        {"network": "mainnet", "account": "0xABC123", "coin": "para:SYN", "time": 1789360100000, "tid": 701, "oid": 501, "cloid": "0x00000000000000000000000000000101", "side": "A", "px": "2550", "sz": "0.002", "fee": "0.003", "fee_token": "USDC", "builder_fee": "0.001", "closed_pnl": "0", "hash": "0xsynthetic701"}
+      ]},
+      {"rows": [
+        {"network": "mainnet", "account": "0xabc123", "coin": "para:SYN", "time": 1789360100000, "tid": 701, "oid": 501, "cloid": "0x00000000000000000000000000000101", "side": "A", "px": "2550", "sz": "0.002", "fee": "0.003", "fee_token": "USDC", "builder_fee": "0.001", "closed_pnl": "0", "hash": "0xsynthetic701"},
+        {"network": "mainnet", "account": "0xabc123", "coin": "para:SYN", "time": 1789363550000, "tid": 702, "oid": 502, "cloid": "0x00000000000000000000000000000102", "side": "B", "px": "2700", "sz": "0.002", "fee": "0.004", "fee_token": "USDC", "builder_fee": null, "closed_pnl": "-0.3", "hash": "0xsynthetic702"}
+      ]},
+      {"rows": [
+        {"network": "mainnet", "account": "0xother", "coin": "para:SYN", "time": 1789360100000, "tid": 701, "oid": 999, "cloid": null, "side": "A", "px": "999", "sz": "1", "fee": "9", "fee_token": "USDC", "builder_fee": null, "closed_pnl": "0", "hash": "0xother701"}
+      ]}
+    ],
+    "hl_funding": [
+      {"rows": [
+        {"network": "mainnet", "account": "0xABC123", "coin": "para:SYN", "time": 1789361000000, "hash": "", "usdc": "0.2", "szi": "-0.002", "rate": "0.0001"},
+        {"network": "mainnet", "account": "0xabc123", "coin": "para:SYN", "time": 1789362000000, "hash": "", "usdc": "-0.05", "szi": "-0.002", "rate": "-0.000025"}
+      ]},
+      {"rows": [
+        {"network": "mainnet", "account": "0xabc123", "coin": "para:SYN", "time": 1789362000000, "hash": "", "usdc": "-0.05", "szi": "-0.002", "rate": "-0.000025"},
+        {"network": "mainnet", "account": "0xabc123", "coin": "para:SYN", "time": 1789367200000, "hash": "", "usdc": "8", "szi": "0", "rate": "0"}
+      ]},
+      {"rows": [
+        {"network": "mainnet", "account": "0xother", "coin": "para:SYN", "time": 1789361000000, "hash": "", "usdc": "99", "szi": "-1", "rate": "0.1"}
+      ]}
+    ]
+  },
+  "expected_ingest_counts": {"hl_fills": [1, 1, 1], "hl_funding": [2, 1, 1]},
+  "known_gaps": []
+}

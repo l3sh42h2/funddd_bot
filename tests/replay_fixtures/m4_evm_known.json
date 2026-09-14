@@ -1,0 +1,91 @@
+{
+  "fixture_version": 1,
+  "name": "evm_known_multiplier_partial_pages",
+  "oracle_base_sha": "95354c4",
+  "expected_oracle_sha256": "4941a086a64609ceadec2335f72a5d1c2419edd917b4b88586d93c7a70fc518f",
+  "synthetic": true,
+  "family": "evm",
+  "as_of_ms": 1789363600000,
+  "quote_decimals": 6,
+  "quote_asset": "USDG",
+  "fee_rate": "0.0005",
+  "native_price_quote": "2000",
+  "tables": {
+    "deals": [
+      {
+        "id": "DEVMK1",
+        "created": 1789360000.0,
+        "state": "CLOSED",
+        "coin": "SYN",
+        "chain": "robinhood",
+        "token": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token_dec": 6,
+        "perp_venue": "gate",
+        "symbol": "1000SYN_USDT",
+        "leg_usd": "100",
+        "owner_json": "{}",
+        "sim": 0,
+        "carry": "0",
+        "dust": "0",
+        "updated": 1789363600.0,
+        "inst_json": "{\"chain\":\"robinhood\",\"contract_type\":\"PERPETUAL\",\"ident_ev\":\"synthetic\",\"period_h\":\"1\",\"perp_base_asset\":\"1000SYN\",\"perp_symbol\":\"1000SYN_USDT\",\"perp_venue\":\"gate\",\"px_ratio\":\"1\",\"quote_asset\":\"USDT\",\"schema\":1,\"source\":\"fixture:frozen\",\"spot_units_per_token\":\"1\",\"token\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"token_dec\":6,\"units_per_contract\":\"1000\",\"verified\":true,\"verified_ts\":1789360000.0,\"why\":null}",
+        "perp_scope": null
+      }
+    ],
+    "intents": [
+      {"id": "EEVMK1", "deal_id": "DEVMK1", "kind": "entry", "status": "done", "created": 1789360000.0},
+      {"id": "XEVMK1", "deal_id": "DEVMK1", "kind": "exit", "status": "done", "created": 1789363500.0}
+    ],
+    "clips": [
+      {"id": 1, "intent_id": "EEVMK1", "seq": 1, "state": "BALANCED", "planned_in": "100000000", "dex_in": "100000000", "dex_out": "1200000000", "perp_qty": "1.2", "perp_quote": "120"},
+      {"id": 2, "intent_id": "XEVMK1", "seq": 1, "state": "BALANCED", "planned_in": "1200000000", "dex_in": "1200000000", "dex_out": "110000000", "perp_qty": "1.2", "perp_quote": "108"}
+    ],
+    "perp_orders": [
+      {"id": 1, "clip_id": 1, "client_id": "fb-DEVMK1-e01-c1-a1", "venue": "gate", "symbol": "1000SYN_USDT", "side": "SELL", "state": "FILLED", "order_id": 11, "executed_qty": "1.2", "avg_price": "100", "cum_quote": "120"},
+      {"id": 2, "clip_id": 2, "client_id": "fb-DEVMK1-x01-c1-a1", "venue": "gate", "symbol": "1000SYN_USDT", "side": "BUY", "state": "PARTIALLY_FILLED", "order_id": 12, "executed_qty": "1.2", "avg_price": "90", "cum_quote": "108"}
+    ],
+    "dex_txs": [
+      {"id": 1, "clip_id": 1, "kind": "swap", "chain": "robinhood", "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nonce": 7, "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111", "state": "MINED_OK", "status": 1, "gas_used": 21000, "eff_gas_price": "1000000000", "amount_in": "100000000", "amount_out": "1200000000"},
+      {"id": 2, "clip_id": 2, "kind": "swap", "chain": "robinhood", "wallet": "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "nonce": 8, "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222", "state": "MINED_OK", "status": 1, "gas_used": 30000, "eff_gas_price": "1000000000", "amount_in": "1200000000", "amount_out": "110000000"}
+    ],
+    "operations": [
+      {"id": "OEVMK1", "deal_id": "DEVMK1", "profile_id": "rh_okx_gate", "inst_hash": "07f16e59a0e3e37b", "mode": "live", "side": "exit", "target_kind": "token_raw_to_sell", "target_asset": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "target_decimals": 6, "target_raw": "1200000000", "confirmed_raw": "1200000000", "reserved_raw": "0", "approval_version": 1, "state": "CLOSED", "created": 1789363400.0, "updated": 1789363600.0}
+    ],
+    "operation_intents": [
+      {"intent_id": "XEVMK1", "operation_id": "OEVMK1", "seq": 1}
+    ],
+    "core_notifications": [
+      {"id": 1, "payload": "{\"kind\":\"send\",\"operation_id\":\"OEVMK1\",\"text\":\"synthetic closed\"}", "created": 1789363600.0, "delivered": 1789363601.0, "result": "{\"message_id\":1}"}
+    ]
+  },
+  "ingest_batches": {
+    "perp_fills": [
+      {"venue": "gate", "rows": [
+        {"trade_id": 101, "order_id": 11, "price": "100", "qty": "0.7", "quote_qty": "70", "commission_abs": "0.03", "commission_asset": "USDT", "maker": false, "realized_pnl": "0", "ts": 1789360100000},
+        {"trade_id": 102, "order_id": 11, "price": "100", "qty": "0.5", "quote_qty": "50", "commission_abs": "0.02", "commission_asset": "USDT", "maker": false, "realized_pnl": "0", "ts": 1789360110000}
+      ]},
+      {"venue": "gate", "rows": [
+        {"trade_id": 102, "order_id": 11, "price": "100", "qty": "0.5", "quote_qty": "50", "commission_abs": "0.02", "commission_asset": "USDT", "maker": false, "realized_pnl": "0", "ts": 1789360110000},
+        {"trade_id": 103, "order_id": 12, "price": "90", "qty": "1.2", "quote_qty": "108", "commission_abs": "0.04", "commission_asset": "USDT", "maker": false, "realized_pnl": "12", "ts": 1789363550000}
+      ]},
+      {"venue": "aster", "rows": [
+        {"trade_id": 101, "order_id": 999, "price": "1", "qty": "1", "quote_qty": "1", "commission_abs": "0.5", "commission_asset": "USDT", "maker": false, "realized_pnl": "0", "ts": 1789360200000}
+      ]}
+    ],
+    "funding_income": [
+      {"venue": "gate", "rows": [
+        {"tran_id": 201, "symbol": "1000SYN_USDT", "income": "0.4", "ts": 1789361000000},
+        {"tran_id": 202, "symbol": "1000SYN_USDT", "income": "-0.1", "ts": 1789362000000}
+      ]},
+      {"venue": "gate", "rows": [
+        {"tran_id": 202, "symbol": "1000SYN_USDT", "income": "-0.1", "ts": 1789362000000},
+        {"tran_id": 203, "symbol": "1000SYN_USDT", "income": "9", "ts": 1789367200000}
+      ]},
+      {"venue": "aster", "rows": [
+        {"tran_id": 201, "symbol": "1000SYN_USDT", "income": "99", "ts": 1789361000000}
+      ]}
+    ]
+  },
+  "expected_ingest_counts": {"perp_fills": [2, 1, 1], "funding_income": [2, 1, 1]},
+  "known_gaps": ["legacy EVM fill and funding keys are venue-scoped, not account-scoped; missing historical account scope is not invented"]
+}

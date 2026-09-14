@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "name": "evm_unknown_crash_duplicate_notification",
+  "oracle_base_sha": "95354c4",
+  "expected_oracle_sha256": "610039c6e74b8c2871e4db96d3187a1dc9d8b2ec43af8508bb15f59c23412034",
+  "synthetic": true,
+  "family": "evm",
+  "as_of_ms": 1789363600000,
+  "quote_decimals": 6,
+  "quote_asset": "USDG",
+  "fee_rate": "0.0005",
+  "native_price_quote": null,
+  "tables": {
+    "deals": [
+      {"id": "DEVMU1", "created": 1789360000.0, "state": "PAUSED", "reason": "dex_unknown", "coin": "SYN", "chain": "robinhood", "token": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "token_dec": 6, "perp_venue": "gate", "symbol": "1000SYN_USDT", "leg_usd": "100", "owner_json": "{}", "sim": 0, "carry": "0", "dust": "0", "updated": 1789363600.0, "inst_json": "{\"chain\":\"robinhood\",\"contract_type\":\"PERPETUAL\",\"ident_ev\":\"synthetic\",\"period_h\":\"1\",\"perp_base_asset\":\"1000SYN\",\"perp_symbol\":\"1000SYN_USDT\",\"perp_venue\":\"gate\",\"px_ratio\":\"1\",\"quote_asset\":\"USDT\",\"schema\":1,\"source\":\"fixture:frozen\",\"spot_units_per_token\":\"1\",\"token\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"token_dec\":6,\"units_per_contract\":\"1000\",\"verified\":true,\"verified_ts\":1789360000.0,\"why\":null}", "perp_scope": null}
+    ],
+    "intents": [
+      {"id": "EEVMU1", "deal_id": "DEVMU1", "kind": "entry", "status": "interrupted", "created": 1789360000.0}
+    ],
+    "clips": [
+      {"id": 20, "intent_id": "EEVMU1", "seq": 1, "state": "DEX_UNKNOWN", "planned_in": "60000000", "dex_in": null, "dex_out": null},
+      {"id": 21, "intent_id": "EEVMU1", "seq": 2, "state": "BALANCED", "planned_in": "40000000", "dex_in": null, "dex_out": "480000000", "perp_qty": "0.48", "perp_quote": null}
+    ],
+    "perp_orders": [
+      {"id": 20, "clip_id": 20, "client_id": "fb-DEVMU1-e01-c1-a1", "venue": "gate", "symbol": "1000SYN_USDT", "side": "SELL", "state": "UNKNOWN", "order_id": null, "executed_qty": null, "cum_quote": null},
+      {"id": 21, "clip_id": 21, "client_id": "fb-DEVMU1-e02-c1-a1", "venue": "gate", "symbol": "1000SYN_USDT", "side": "SELL", "state": "PARTIALLY_FILLED", "order_id": 21, "executed_qty": "0.48", "cum_quote": null}
+    ],
+    "dex_txs": [
+      {"id": 20, "clip_id": 20, "kind": "swap", "chain": "robinhood", "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nonce": 20, "tx_hash": "0x9999999999999999999999999999999999999999999999999999999999999999", "state": "SENT", "status": null, "gas_used": null, "eff_gas_price": null}
+    ],
+    "operations": [
+      {"id": "OEVMU1", "deal_id": "DEVMU1", "profile_id": "rh_okx_gate", "inst_hash": "07f16e59a0e3e37b", "mode": "live", "side": "entry", "target_kind": "stable_raw_budget", "target_asset": "0x5fc5360d0400a0fd4f2af552add042d716f1d168", "target_decimals": 6, "target_raw": "100000000", "confirmed_raw": "40000000", "reserved_raw": "60000000", "approval_version": 1, "state": "PAUSED_UNKNOWN", "reason": "process crash after send", "created": 1789360000.0, "updated": 1789363600.0}
+    ],
+    "operation_intents": [{"intent_id": "EEVMU1", "operation_id": "OEVMU1", "seq": 1}],
+    "core_notifications": [
+      {"id": 20, "payload": "{\"kind\":\"send\",\"operation_id\":\"OEVMU1\",\"text\":\"synthetic unknown\"}", "created": 1789363600.0},
+      {"id": 21, "payload": "{\"kind\":\"send\",\"operation_id\":\"OEVMU1\",\"text\":\"synthetic unknown\"}", "created": 1789363601.0}
+    ]
+  },
+  "ingest_batches": {},
+  "expected_ingest_counts": {},
+  "known_gaps": ["legacy EVM journal has no account namespace for fills/funding", "unknown signed transaction keeps its reserve and requires evidence-based recovery"]
+}

@@ -1,0 +1,38 @@
+{
+  "fixture_version": 1,
+  "name": "solana_unknown_after_sign_and_hl_ack",
+  "oracle_base_sha": "95354c4",
+  "expected_oracle_sha256": "aac16939e2696853dd694b9c388a9598166d665b9957347e75d6de37c89c9e78",
+  "synthetic": true,
+  "family": "solana",
+  "as_of_ms": 1789363600000,
+  "quote_decimals": 6,
+  "quote_asset": "USDC",
+  "fee_rate": "0.000675",
+  "native_price_quote": "150",
+  "tables": {
+    "deals": [
+      {"id": "DSOLU1", "created": 1789360000.0, "state": "PAUSED", "reason": "unknown external outcomes", "coin": "SYN", "chain": "solana", "token": "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump", "token_dec": 6, "perp_venue": "hyperliquid", "symbol": "para:SYN", "leg_usd": "5", "owner_json": "{}", "sim": 0, "carry": "0", "dust": "0", "updated": 1789363600.0, "inst_json": "{\"chain\":\"solana\",\"contract_type\":\"PERPETUAL\",\"genesis_hash\":\"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d\",\"ident_ev\":\"synthetic\",\"identity_expires_at\":\"2099-01-01T00:00:00Z\",\"identity_hash\":\"sha256:synthetic\",\"identity_status\":\"reviewed_override\",\"instrument_id\":\"synthetic_sol_hl_v1\",\"instrument_version\":1,\"network\":\"solana-mainnet\",\"period_h\":\"1\",\"perp_account\":\"hyperliquid:mainnet:synthetic-master:0xabc123:para\",\"perp_asset_id\":999999,\"perp_base_asset\":\"SYN\",\"perp_collateral\":\"token:0\",\"perp_dex\":\"para\",\"perp_network\":\"mainnet\",\"perp_symbol\":\"para:SYN\",\"perp_venue\":\"hyperliquid\",\"profile_id\":\"sol_best_hyperliquid\",\"px_ratio\":\"1\",\"quote_asset\":\"USDC\",\"quote_dec\":6,\"quote_mint\":\"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\",\"quote_program\":\"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA\",\"schema\":2,\"source\":\"fixture:frozen\",\"spot_units_per_token\":\"1\",\"token\":\"9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump\",\"token_dec\":6,\"token_extensions\":[\"metadataPointer\"],\"token_program\":\"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb\",\"units_per_contract\":\"1000\",\"verified\":true,\"verified_ts\":1789360000.0,\"why\":null}", "perp_scope": "hyperliquid|mainnet|hyperliquid:mainnet:synthetic-master:0xabc123:para|para|para:SYN"}
+    ],
+    "intents": [{"id": "ESOLU1", "deal_id": "DSOLU1", "kind": "entry", "status": "interrupted", "created": 1789360000.0}],
+    "clips": [{"id": 30, "intent_id": "ESOLU1", "seq": 1, "state": "DEX_UNKNOWN", "planned_in": "5000000", "dex_in": null, "dex_out": null}],
+    "perp_orders": [{"id": 30, "clip_id": 30, "client_id": "fb-DSOLU1-e01-c1-a1", "venue": "hl:mainnet:0xabc123:para", "symbol": "para:SYN", "side": "SELL", "state": "UNKNOWN", "order_id": null, "executed_qty": null, "cum_quote": null}],
+    "sol_tx_attempts": [
+      {"attempt_id": "synthetic-sol-attempt-30", "network": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d", "wallet": "11111111111111111111111111111111", "logical_action_id": "spot:DSOLU1:30", "clip_ref": "30", "provider": "synthetic", "path": "synthetic-path", "request_id": "synthetic-request-30", "payload_kind": "transaction", "message_hash": "sha256:message-30", "recent_blockhash": "11111111111111111111111111111111", "last_valid_block_height": 999999, "lvbh_exact": 1, "plan_json": "{}", "signature": "synthetic-signature-30", "state": "UNKNOWN", "created": 1789360100.0, "updated": 1789360101.0}
+    ],
+    "hl_order_attempts": [
+      {"client_id": "fb-DSOLU1-e01-c1-a1", "cloid": "0x00000000000000000000000000000300", "kind": "order", "network": "mainnet", "master": "synthetic-master", "account": "0xAbC123", "signer": "synthetic-signer", "dex": "para", "fullcoin": "para:SYN", "asset": 999999, "side": "SELL", "sz": "0.005", "px": "1000", "reduce_only": 0, "nonce": 1030, "action_json": "{}", "action_hash": "sha256:action-30", "state": "UNKNOWN", "created": 1789360110.0, "deal_id": "DSOLU1", "intent_id": "ESOLU1", "clip_id": 30}
+    ],
+    "operations": [
+      {"id": "OSOLU1", "deal_id": "DSOLU1", "profile_id": "sol_best_hyperliquid", "inst_hash": "cbad1e45a2347250", "mode": "live", "side": "entry", "target_kind": "stable_raw_budget", "target_asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "target_decimals": 6, "target_raw": "5000000", "confirmed_raw": "0", "reserved_raw": "5000000", "approval_version": 1, "state": "PAUSED_UNKNOWN", "reason": "unknown after signing/ack", "created": 1789360000.0, "updated": 1789363600.0}
+    ],
+    "operation_intents": [{"intent_id": "ESOLU1", "operation_id": "OSOLU1", "seq": 1}],
+    "core_notifications": [
+      {"id": 30, "payload": "{\"kind\":\"send\",\"operation_id\":\"OSOLU1\",\"text\":\"synthetic paused unknown\"}", "created": 1789363600.0},
+      {"id": 31, "payload": "{\"kind\":\"send\",\"operation_id\":\"OSOLU1\",\"text\":\"synthetic paused unknown\"}", "created": 1789363601.0}
+    ]
+  },
+  "ingest_batches": {},
+  "expected_ingest_counts": {},
+  "known_gaps": ["unknown Solana signature and HL client action remain namespaced and unresolved", "manual resume remains required; fixture does not invent a finality result"]
+}
