@@ -211,13 +211,15 @@ def test_interrupted_first_preswitch_resumes_legacy_and_discards_copied_state(tm
     assert resumed == [True] and not paths.state.exists() and not paths.transition.exists()
 
 
-def test_prepared_transition_with_undrained_old_core_only_clears_journal(tmp_path, monkeypatch):
+@pytest.mark.parametrize('phase', ['prepared', 'switched'])
+def test_transition_with_undrained_old_core_only_clears_journal(tmp_path, monkeypatch, phase):
     paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
     old = paths.releases / 'release-old'; old.mkdir(parents=True)
     previous = {'release_id': 'release-old'}
-    af.atomic_json(old / 'release-manifest.json', previous)
+    manifest = release_manifest('release-old')
+    af.atomic_json(old / 'release-manifest.json', manifest)
     af.atomic_json(paths.release_state, previous)
-    transition = {'operation_id': 'op', 'phase': 'prepared', 'target_release_id': 'release-new',
+    transition = {'operation_id': 'op', 'phase': phase, 'target_release_id': 'release-new',
                   'db_authority': 'state', 'previous_state': previous, 'ui_only': False}
     af.atomic_json(paths.transition, transition)
     class Commands:
@@ -225,11 +227,18 @@ def test_prepared_transition_with_undrained_old_core_only_clears_journal(tmp_pat
     class Client:
         def call(self, method, payload):
             assert method == 'get_status'
-            return {'drain': False}
+            return {'ready': True, 'release_id': 'release-old',
+                    'source_sha256': manifest['source_sha256'], 'artifact_sha256': manifest['artifact_sha256'],
+                    'ipc_version': 1, 'schema_version': 2, 'drain': False,
+                    'drain_epoch': 'old-epoch', 'recovery_complete': True,
+                    'execution_lock_held': True}
     monkeypatch.setattr(job, 'restore_before_switch', lambda *a, **k: pytest.fail('old core is already healthy'))
+    verified = []
+    monkeypatch.setattr(job, 'wait_components', lambda *a, **k: verified.append(True))
     with pytest.raises(job.DeployFailure, match='RESNAPSHOT'):
         job.recover_transition(paths, Commands(), Client, transition)
-    assert not paths.transition.exists() and json.loads(paths.release_state.read_text()) == previous
+    assert verified == [True] and not paths.transition.exists()
+    assert json.loads(paths.release_state.read_text()) == previous
 
 
 def test_committed_healthy_target_wins_over_leftover_transition(tmp_path, monkeypatch):
@@ -269,6 +278,19 @@ def test_inactive_first_target_without_core_meta_is_fenced_by_start_config_and_l
     state = json.loads(paths.release_state.read_text())
     assert state['release_id'] == 'release-new' and state['drain'] is True
     assert not paths.transition.exists()
+
+
+def test_offline_fence_cancels_systemd_restart_backoff_before_install(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    events = []
+    class Commands:
+        def run(self, argv, **kwargs):
+            events.append(' '.join(map(str, argv)))
+            return subprocess.CompletedProcess(argv, 0, '')
+    monkeypatch.setattr(job, '_wait_inactive', lambda *a: events.append('inactive_verified'))
+    monkeypatch.setattr(job, 'execution_lock_free', lambda *a: events.append('lock_free'))
+    job.cancel_pending_core_restart(paths, Commands())
+    assert events == ['systemctl stop funding_bot-core.service', 'inactive_verified', 'lock_free']
 
 
 def test_partial_rollback_records_actual_old_link_and_retains_transition(tmp_path):

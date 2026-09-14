@@ -466,6 +466,12 @@ def prove_inactive_offline_fence(paths, commands, previous_state):
                 'release_id': previous_state.get('release_id'), 'offline_start_fence': True}
 
 
+def cancel_pending_core_restart(paths, commands):
+    commands.run(['systemctl', 'stop', 'funding_bot-core.service'])
+    _wait_inactive(commands, 'funding_bot-core.service')
+    execution_lock_free(paths.execution_lock)
+
+
 def installed_tree_sha256(root):
     values = {}
     for path in sorted(Path(root).rglob('*')):
@@ -632,6 +638,26 @@ def wait_core_ready(client, manifest, *, commands=None, drain_release_id=None,
                 raise DeployFailure('core exited before readiness: ' + last) from e
             sleep(2)
     raise DeployFailure('core readiness timeout: ' + last)
+
+
+def wait_core_live_ready(client, manifest, *, commands=None, timeout=180, sleep=time.sleep):
+    deadline = time.monotonic() + timeout
+    last = 'not checked'
+    while time.monotonic() < deadline:
+        try:
+            value = health_matches(client.call('get_status', {}), manifest,
+                                   require_drain=False, require_recovery=False)
+            if value.get('drain') is not False:
+                raise DeployFailure('core unexpectedly drained')
+            return value
+        except (IpcRefused, DeployFailure) as e:
+            last = str(e)
+            if commands is not None and commands.run(
+                    ['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'],
+                    check=False).returncode != 0:
+                raise DeployFailure('core exited before live readiness: ' + last) from e
+            sleep(2)
+    raise DeployFailure('core live readiness timeout: ' + last)
 
 
 def _service_pid(commands, name):
@@ -886,7 +912,7 @@ def recover_transition(paths, commands, client_factory, transition):
             resume_legacy(paths, commands)
             if str(transition.get('db_authority', '')).startswith('legacy') and paths.state.exists():
                 shutil.rmtree(paths.state)
-        elif transition.get('phase') == 'prepared':
+        else:
             active = commands.run(['systemctl', 'is-active', '--quiet', 'funding_bot-core.service'],
                                   check=False).returncode == 0
             if active:
@@ -894,16 +920,28 @@ def recover_transition(paths, commands, client_factory, transition):
                 if health.get('drain') is True:
                     restore_before_switch(paths, commands, client_factory, previous_release,
                                           previous_manifest, drain_release_id=target_id)
-                # An undrained old core means begin_drain had not mutated it.
+                else:
+                    health_matches(health, previous_manifest, require_drain=False,
+                                   require_recovery=False)
+                    commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
+                    commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+                    wait_components(paths, commands, previous_manifest)
             else:
-                restore_before_switch(paths, commands, client_factory, previous_release,
-                                      previous_manifest, drain_release_id=target_id)
-        elif transition.get('ui_only'):
-            restore_ui_before_switch(commands, previous_release)
-            commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
-        else:
-            restore_before_switch(paths, commands, client_factory, previous_release, previous_manifest,
-                                  drain_release_id=target_id)
+                if previous.get('status') != 'healthy':
+                    prove_inactive_offline_fence(paths, commands, previous)
+                else:
+                    try:
+                        durable_drain(paths.state / 'core/trade.db')
+                    except DeployFailure:
+                        install_units(previous_release, commands)
+                        commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
+                        commands.run(['systemctl', 'start', 'funding_bot-core.service'])
+                        wait_core_live_ready(client_factory(), previous_manifest, commands=commands)
+                        commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
+                        wait_components(paths, commands, previous_manifest)
+                    else:
+                        restore_before_switch(paths, commands, client_factory, previous_release,
+                                              previous_manifest, drain_release_id=target_id)
         if previous is not None:
             af.atomic_json(paths.release_state, previous)
         clear_transition(paths)
@@ -1011,6 +1049,9 @@ class Job:
                 else:
                     offline = prove_inactive_offline_fence(p, self.commands, previous_state)
                     drain_owner_release = offline.get('release_id') or previous_state['release_id']
+                    # is-active=false can be a RestartSec backoff. Explicit stop
+                    # cancels the pending restart before the long offline install.
+                    cancel_pending_core_restart(p, self.commands)
                     report['stages'].append('offline_fence_proved')
                 write_transition(p, transition, 'fenced')
                 report['stages'].append('drained')
