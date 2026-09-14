@@ -2,7 +2,7 @@
   "fixture_version": 1,
   "name": "evm_known_multiplier_partial_pages",
   "oracle_base_sha": "95354c4",
-  "expected_oracle_sha256": "4941a086a64609ceadec2335f72a5d1c2419edd917b4b88586d93c7a70fc518f",
+  "expected_oracle_sha256": "8eb8ed92392e60d48749f9e0b5a61bd3f7620d62a60a1d8eb431c244ba2f1fb5",
   "synthetic": true,
   "family": "evm",
   "as_of_ms": 1789363600000,

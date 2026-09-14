@@ -29,15 +29,6 @@ def test_evm_known_facts_match_frozen_oracle_exactly():
         "spot_raw": 0, "perp_contracts": "0", "spot_base_units": "0", "perp_base_units": "0",
         "delta_base_units": "0", "known": True, "unknown_reasons": [],
     }
-    assert result.actual["cost_basis"] == {
-        "spot_acquired_raw": 1_200_000_000,
-        "spot_quote_cost": "100",
-        "spot_avg_entry_price": "0.08333333333333333333333333333",
-        "perp_opened_contracts": "1.2",
-        "perp_quote_credit": "120",
-        "perp_avg_entry_price": "100",
-        "complete": True,
-    }
     assert result.actual["accounting"]["fees"] == {
         "perp_quote": "0.09", "estimated": False, "network_native": "0.000051", "network_quote": "0.102",
     }
@@ -53,8 +44,6 @@ def test_solana_known_facts_match_and_namespaces_do_not_collide():
     assert result.actual["identity"]["inst_hash"] == "cbad1e45a2347250"
     assert result.actual["identity"]["inst_json_sha256"] == \
         "24a34bf7acc8052d5050730ea7b98e637adcb8c3973c3b638dbf29040cb64f8d"
-    assert result.actual["cost_basis"]["spot_avg_entry_price"] == "2.5"
-    assert result.actual["cost_basis"]["perp_avg_entry_price"] == "2550"
     assert result.actual["accounting"]["fees"] == {
         "perp_quote": "0.007", "estimated": False, "network_lamports": 11_000,
         "network_quote": "0.00165", "rent_locked_lamports": 0, "spot_external_quote": "0.002",
@@ -89,6 +78,62 @@ def test_field_level_mismatch_is_actionable():
     assert [(x.path, x.expected, x.actual) for x in mismatches] == [
         ("accounting.realized_pnl_quote", "22.108", "22.109")
     ]
+
+
+def test_frozen_evm_oracle_charges_reverted_receipt_gas(tmp_path):
+    fixture, _ = R.load_fixture(FIXTURES / "m4_evm_known.json")
+    fixture = copy.deepcopy(fixture)
+    fixture["tables"]["dex_txs"].append({
+        "id": 3, "clip_id": 1, "kind": "swap", "chain": "robinhood",
+        "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "nonce": 9,
+        "tx_hash": "0x" + "33" * 32, "state": "MINED_REVERTED", "status": 0,
+        "gas_used": 10_000, "eff_gas_price": "1000000000",
+    })
+    oracle = R.oracle_projection(fixture)
+    con, _ = R.materialize_fixture(fixture, tmp_path / "trade.db")
+    try:
+        actual = R.current_projection(con, fixture)
+    finally:
+        con.close()
+    assert oracle["accounting"]["fees"]["network_native"] == "0.000061"
+    assert actual["accounting"]["fees"]["network_native"] == "0.000061"
+
+
+def test_frozen_evm_fee_coverage_uses_one_cent_tolerance(tmp_path):
+    fixture, _ = R.load_fixture(FIXTURES / "m4_evm_known.json")
+    fixture = copy.deepcopy(fixture)
+    # Order quote 120; actual fill coverage 119.995. Frozen marks.FEE_TOL=.01 treats the .005 gap as rounding.
+    for batch in fixture["ingest_batches"]["perp_fills"]:
+        for row in batch["rows"]:
+            if batch["venue"] == "gate" and row.get("order_id") == 11 and row.get("trade_id") == 101:
+                row["quote_qty"] = "69.995"
+    accounting = R.oracle_projection(fixture)["accounting"]
+    con, _ = R.materialize_fixture(fixture, tmp_path / "trade.db")
+    try:
+        actual = R.current_projection(con, fixture)["accounting"]
+    finally:
+        con.close()
+    assert accounting["fees"]["estimated"] is False
+    assert accounting["fees"]["perp_quote"] == "0.09"
+    assert actual["fees"]["estimated"] is False
+    assert actual["fees"]["perp_quote"] == "0.09"
+
+
+def test_open_evm_funding_window_ends_at_as_of_not_deal_updated(tmp_path):
+    fixture, _ = R.load_fixture(FIXTURES / "m4_evm_unknown_recovery.json")
+    fixture = copy.deepcopy(fixture)
+    fixture["tables"]["deals"][0]["updated"] = 1789361000.0
+    fixture["ingest_batches"] = {"funding_income": [{"venue": "gate", "rows": [{
+        "tran_id": 900, "symbol": "1000SYN_USDT", "income": "0.25", "ts": 1789362000000,
+    }]}]}
+    accounting = R.oracle_projection(fixture)["accounting"]
+    con, _ = R.materialize_fixture(fixture, tmp_path / "trade.db")
+    try:
+        actual = R.current_projection(con, fixture)["accounting"]
+    finally:
+        con.close()
+    assert accounting["funding"] == {"quote": "0.25", "events": 1, "complete": True}
+    assert actual["funding"] == accounting["funding"]
 
 
 def test_cli_does_not_green_unsafe_legacy_fallback():

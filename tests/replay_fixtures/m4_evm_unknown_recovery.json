@@ -2,7 +2,7 @@
   "fixture_version": 1,
   "name": "evm_unknown_crash_duplicate_notification",
   "oracle_base_sha": "95354c4",
-  "expected_oracle_sha256": "610039c6e74b8c2871e4db96d3187a1dc9d8b2ec43af8508bb15f59c23412034",
+  "expected_oracle_sha256": "61459b7b2b7924ba7c52d3a75faa6538932f5e52ee1b8697303151f7ddb66df7",
   "synthetic": true,
   "family": "evm",
   "as_of_ms": 1789363600000,

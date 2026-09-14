@@ -18,6 +18,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from decimal import Decimal as D
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from funding_bot import config
@@ -318,32 +319,6 @@ def _positions(deal: dict, clips: list[dict], intents: list[dict], orders: list[
             "unknown_reasons": why}
 
 
-def _cost_basis(clips: list[dict], intents: list[dict], orders: list[dict], token_dec: int, quote_dec: int) -> dict:
-    kinds = {x["id"]: x["kind"] for x in intents}
-    all_entry = [c for c in clips if kinds[c["intent_id"]] == "entry"]
-    entry_clips = [c for c in all_entry if c.get("state") in FLOW_STATES]
-    spot_unknown = any(c.get("state") in {"DEX_SENT", "DEX_UNKNOWN"} or
-                       (c.get("state") in FLOW_STATES and None in (c.get("dex_in"), c.get("dex_out")))
-                       for c in all_entry)
-    spot_raw = None if spot_unknown else sum(int(c["dex_out"]) for c in entry_clips)
-    spot_quote = None if spot_unknown else sum((_div(D(int(c["dex_in"])), quote_dec) for c in entry_clips), D(0))
-    entry_ids = {int(c["id"]) for c in all_entry}
-    entry_orders = [o for o in orders if int(o.get("clip_id") or -1) in entry_ids and o.get("side") == "SELL"]
-    perp_unknown = any(o.get("state") in OPEN_PERP_STATES or
-                       (o.get("state") in FILLED_STATES and None in (o.get("executed_qty"), o.get("cum_quote")))
-                       for o in entry_orders)
-    opens = [o for o in entry_orders if o.get("state") in FILLED_STATES]
-    contracts = None if perp_unknown else sum((_d(o["executed_qty"]) for o in opens), D(0))
-    quote = None if perp_unknown else sum((_d(o["cum_quote"]) for o in opens), D(0))
-    tokens = None if spot_raw is None else _div(D(spot_raw), token_dec)
-    complete = not spot_unknown and not perp_unknown
-    return {"spot_acquired_raw": spot_raw, "spot_quote_cost": _ds(spot_quote),
-            "spot_avg_entry_price": _ds(spot_quote / tokens) if spot_quote is not None and tokens else None,
-            "perp_opened_contracts": _ds(contracts), "perp_quote_credit": _ds(quote),
-            "perp_avg_entry_price": _ds(quote / contracts) if quote is not None and contracts else None,
-            "complete": complete}
-
-
 def _operation_state(fixture: dict, deal_id: str) -> dict:
     ops = [x for x in _fixture_rows(fixture, "operations") if x.get("deal_id") == deal_id]
     active = []
@@ -378,8 +353,45 @@ def _operation_state(fixture: dict, deal_id: str) -> dict:
                               if x.get("deal_id") == deal_id},
             "clip_states": {str(x["id"]): x["state"] for x in _fixture_rows(fixture, "clips")},
             "active_operations": active, "unresolved_evm": dex_unknown, "unresolved_solana": sol_unknown,
-            "unresolved_hl": hl_unknown, "notification_payload_multiplicity": sorted(groups.values()),
-            "notification_trade_actions": 0}
+            "unresolved_hl": hl_unknown, "notification_payload_multiplicity": sorted(groups.values())}
+
+
+def _current_state(con: sqlite3.Connection, deal_id: str) -> dict:
+    """Read the target store rather than reusing the fixture oracle projection."""
+    active = []
+    for row in con.execute("SELECT * FROM operations WHERE deal_id=? ORDER BY id", (deal_id,)):
+        op = dict(row)
+        if op["state"] in ACTIVE_OP_STATES:
+            active.append({"id": op["id"], "state": op["state"], "target_raw": int(op["target_raw"]),
+                           "confirmed_raw": int(op["confirmed_raw"]), "reserved_raw": int(op["reserved_raw"]),
+                           "remaining_unreserved_raw": store.operation_remaining(op),
+                           "manual_resume_required": op["state"] in {"PARTIAL", "STOPPED", "PAUSED_RISK",
+                                                                            "PAUSED_UNKNOWN"}})
+    groups: dict[str, int] = {}
+    for (raw,) in con.execute("SELECT payload FROM core_notifications ORDER BY id"):
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            payload = {"malformed": True}
+        digest = _sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+        groups[digest] = groups.get(digest, 0) + 1
+    return {
+        "deal_state": con.execute("SELECT state FROM deals WHERE id=?", (deal_id,)).fetchone()[0],
+        "intent_states": {r[0]: r[1] for r in con.execute(
+            "SELECT id,status FROM intents WHERE deal_id=? ORDER BY id", (deal_id,))},
+        "clip_states": {str(r[0]): r[1] for r in con.execute(
+            "SELECT c.id,c.state FROM clips c JOIN intents i ON i.id=c.intent_id WHERE i.deal_id=? ORDER BY c.id",
+            (deal_id,))},
+        "active_operations": active,
+        "unresolved_evm": sorted(str(r[0]) for r in con.execute(
+            "SELECT tx_hash FROM dex_txs WHERE state IN ('SIGNED','SENT','UNKNOWN')")),
+        "unresolved_solana": sorted(f"{r[0]}:{r[1]}:{r[2]}" for r in con.execute(
+            "SELECT network,wallet,attempt_id FROM sol_tx_attempts "
+            "WHERE state IN ('BROADCAST_ATTEMPTED','SIGNED_DURABLE','UNKNOWN')")),
+        "unresolved_hl": sorted(f"{r[0]}:{str(r[1]).lower()}:{r[2]}" for r in con.execute(
+            "SELECT network,account,client_id FROM hl_order_attempts WHERE state IN ('SIGNED','SENT','UNKNOWN')")),
+        "notification_payload_multiplicity": sorted(groups.values()),
+    }
 
 
 def _oracle_evm(fixture: dict, deal: dict, intents: list[dict], clips: list[dict], orders: list[dict], inst: dict) -> dict:
@@ -409,16 +421,20 @@ def _oracle_evm(fixture: dict, deal: dict, intents: list[dict], clips: list[dict
             else:
                 covered += fq
         fees += paid
-        if not trust and q - covered > D("0.000001"):
+        # Frozen 95354c4 marks.FEE_TOL: sub-cent coverage gaps are rounding, not an estimated extra fee.
+        if not trust and q - covered > D("0.01"):
             fees += (q - covered) * _d(fixture["fee_rate"])
             fees_est = True
-    start, end = int(float(deal["created"]) * 1000), int(float(deal["updated"]) * 1000)
+    start = int(float(deal["created"]) * 1000)
+    end = int(float(deal["updated"]) * 1000) if deal["state"] in {"CLOSED", "ABORTED"} else int(fixture["as_of_ms"])
     funds = [x for x in _fixture_rows(fixture, "funding_income") if x["venue"] == deal["perp_venue"] and
              x["symbol"] == deal["symbol"] and start <= int(x["ts"]) <= end]
     funding = sum((_d(x["income"]) or D(0) for x in funds), D(0))
     gas_native = D(0)
     for tx in _fixture_rows(fixture, "dex_txs"):
-        if tx.get("status") == 1 and tx.get("gas_used") is not None and tx.get("eff_gas_price") is not None:
+        # EVM charges receipt gas on both success and revert; report.gas_totals at 95354c4 does not filter status.
+        if tx.get("gas_used") is not None and tx.get("eff_gas_price") is not None and \
+                tx.get("kind") in {"approve", "swap", "bump", "cancel"}:
             gas_native += D(int(tx["gas_used"])) * D(int(tx["eff_gas_price"])) / D(10) ** 18
     native_px = _d(fixture.get("native_price_quote"))
     gas_quote = None if gas_native and native_px is None else gas_native * (native_px or D(0))
@@ -519,8 +535,6 @@ def oracle_projection(fixture: dict) -> dict:
         _oracle_sol(fixture, deal, intents, clips, orders, inst)
     return {"deal_id": deal["id"], "family": fixture["family"], "as_of_ms": int(fixture["as_of_ms"]),
             "identity": identity, "positions": _positions(deal, clips, intents, orders, inst),
-            "cost_basis": _cost_basis(clips, intents, orders, int(deal["token_dec"]),
-                                      int(fixture["quote_decimals"])),
             "accounting": body, "state": _operation_state(fixture, deal["id"])}
 
 
@@ -565,19 +579,25 @@ def current_projection(con: sqlite3.Connection, fixture: dict) -> dict:
              "legacy_perp_net": _ds(pf.legacy_net)}
     missing = [*clip_missing, *sf.missing, *order_missing, *pf.missing]
     if fixture["family"] == "evm":
-        j = marks.journal(con, deal, until_ms=int(fixture["as_of_ms"]))
         native_px = _d(fixture.get("native_price_quote"))
+        mark_deal = dict(deal)
+        if deal["state"] not in {"CLOSED", "ABORTED"}:
+            mark_deal["updated"] = int(fixture["as_of_ms"]) / 1000
+        final = marks.final_mark(con, mark_deal, SimpleNamespace(native_px=lambda: native_px),
+                                 now=int(fixture["as_of_ms"]) / 1000)
+        j = marks.journal(con, mark_deal, until_ms=int(float(mark_deal["updated"]) * 1000))
         gas_quote = j.gas_usd(native_px)
-        pnl = None if missing or gas_quote is None else j.spot_flow + j.perp_flow - j.fees + (j.funding or D(0)) - gas_quote
+        pnl = final.pnl_now
+        funding_end = int(float(mark_deal["updated"]) * 1000)
         body = {"flows": flows, "missing_monetary_evidence": missing,
                 "fees": {"perp_quote": _ds(j.fees), "estimated": bool(j.fees_est),
                          "network_native": _ds(j.gas_native), "network_quote": _ds(gas_quote)},
                 "funding": {"quote": _ds(j.funding), "events": con.execute(
                     "SELECT count(*) FROM funding_income WHERE venue=? AND symbol=? AND ts>=? AND ts<=?",
                     (deal["perp_venue"], deal["symbol"], int(float(deal["created"]) * 1000),
-                     int(fixture["as_of_ms"]))).fetchone()[0], "complete": True},
+                     funding_end)).fetchone()[0], "complete": True},
                 "realized_pnl_quote": _ds(pnl),
-                "accounting_complete": not missing and not j.fees_est and pnl is not None}
+                "accounting_complete": bool(final.flags.get("accounting_complete")) and not j.fees_est and pnl is not None}
     else:
         L = sol_ledger.ledger(con, deal, fee_rate=_d(fixture["fee_rate"]))
         native_px = _d(fixture.get("native_price_quote"))
@@ -591,15 +611,9 @@ def current_projection(con: sqlite3.Connection, fixture: dict) -> dict:
                             "complete": bool(L.funding_complete)}, "realized_pnl_quote": _ds(pnl),
                 "accounting_complete": not missing and bool(L.complete) and L.network_usdc(native_px) is not None and
                                        not L.other_unknown and pnl is not None}
-    tables = {name: _rows_from_db(con, name) for name in ("deals", "intents", "clips", "dex_txs", "operations",
-                                                                          "core_notifications", "sol_tx_attempts",
-                                                                          "hl_order_attempts")}
-    shadow = {**fixture, "tables": {**fixture.get("tables", {}), **tables}}
     return {"deal_id": did, "family": fixture["family"], "as_of_ms": int(fixture["as_of_ms"]),
             "identity": identity, "positions": positions,
-            "cost_basis": _cost_basis(clips, intents, orders, int(deal["token_dec"]),
-                                      int(fixture["quote_decimals"])),
-            "accounting": body, "state": _operation_state(shadow, did)}
+            "accounting": body, "state": _current_state(con, did)}
 
 
 def _compare(expected: Any, actual: Any, fixture: str, path: str = "") -> list[Mismatch]:
@@ -655,6 +669,7 @@ def replay_fixture(path: Path, *, root: Path | None = None) -> ReplayResult:
     mismatches = _compare(oracle, actual, fixture["name"])
     classification = "verified_known_exact"
     gaps = list(fixture.get("known_gaps", []))
+    gaps.append("cost basis has no independent target projection in this harness; dedicated execution tests remain required")
     if oracle["accounting"]["missing_monetary_evidence"]:
         classification = "unsafe_legacy_fallback"
         gaps.append("missing monetary evidence: strict projection is unknown; legacy numeric fallback is not accepted")

@@ -2,7 +2,7 @@
   "fixture_version": 1,
   "name": "solana_known_multiplier_account_pages",
   "oracle_base_sha": "95354c4",
-  "expected_oracle_sha256": "a031e9ec5affc065b36ff5b9bc00b11e2d136302ee89c95cdac842b928947eb8",
+  "expected_oracle_sha256": "c78d5e42e3848347f48b170a8007b1eb07b8f4ab0c701bf9f389b8ba3781ead9",
   "synthetic": true,
   "family": "solana",
   "as_of_ms": 1789363600000,

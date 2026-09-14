@@ -29,11 +29,6 @@ def test_unknown_outcome_is_not_zero_and_reserve_survives_replay(name, operation
     assert acct["realized_pnl_quote"] is None and acct["accounting_complete"] is False
     assert acct["missing_monetary_evidence"]
     assert acct["flows"]["spot_net"] is None and acct["flows"]["legacy_spot_net"] == "0"
-    assert result.actual["cost_basis"] == {
-        "spot_acquired_raw": None, "spot_quote_cost": None, "spot_avg_entry_price": None,
-        "perp_opened_contracts": None, "perp_quote_credit": None, "perp_avg_entry_price": None,
-        "complete": False,
-    }
     state = result.actual["state"]
     (active,) = state["active_operations"]
     assert active == {
@@ -47,7 +42,6 @@ def test_unknown_outcome_is_not_zero_and_reserve_survives_replay(name, operation
     }
     assert state[unresolved_field]
     assert state["notification_payload_multiplicity"] == [2]
-    assert state["notification_trade_actions"] == 0
 
 
 def test_duplicate_notification_ack_is_idempotent_and_cannot_change_trading_state(tmp_path):

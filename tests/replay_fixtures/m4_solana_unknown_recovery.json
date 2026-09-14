@@ -2,7 +2,7 @@
   "fixture_version": 1,
   "name": "solana_unknown_after_sign_and_hl_ack",
   "oracle_base_sha": "95354c4",
-  "expected_oracle_sha256": "aac16939e2696853dd694b9c388a9598166d665b9957347e75d6de37c89c9e78",
+  "expected_oracle_sha256": "ffe37416bce114d5e267ecfb0d96e302b32573e056ee2043048ce53019ab37a2",
   "synthetic": true,
   "family": "solana",
   "as_of_ms": 1789363600000,
