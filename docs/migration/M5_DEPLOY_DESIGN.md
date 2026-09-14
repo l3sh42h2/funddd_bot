@@ -37,7 +37,15 @@ identity из загруженного immutable release, а не из меня�
 Mac/CLI только передаёт immutable inputs в уникальную `/var/tmp` и запускает detached `systemd-run` oneshot с
 `TimeoutStartSec=infinity`. Один server process держит стабильный `/run/lock/funding-bot-deploy.lock`; потеря SSH
 не прерывает job. Retry повторяет base/preflight/drain/health, но reuse receipt допускается только при полном
-совпадении identity.
+совпадении manifest, sources, wheel bytes, Linux runtime, `pip check/freeze` и сохранённого fingerprint всего venv.
+Перед запуском bootstrap сверяет hashes всех четырёх модулей runner, а server job связывает их с проверенным
+artifact; upload после этого root-owned и недоступен для записи deploy account.
+
+До fence/copy/switch атомарно создаётся durable transition journal. Пока он существует, `inspect-base` показывает
+transition и фактический current link, а не старый `release-state.json`. Retry под тем же flock сверяет link и
+владельца authoritative DB: до первого switch восстанавливает legacy и удаляет только неавторитетную копию state,
+после switch удерживает новую DB и fenced core; для последующих релизов выполняет только совместимый code rollback.
+Любое восстановление требует нового `inspect-base`.
 
 Для уже мигрированного core job вызывает deploy-only `begin_drain` с CAS revision, затем опрашивает тот же epoch.
 Переключение разрешено только при `safe_to_switch=true`, свежем recovery evidence, `unresolved=0`, `busy=false` и
@@ -66,13 +74,15 @@ Interface остаётся на `127.0.0.1:8792`. Уже работающий Cl
 обновляется для нового state path только на будущий естественный restart.
 
 Перед снятием drain проверяются exact identities, PID/boot id, freshness/readiness всех трёх процессов и лимит
-health 16 KiB. Затем `end_drain` требует тот же epoch и actual loaded release. Итог сохраняется атомарно в
+health 16 KiB. Collector проверяется по его public `/status`, interface — по отдельному private health-файлу.
+После startup ACK ещё раз получается свежий drain proof; потерянный ответ `end_drain` повторяется с тем же epoch,
+а успех принимается только по следующему status actual loaded release. Итог сохраняется атомарно в
 `/var/lib/funding-bot/deploy/release-state.json` и отдельный report с этапами, backup hash и health evidence.
 
 ## UI-only и rollback boundary
 
 Core не рестартует только если manifest доказывает одинаковые core/collector component hashes, dependency set,
-IPC, DTO, schema и min_reader. Тогда меняются symlink и interface, а `release-state.json` хранит разные release IDs
+Linux runtime, IPC, DTO, schema и min_reader. Тогда меняются symlink и interface, а `release-state.json` хранит разные release IDs
 компонентов. Любая неоднозначность запускает полный цикл.
 
 Rollback всегда меняет только код. Перед ним повторяются drain/recovery/lock и `compatible_readers` против текущей

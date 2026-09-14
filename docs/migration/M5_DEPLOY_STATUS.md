@@ -2,9 +2,11 @@
 
 Дата: 2026-09-14. База исполнителя: `aaf5737`; интегрирован согласованный core contract commit `ca44f45`
 (эквивалент родительского `1a37ea8`). Deploy implementation: `18b5405` плюс последующие документальные/hardening
-правки этой ветки. Production deployment не запускался.
+правки этой ветки (`2f98134`, `e98c90d`). Production deployment не запускался.
 
-Локально пройден профиль M5: 25 tests (`test_m5_deploy_*`, `test_migration_m5`, `test_core_drain`) за 0.17 s.
+Последний сфокусированный прогон deploy: 22 passed, 1 skipped (root-only Linux DAC) за 0.16 s; также пройдены
+`bash -n`, `py_compile` и `git diff --check`. Более ранний локальный профиль M5 дал 29 passed после интеграции
+финального core drain checkpoint.
 Проверяются exact fingerprint, tamper, unsafe archive, STALE_BASE до service mutations, epoch/recovery/ownership,
 WAL/state/offset/secret migration, mixed-version UI gate, reader-compatible code-only rollback, health identities и
 порядок drain → stop → backup → switch → readiness → end_drain.
@@ -13,6 +15,7 @@ WAL/state/offset/secret migration, mixed-version UI gate, reader-compatible code
 локальных Unix/TCP sockets, а не assertion торгового/deploy кода. Повтор вне sandbox и Linux functional staging ещё
 не выполнены. Полный suite на точном финальном artifact также не выполнен; receipt не создан.
 
-Независимый reviewer Astra xhigh назначен координатором и ещё не завершил проверку. Доступные token/usage counters
+Независимый reviewer Astra xhigh назначен координатором; его найденные блокеры внесены, повторная проверка ещё не
+завершена. Доступные token/usage counters
 исполнителю не предоставлены. Время всей подготовки отдельно не измерялось. Время production deploy равно нулю:
 он не проводился.
