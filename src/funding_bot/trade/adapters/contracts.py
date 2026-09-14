@@ -38,6 +38,12 @@ class Status(StrEnum):
     UNKNOWN = 'UNKNOWN'
 
 
+class RejectionKind(StrEnum):
+    PRECISION = 'precision'
+    REDUCE_ONLY = 'reduce_only'
+    OTHER = 'other'
+
+
 def decimal(value, name, *, positive=False):
     if not isinstance(value, D) or not value.is_finite() or (positive and value <= 0):
         raise AdapterError(ErrorKind.INVALID, f'{name}: finite Decimal required')
@@ -250,6 +256,7 @@ class Result:
     perp_quote: QuoteAmount | None = None
     trade_notional: QuoteAmount | None = None
     avg_price: QuoteAmount | None = None
+    rejection_kind: RejectionKind | None = None
 
     def __post_init__(self):
         if self.executed_quantity is not None and decimal(self.executed_quantity, 'executed quantity') < 0:
@@ -258,6 +265,9 @@ class Result:
             raise AdapterError(ErrorKind.INVALID, 'outcome evidence/finality required')
         if self.status == Status.UNKNOWN and self.terminal:
             raise AdapterError(ErrorKind.INVALID, 'unknown outcome is not terminal')
+        if self.rejection_kind is not None:
+            if not isinstance(self.rejection_kind, RejectionKind) or self.status != Status.REJECTED:
+                raise AdapterError(ErrorKind.INVALID, 'rejection kind requires a rejected result')
         if self.status == Status.SETTLED and (self.provisional or not self.terminal or self.executed_quantity is None):
             raise AdapterError(ErrorKind.INVALID, 'settled requires proven execution')
         if self.version not in (1, 2):

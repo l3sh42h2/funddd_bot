@@ -25,6 +25,7 @@ class Bindings:
     cancel: Callable | None = None
     clock: Callable = time.time
     authorize_cancel: Callable | None = None
+    partial_terminal: bool = False
 
 
 class NativeAdapter:
@@ -33,6 +34,8 @@ class NativeAdapter:
 
     def __init__(self, spec, bindings: Bindings):
         self.spec, self.bindings = spec, bindings
+        if type(bindings.partial_terminal) is not bool:
+            raise AdapterError(ErrorKind.CONFIG, 'partial terminal profile must be boolean')
         if spec.capabilities.market_kind != self.market_kind:
             raise AdapterError(ErrorKind.CONFIG, 'wrong adapter market kind')
         if spec.capabilities.network_family != self.network_family:
@@ -127,7 +130,8 @@ class FuturesAdapter(NativeAdapter):
     market_kind = 'perpetual'
 
     def normalize(self, native, side):
-        return outcomes.perpetual(native, self.spec.scope, spec=self.spec, side=side)
+        return outcomes.perpetual(native, self.spec.scope, spec=self.spec, side=side,
+                                  partial_terminal=self.bindings.partial_terminal)
 
 
 class EvmSpotAdapter(NativeAdapter):

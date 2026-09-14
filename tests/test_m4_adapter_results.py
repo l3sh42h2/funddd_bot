@@ -8,7 +8,7 @@ import pytest
 from funding_bot.trade.adapters import outcomes
 from funding_bot.trade.adapters.contracts import (Action, AdapterError, Capabilities, ErrorKind,
                                                   LegSpec, NativeRef, Prepared, Quote, QuoteAmount,
-                                                  RawAmount, Result, Status)
+                                                  RawAmount, RejectionKind, Result, Status)
 from funding_bot.trade.adapters.native import Bindings, FuturesAdapter
 from funding_bot.trade import fees as native_fees, sol_exec
 from funding_bot.trade.sol_exec import SwapOutcome
@@ -105,6 +105,46 @@ def test_two_argument_perpetual_mapping_remains_version_one():
     spec = perp_spec()
     result = outcomes.perpetual(PerpFill('client', 7, 'FILLED', D(1), D(2), D(2), 1), spec.scope)
     assert result.version == 1 and result.status == Status.SETTLED and result.executed_quantity == D(1)
+
+
+def test_perpetual_partial_is_terminal_only_with_native_mapper_proof():
+    spec = perp_spec()
+    fill = PerpFill('client', 7, 'PARTIALLY_FILLED', D('0.5'), D(2), D(1), 1)
+    observed = outcomes.perpetual(fill, spec.scope, spec=spec, side='SELL')
+    terminal = outcomes.perpetual(fill, spec.scope, spec=spec, side='SELL', partial_terminal=True)
+    assert observed.status == terminal.status == Status.PARTIAL
+    assert observed.provisional and not observed.terminal
+    assert terminal.terminal and not terminal.provisional and terminal.finality == 'exchange_terminal'
+
+
+@pytest.mark.parametrize(
+    ('venue', 'code', 'native_kind', 'expected'),
+    [
+        ('aster', -1111, None, RejectionKind.PRECISION),
+        ('aster', -2022, None, RejectionKind.REDUCE_ONLY),
+        ('gate', 'reduce_only', None, RejectionKind.REDUCE_ONLY),
+        ('gate', 'INVALID_PARAM_VALUE', None, RejectionKind.OTHER),
+        ('hyperliquid', None, 'tick_size', RejectionKind.PRECISION),
+        ('hyperliquid', None, 'reduce_only', RejectionKind.REDUCE_ONLY),
+    ],
+)
+def test_perpetual_rejection_exposes_unified_kind_without_native_code(venue, code, native_kind, expected):
+    spec = perp_spec(venue)
+    fill = NS(client_id='client', order_id=None, status='REJECTED', qty=D(0), avg_px=D(0), quote=D(0),
+              sign_nonce=1, err_code=code, err_kind=native_kind)
+    result = outcomes.perpetual(fill, spec.scope, spec=spec, side='SELL')
+    assert result.status == Status.REJECTED and result.rejection_kind == expected
+    assert result.native_ref == NativeRef('client_order', 'client') and result.terminal
+
+
+def test_futures_adapter_passes_partial_terminal_binding_profile():
+    spec = perp_spec('gate')
+    bindings = Bindings(None, None, lambda *_: None, lambda *_: None, lambda *_: None,
+                        lambda *_: None, lambda *_: None, lambda *_: None, partial_terminal=True)
+    adapter = FuturesAdapter(spec, bindings)
+    fill = PerpFill('client', 7, 'PARTIALLY_FILLED', D('0.5'), D(2), D(1), 1)
+    result = adapter.normalize(fill, 'SELL')
+    assert result.status == Status.PARTIAL and result.terminal and not result.provisional
 
 
 @pytest.mark.parametrize(

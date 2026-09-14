@@ -4,7 +4,7 @@ from decimal import Decimal as D
 from ..fees import FeeComponent
 from ..keys import redact
 from .contracts import (AdapterError, ErrorKind, NativeRef, QuoteAmount, RawAmount,
-                        Result, Status)
+                        RejectionKind, Result, Status)
 
 _REDUCE = frozenset({'reduce_only', 'position_closed', 'reduce_out', 'REDUCE_ONLY', 'REDUCE_ONLY_FAIL',
                      'POSITION_EMPTY', 'REDUCE_EXCEEDED', 'INCREASE_POSITION'})
@@ -95,7 +95,7 @@ def _legacy_perpetual(fill, scope):
                   ErrorKind.REJECTED if status == Status.REJECTED else None)
 
 
-def perpetual(fill, scope, *, spec=None, side=None):
+def perpetual(fill, scope, *, spec=None, side=None, partial_terminal=False):
     """Map a native cumulative perpetual fill.
 
     The two-argument form remains the version-1 public API. NativeAdapter supplies
@@ -105,13 +105,16 @@ def perpetual(fill, scope, *, spec=None, side=None):
         return _legacy_perpetual(fill, scope)
     if scope != spec.scope or side not in {'BUY', 'SELL'}:
         raise AdapterError(ErrorKind.IDENTITY, 'perpetual result scope/side mismatch')
+    if type(partial_terminal) is not bool:
+        raise AdapterError(ErrorKind.CONFIG, 'partial terminal profile must be boolean')
 
     statuses = {'FILLED': Status.SETTLED, 'PARTIALLY_FILLED': Status.PARTIAL,
                 'EXPIRED': Status.CANCELLED, 'CANCELED': Status.CANCELLED, 'CANCELLED': Status.CANCELLED,
                 'REJECTED': Status.REJECTED, 'NEW': Status.ACCEPTED}
     status = statuses.get(getattr(fill, 'status', None), Status.UNKNOWN)
     terminal = getattr(fill, 'status', None) in _PERP_TERMINAL
-    if getattr(fill, 'outcome', None) == 'PARTIAL_TERMINAL':
+    if (getattr(fill, 'status', None) == 'PARTIALLY_FILLED' and
+            (partial_terminal or getattr(fill, 'outcome', None) == 'PARTIAL_TERMINAL')):
         terminal = True
     quantity = _decimal(getattr(fill, 'qty', None))
     quote = _decimal(getattr(fill, 'quote', None))
@@ -140,6 +143,9 @@ def perpetual(fill, scope, *, spec=None, side=None):
                   evidence, terminal=terminal,
                   error=ErrorKind.UNKNOWN if status == Status.UNKNOWN else
                   ErrorKind.REJECTED if status == Status.REJECTED else None,
+                  rejection_kind=({'precision': RejectionKind.PRECISION,
+                                   'reduce_only': RejectionKind.REDUCE_ONLY}.get(rejection(fill), RejectionKind.OTHER)
+                                  if status == Status.REJECTED else None),
                   **_identity(spec, ref), **amounts)
 
 
