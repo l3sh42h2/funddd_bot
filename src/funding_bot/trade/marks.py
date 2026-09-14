@@ -38,6 +38,7 @@ from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 from .. import config
 from . import report, store, tconfig
+from .ledger_flows import perp_quote_flows, spot_quote_flows
 from .keys import redact
 
 log = logging.getLogger(__name__)
@@ -77,13 +78,18 @@ class Journal:
     fees_est: bool              # хоть одна заявка — оценкой по тарифу (userTrades не добраны)
     funding: D | None           # фандинг: + получили, − заплатили; None — симуляция (не начисляется)
     gas_native: D               # газ всех транзакций сделки в нативной монете
+    missing_flows: tuple[str, ...] = ()  # исполнено, но сумма котировки отсутствует/битая: это неизвестно, не 0
 
     @property
-    def spot_flow(self) -> D:
+    def spot_flow(self) -> D | None:
+        if any(x.startswith("clip:") for x in self.missing_flows):
+            return None
         return self.spot_out - self.spot_in
 
     @property
-    def perp_flow(self) -> D:
+    def perp_flow(self) -> D | None:
+        if any(x.startswith("order:") for x in self.missing_flows):
+            return None
         return self.perp_sell - self.perp_buy
 
     def gas_usd(self, native_px: D | None) -> D | None:
@@ -108,14 +114,9 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
     сделка на том же символе не должна дописать свой фандинг в её итог)."""
     did = deal["id"]
     _stable, sdec = stable_of(deal["chain"])
-    s_in = s_out = ZERO
-    qs = ",".join("?" * len(FLOW_CLIPS))
-    for r in con.execute(f"SELECT c.dex_in, c.dex_out, i.kind FROM clips c JOIN intents i ON c.intent_id = i.id "
-                         f"WHERE i.deal_id=? AND c.state IN ({qs})", (did, *FLOW_CLIPS)):
-        if r["kind"] == "entry":
-            s_in += D(int(r["dex_in"] or 0)) / D(10) ** sdec
-        elif r["kind"] in ("exit", "undo"):
-            s_out += D(int(r["dex_out"] or 0)) / D(10) ** sdec
+    spot = spot_quote_flows(con, did, sdec)
+    perp = perp_quote_flows(con, did)
+    s_in, s_out = spot.debit, spot.credit
     prefix = f"fb-{did}-"
     # userTrades по заявке: [комиссия в стейблах, оборот, который она покрывает, оборот сделки неизвестен]. Комиссия не
     # в стейблах (скидка BNB) в $ не переводится, недобранные userTrades дают неполную сумму — непокрытый оборот ниже
@@ -137,15 +138,15 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
         else:
             acc[1] += qq
     rate = D(str(config.FEES_TAKER[deal["perp_venue"]]))
-    sell = buy = fees = ZERO
+    sell, buy, fees = perp.credit, perp.debit, ZERO
     est = False
     for o in con.execute("SELECT venue, order_id, side, cum_quote FROM perp_orders WHERE substr(client_id, 1, ?)=? "
                          "AND state IN (?,?)", (len(prefix), prefix, *FILLED)):
-        q = _dv(o["cum_quote"]) or ZERO
-        if o["side"] == "SELL":
-            sell += q
-        else:
-            buy += q
+        q = _dv(o["cum_quote"])
+        if q is None or q < 0:
+            # perp_quote_flows already records this exact order in missing_flows.  It must not be used as a zero
+            # turnover for fee estimation either; the whole realized base will remain unknown.
+            continue
         k = (o["venue"], int(o["order_id"])) if o["order_id"] is not None else None
         paid, covered, trust = comm.get(k, (ZERO, ZERO, False)) if k is not None else (ZERO, ZERO, False)
         fees += paid
@@ -162,7 +163,7 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
             args.append(int(until_ms))
         fund = sum((_dv(r[0]) or ZERO for r in con.execute(sql, args)), ZERO)
     gas = report.gas_totals(deal_txs(con, did), None)["native"]
-    return Journal(s_in, s_out, sell, buy, fees, est, fund, gas)
+    return Journal(s_in, s_out, sell, buy, fees, est, fund, gas, spot.missing + perp.missing)
 
 
 # --- оценка ----------------------------------------------------------------------------------------------------
@@ -447,7 +448,13 @@ def mark_deal(con, deal: Mapping, legs, *, now: float, fetch_funding: bool = Tru
     if m.gas is None:
         m.err("цена BNB не получена — газ сделки в $ неизвестен")
     m.funding = j.funding if j.funding is not None else ZERO
-    base = None if m.gas is None else j.spot_flow + j.perp_flow - j.fees - m.gas + m.funding
+    m.flags["accounting_complete"] = not j.missing_flows
+    if j.missing_flows:
+        m.flags["missing_flows"] = list(j.missing_flows)
+        m.err("в исполненном журнале отсутствуют денежные суммы: " + ", ".join(j.missing_flows))
+    base = None
+    if m.gas is not None and j.spot_flow is not None and j.perp_flow is not None:
+        base = j.spot_flow + j.perp_flow - j.fees - m.gas + m.funding
     m.px_dex = _dex_mid(m, legs, deal, int(bk.tokens_raw), dec, px_ask, gate) if q_tok != 0 else None
     gate()
     book = _read(m, f"стакан {venue}", lambda: legs.perp.book(symbol, tconfig.ASTER_DEPTH_LIMIT))
@@ -490,7 +497,11 @@ def final_mark(con, deal: Mapping, legs, *, now: float) -> Mark:
     if j.fees_est:
         m.flags["fees_est"] = True
     m.gas = j.gas_usd(_Once(getattr(legs, "native_px", None))() if j.gas_native else None)
-    if m.gas is not None:
+    m.flags["accounting_complete"] = not j.missing_flows
+    if j.missing_flows:
+        m.flags["missing_flows"] = list(j.missing_flows)
+        m.err("в исполненном журнале отсутствуют денежные суммы: " + ", ".join(j.missing_flows))
+    if m.gas is not None and j.spot_flow is not None and j.perp_flow is not None:
         m.pnl_now = j.spot_flow + j.perp_flow - j.fees - m.gas + m.funding
     return m
 

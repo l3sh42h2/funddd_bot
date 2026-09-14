@@ -183,7 +183,19 @@ def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
                                        (d["id"],)).fetchone())
     except sqlite3.OperationalError:            # трейдер старой версии ещё не создал deal_marks — расчёта нет
         mk = None
+    # Старый кэш мог быть рассчитан до строгой проекции денежных потоков. Проверяем исходный журнал при каждом чтении:
+    # FILLED/DEX_OK с отсутствующей суммой не имеет права остаться известным PnL только потому, что deal_marks старше.
+    evm_missing: tuple[str, ...] = ()
+    if not _is_sol(d):
+        try:
+            evm_missing = tmarks.journal(
+                con, d, until_ms=int(float(d.get("updated") or now) * 1000) if st == "CLOSED" else None
+            ).missing_flows
+        except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError):
+            evm_missing = ("journal:unreadable",)
     if st == "CLOSED":
+        if evm_missing:
+            return {"final": True, "total": None, "no_gas": False, "incomplete": True}
         if mk is not None and mk["flags"].get("final") and mk["pnl_now"] is not None:
             out = {"final": True, "total": mk["pnl_now"], "no_gas": False}
             if mk["flags"].get("accounting_complete") is False:
@@ -198,10 +210,17 @@ def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
             log.warning("кабинет: итог %s не посчитан: %s", d.get("id"), type(e).__name__)
             return None
         gas = j.gas_usd(None)                   # газа не было — 0; был — в $ не перевести
-        return {"final": True, "total": j.spot_flow + j.perp_flow - j.fees + (j.funding or ZERO) - (gas or ZERO),
+        total = None if j.spot_flow is None or j.perp_flow is None else \
+            j.spot_flow + j.perp_flow - j.fees + (j.funding or ZERO) - (gas or ZERO)
+        return {"final": True, "total": total,
                 "no_gas": gas is None}
     if mk is None or mk["flags"].get("final"):
         return {"final": False, "mark": None}
+    if evm_missing:
+        mk = dict(mk)
+        mk["flags"] = dict(mk["flags"], accounting_complete=False, missing_flows=list(evm_missing))
+        for key in ("pnl_now", "pnl_exit", "exit_cost"):
+            mk[key] = None
     return {"final": False, "mark": mk, "stale": now - mk["ts"] > tconfig.MARK_STALE_S}
 
 
