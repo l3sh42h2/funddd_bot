@@ -38,8 +38,6 @@ def _run(env):
     cfg = owner.load()
     conns, holder = Conns(), CfgHolder()
     rt, legs, keys_mode, mode, legacy_on = build_trader_legs(cfg, conns, holder, env)
-    if legacy_on and rt.mode == 'live':
-        rt.live.perp.check_clock()
     ref = {}
     from ..market_snapshot import load_market_table
     desk = Desk(conns, legs, table_loader=load_market_table, keys_mode=keys_mode, busy=lambda: ref['engine'].busy())

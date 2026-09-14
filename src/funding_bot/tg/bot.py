@@ -624,31 +624,7 @@ class Bot:
         return code
 
 
-def build_trader_legs(cfg, conns: Conns, holder: CfgHolder, env, *, build=None, factory=None):
-    """Ноги трейдера по связкам (ТЗ SOL×HL §3.2, M01/M02): старая связка — прежний build_runtime (при включённой — тот же
-    вызов, те же ключи Aster/EVM); связка Solana × Hyperliquid — ленивая фабрика в RuntimeRegistry (её ключи — при
-    первой сборке, её сбой — ProfileDown этой связки). Старая связка выключена (enabled = false) — её ноги только
-    симуляция без ключей: Aster/EVM не обязательны для одной SOL-связки.
-    Возвращает (rt, реестр ног, keys_mode, режим бота, старая связка включена)."""
-    from ..trade.runtime import RuntimeRegistry, SolFactory
-    build = build or build_runtime
-    legacy_on = cfg.profile_enabled(owner_mod.LEGACY_PROFILE)
-    sol_on = cfg.profile_enabled(owner_mod.SOL_HL)
-    if legacy_on:
-        rt = build(cfg, conns, holder=holder, environ=env)
-    else:
-        rt = build(cfg, conns, holder=holder, mode="dry", environ=env)
-    keys_mode = rt.mode if rt.keys is not None else (cfg.mode if (sol_on and not legacy_on) else None)
-    factories = {}
-    if sol_on:
-        factories[owner_mod.SOL_HL] = (factory or SolFactory)(owner_mod.load, conns, keys_mode=keys_mode, environ=env)
-    if cfg.profile_enabled(owner_mod.RH_GATE):     # FATCOIN 13.09: спот OKX DEX Robinhood × перп Gate (ключ EVM — старой связки)
-        from ..trade.runtime import EvmGateFactory
-        factories[owner_mod.RH_GATE] = EvmGateFactory(owner_mod.load, conns, holder, rt, environ=env)
-    reg = RuntimeRegistry(lambda sim: rt.sim if sim else rt.live, factories)
-    mode = rt.mode if legacy_on else (keys_mode or "dry")
-    return rt, reg, keys_mode, mode, legacy_on
-
+from ..trade.assembly import build_trader_legs
 
 def _notify(api, chat: int | None, html: str) -> None:
     """Одно сообщение мимо очереди — когда процесс не стартует (владелец иначе не узнает почему)."""
@@ -695,17 +671,6 @@ def _run_trader(environ=None) -> int:
     except Exception as e:                     # noqa — сеть/узел при сборке ног
         log.error("сборка ног: %s", redact(e))
         return EXIT_TRANSIENT
-    if legacy_on and rt.mode == "live":
-        from ..trade.aster_trade import AsterError
-        try:
-            rt.live.perp.check_clock()         # nonce Aster живёт в ±10 с: при расхождении > 2 с live не стартует
-        except AsterError as e:
-            log.error("%s", e)
-            _notify(send_api, cfg.owner_id, views.refused(f"трейдер не запущен: {e}"))
-            return EXIT_CONFIG
-        except Exception as e:                 # noqa
-            log.error("часы Aster не проверены: %s", redact(e))
-            return EXIT_TRANSIENT
     ref: dict[str, Engine] = {}
     desk = Desk(conns, legs, keys_mode=keys_mode, busy=lambda: ref["e"].busy())
     engine = Engine(conns, legs, desk, keys_mode=keys_mode, holder=holder, busy_path=tconfig.TRADING_BUSY)

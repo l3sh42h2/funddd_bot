@@ -1,0 +1,19 @@
+Environment: macOS, existing Python 3.12 venv; PYTHONPATH=src; synthetic test data only.
+Full: python -m pytest -q --tb=short
+2193 passed, 3 skipped in 147.30s (0:02:27)
+Full log local: /tmp/funding_m3_fulltests.log
+
+Subsequent targeted profile:
+python -m pytest -q tests/test_migration_m3.py tests/test_sol_c2_runtime.py tests/test_sol_c2_engine.py tests/test_sol_c3_ledger.py tests/test_rh_gate_engine.py tests/test_trade_evm.py tests/test_rh_swap.py tests/test_trade_engine.py tests/test_sol_keys.py --tb=short
+280 passed in 7.97s
+Log local: /tmp/funding_m3_final_targeted.log
+
+Final M3 scope/unknown/transaction guards:
+python -m pytest -q tests/test_migration_m3.py --tb=short
+30 passed in 0.23s
+
+Full run predates final guards; affected tests rerun afterwards. No M3 deployment or live test orders.
+
+Final bootstrap isolation profile (M3/M1/SOL bot/ledger/RH): 78 passed in 5.57s
+Log local: /tmp/funding_m3_bootstrap_final.log
+Secret scan: passed. Only pre-existing public https://api.mainnet-beta.solana.com fallback literal exempted; no credential URLs exempted.

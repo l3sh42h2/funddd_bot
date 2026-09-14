@@ -98,6 +98,8 @@ class RuntimeRegistry:
         self._cache: dict[tuple[str, bool], Any] = {}
         self._lock = threading.Lock()
         self.last_error: dict[str, str] = {}
+        from .adapters.registry import production_registry
+        self.adapters = production_registry()
 
     def __call__(self, sim: bool):
         return None if self.legacy is None else self.legacy(sim)
@@ -147,21 +149,21 @@ def legs_of(legs_fn: Any, deal: Mapping):
 
 # --- боевая сборка ног SOL × HL ---------------------------------------------------------------------------------
 class EvmGateFactory:
-    """Ноги связки rh_okx_gate (спот OKX DEX в сети Robinhood × перп Gate, FATCOIN 13.09) для RuntimeRegistry, лениво.
-    Спот подписывает тот же EVM-ключ, что BSC (адрес = wallets.rh_gate.evm_address): ключ берётся у уже собранной старой
-    связки — keys.load второй раз не вызывается (он стирает секреты из окружения); без него боевых ног нет. Перп —
-    Gate (GATE_API_KEY/GATE_API_SECRET). Режим — меньший из режима связки и режима, в котором загружены ключи."""
+    """Compatibility alias for Robinhood spot + Gate. Production uses CredentialProvider;
+    legacy_rt is retained only for older offline callers. Each leg keeps its loaded mode ceiling.
+    """
 
     def __init__(self, owner_loader: Callable[[], Any], conns, holder, legacy_rt, *, environ=None, okx=None, rpc=None,
-                 gate=None):
+                 gate=None, credentials=None, keys_mode=None):
         self.owner_loader, self.conns, self.holder, self.rt = owner_loader, conns, holder, legacy_rt
         self.environ, self.okx, self.rpc, self.gate = environ, okx, rpc, gate
+        self.credentials, self.keys_mode = credentials, keys_mode
         self._lock = threading.Lock()
         self._built: dict[bool, Any] = {}
 
     def _mode(self, cfg) -> str:
         from .keys import effective_mode
-        rt_mode = self.rt.mode if (self.rt is not None and getattr(self.rt, "keys", None) is not None) else "dry"
+        rt_mode = self.keys_mode if self.credentials is not None else self.rt.mode if (self.rt is not None and getattr(self.rt, "keys", None) is not None) else "dry"
         return effective_mode(cfg.profile_mode(RH_GATE), rt_mode)
 
     def __call__(self, sim: bool):
@@ -193,7 +195,8 @@ class EvmGateFactory:
         loader, conns = self.owner_loader, self.conns
 
         def mode_state():
-            return loader().profile_mode(RH_GATE), store.is_paused(conns.get())
+            from .keys import effective_mode
+            return effective_mode(loader().profile_mode(RH_GATE), mode), store.is_paused(conns.get())
 
         if sim:
             perp_ro = self.gate if self.gate is not None else self._gate_reader(mode, mode_state)
@@ -201,7 +204,7 @@ class EvmGateFactory:
                                  native_usd=native_px)
             return Legs(SimSpot(spot_ro, native_px=native_px, wallet_known=bool(wallet)), SimPerp(perp_ro), True,
                         native_px)
-        k = getattr(self.rt, "keys", None)
+        k = self.credentials.evm(mode, wallet) if self.credentials is not None else getattr(self.rt, "keys", None)
         evm = getattr(k, "evm", None) if k is not None else None
         addr = getattr(k, "evm_address", None) if k is not None else None
         if mode == "live" and evm is None:
@@ -210,7 +213,7 @@ class EvmGateFactory:
             raise RuntimeError("wallets.rh_gate.evm_address не задан — не собираю")
         if (evm is not None or addr) and str(addr or "").lower() != str(wallet).lower():
             raise RuntimeError("wallets.rh_gate.evm_address не совпадает с адресом EVM-ключа (DEX_EVM_KEY) — не собираю")
-        perp = self.gate if self.gate is not None else GateTrade.from_env(mode_state, self.environ)
+        perp = self.gate if self.gate is not None else self._gate_trade(mode_state)
         clock = getattr(perp, "check_clock", None)
         if callable(clock):
             clock()                              # часы расходятся с Gate — связка не собирается (как у Aster на старте)
@@ -227,13 +230,20 @@ class EvmGateFactory:
         spot = OkxEvmSpot(okx, rpc, self.holder, chain=chain, wallet=wallet, sender=sender, native_usd=native_px)
         return Legs(spot, perp, False, native_px, can_send=mode == "live" and sender is not None)
 
+    def _gate_trade(self, mode_state):
+        from .gate_trade import GateTrade
+        if self.credentials is None:
+            return GateTrade.from_env(mode_state, self.environ)
+        key, secret = self.credentials.gate()
+        return GateTrade(key.reveal(), secret.reveal(), mode_state=mode_state)
+
     def _gate_reader(self, mode: str, mode_state):
         """Нога Gate под симуляцию: в readonly/live — с ключами (подписанные чтения: маржа, позиция), как у BSC
         AsterTrade.from_keys; ключей нет или dry — только публичное."""
         from .gate_trade import GateTrade
         if mode != "dry":
             try:
-                return GateTrade.from_env(mode_state, self.environ)
+                return self._gate_trade(mode_state)
             except Exception as e:             # noqa — без ключей симуляция всё равно строится, маржа «не прочитана»
                 log.warning("Gate без ключей для симуляции: %s", redact(e))
         return GateTrade(mode_state=mode_state)
@@ -244,11 +254,12 @@ class SolFactory:
 
     def __init__(self, owner_loader: Callable[[], Any], conns, *, keys_mode: str | None, environ=None,
                  hl_session=None, rpc_session=None, jup_session=None, okx=None, clock=time.time,
-                 mono=time.monotonic, sleep=time.sleep, paused: Callable[[], bool] | None = None):
+                 mono=time.monotonic, sleep=time.sleep, paused: Callable[[], bool] | None = None, credentials=None):
         self.owner_loader, self.conns, self.keys_mode, self.environ = owner_loader, conns, keys_mode, environ
         self.hl_session, self.rpc_session, self.jup_session, self.okx = hl_session, rpc_session, jup_session, okx
         self.clock, self.mono, self.sleep = clock, mono, sleep
         self.paused = paused
+        self.credentials = credentials
         self._keys: Any = None
         self._keys_loaded = False
         self._lock = threading.Lock()
@@ -263,7 +274,8 @@ class SolFactory:
         with self._lock:
             if not self._keys_loaded:
                 mode = self._mode(cfg)
-                self._keys = None if mode == "dry" else K.load_sol_hl(cfg, mode, self.environ)
+                self._keys = None if mode == "dry" else (self.credentials.sol_hl(cfg, mode) if self.credentials is not None
+                                                       else K.load_sol_hl(cfg, mode, self.environ))
                 self._keys_loaded = True
             return self._keys
 
@@ -293,38 +305,18 @@ def _routing(cfg):
     return pol, lim
 
 
-def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Callable[[], Any], hl_session=None,
-                   rpc_session=None, jup_session=None, okx=None, clock=time.time, mono=time.monotonic,
-                   sleep=time.sleep, paused: Callable[[], bool] | None = None) -> SolLegs:
-    """Ноги связки из owner.toml и ключей. Сеть при сборке не читается. Нет адресов [wallets.sol_hl] — отказ
-    (ProfileDown выше): даже симуляция считает маржу и балансы ЭТОГО счёта, а не пустого адреса."""
+def build_hl_component(cfg, conns, *, mode, keys, mode_state, hl_session=None,
+                       clock=time.time, sleep=time.sleep):
+    """One perpetual leg. Does not require a Solana key, wallet, router or executor."""
     from . import store
-    from .fees import NATIVE_SOL, PriceObs
     from . import hl_rules as R
     from .hyperliquid_trade import NETWORKS as HL_NETWORKS, HlJournal, HlSigner, HyperliquidTrade
-    from .jupiter_spot import BASE as JUP_BASE, JupiterSpot
-    from .okx_sol_spot import OkxSolSpot
-    from .sim import SimHlPerp, SimSolSpot
-    from .sol_exec import RpcChain, SolanaExecutor
-    from .sol_route_validator import solana_tools
-    from .solana import MAINNET_GENESIS, USDC_MINT
-    from .solana.rpc import RpcPool, SolanaRpc
-    from .spot_router import SolanaTools, SpotRouter
-    w = lambda k: cfg.get(f"wallets.sol_hl.{k}")          # noqa: E731
-    wallet, user, account = w("solana_address"), w("hl_user_address"), w("hl_account_address")
-    if not (wallet and user and account):
-        raise ValueError("в owner.toml [wallets.sol_hl] не заданы solana_address / hl_user_address / "
-                         "hl_account_address")
+    w = lambda k: cfg.get(f"wallets.sol_hl.{k}")
+    user, account = w("hl_user_address"), w("hl_account_address")
+    if not user or not account:
+        raise ValueError("Hyperliquid account identity missing")
     dex = cfg.get(f"profiles.{SOL_HL}.perp_dex") or "para"
     network = cfg.get(f"profiles.{SOL_HL}.perp_network") or "mainnet"
-    genesis = cfg.get("spot.solana.expected_genesis_hash") or MAINNET_GENESIS
-    loader = owner_loader
-
-    def mode_state():
-        return loader().profile_mode(SOL_HL), bool(paused()) if paused is not None else \
-            store.is_paused(conns.get())
-
-    # --- Hyperliquid: нога — на ОДИН точный рынок; первый выпуск — одна запись реестра профиля на этот dex ---
     from . import instruments as I
     reg = I.load_registry(I.registry_path(cfg.get(f"profiles.{SOL_HL}.instrument_registry")))
     allowed = tuple(cfg.get(f"profiles.{SOL_HL}.allowed_instruments") or ())
@@ -332,7 +324,7 @@ def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Call
                     and s.identity.status != "revoked" and (not allowed or s.instrument_id in allowed)})
     if len(fulls) != 1:
         raise ValueError(f"реестр {reg.path}: рынков профиля на dex {dex} — {len(fulls)} (первый выпуск: ровно один)")
-    live = mode == "live" and keys is not None and keys.hl is not None and keys.sol is not None
+    live = mode == "live" and keys is not None and keys.hl is not None
     signer = journal = None
     if live:
         signer = HlSigner(keys.hl, agent=keys.hl_agent_address, master=user, account=account, network=network)
@@ -351,15 +343,24 @@ def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Call
             log.warning("sol-hl: ставка HL не прочитана: %s", type(e).__name__)
             return None
 
-    def native_obs():
-        try:
-            mids = hl.http.info({"type": "allMids"})
-            return PriceObs(NATIVE_SOL, USDC_MINT, R.to_dec(mids["SOL"], "SOL"), mono(), "HL allMids SOL")
-        except Exception as e:           # noqa — нет цены: расходы в SOL «неизвестны», не 0
-            log.warning("sol-hl: цена SOL не получена: %s", type(e).__name__)
-            return None
+    return hl, fee_rate
 
-    # --- Solana ---
+
+def build_sol_component(cfg, *, mode, keys, mode_state, rpc_session=None, jup_session=None,
+                        okx=None, clock=time.time, mono=time.monotonic, sleep=time.sleep):
+    """One Solana spot leg. Futures account/venue is not an input."""
+    from .jupiter_spot import BASE as JUP_BASE, JupiterSpot
+    from .okx_sol_spot import OkxSolSpot
+    from .sol_exec import RpcChain, SolanaExecutor
+    from .sol_route_validator import solana_tools
+    from .solana import MAINNET_GENESIS, USDC_MINT
+    from .solana.rpc import RpcPool, SolanaRpc
+    from .spot_router import SolanaTools, SpotRouter
+    wallet = cfg.get("wallets.sol_hl.solana_address")
+    if not wallet:
+        raise ValueError("Solana wallet identity missing")
+    genesis = cfg.get("spot.solana.expected_genesis_hash") or MAINNET_GENESIS
+    live = mode == "live" and keys is not None and keys.sol is not None
     urls = [u for u in ((keys.rpc_primary, keys.rpc_secondary) if keys is not None else ()) if u]
     rpcs = [SolanaRpc(u, name=n, expected_genesis=genesis, session=rpc_session, sleep=sleep)
             for u, n in zip(urls, ("primary", "secondary"))] or \
@@ -387,6 +388,47 @@ def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Call
     ex = SolanaExecutor(wallet=wallet, genesis=genesis, signer=keys.sol if live else None, endpoints=pool.endpoints,
                         chain=chain, validator=validator, mode_state=mode_state, clock=clock, sleep=sleep,
                         tip_accounts=policy.tip_recipients, keys=keys)
+    return ex, router, chain
+
+
+def build_sol_legs(cfg, conns, *, sim: bool, mode: str, keys, owner_loader: Callable[[], Any], hl_session=None,
+                   rpc_session=None, jup_session=None, okx=None, clock=time.time, mono=time.monotonic,
+                   sleep=time.sleep, paused: Callable[[], bool] | None = None) -> SolLegs:
+    """Ноги связки из owner.toml и ключей. Сеть при сборке не читается. Нет адресов [wallets.sol_hl] — отказ
+    (ProfileDown выше): даже симуляция считает маржу и балансы ЭТОГО счёта, а не пустого адреса."""
+    from . import store
+    from .fees import NATIVE_SOL, PriceObs
+    from . import hl_rules as R
+    from .sim import SimHlPerp, SimSolSpot
+    from .solana import MAINNET_GENESIS, USDC_MINT
+    w = lambda k: cfg.get(f"wallets.sol_hl.{k}")          # noqa: E731
+    wallet, user, account = w("solana_address"), w("hl_user_address"), w("hl_account_address")
+    if not (wallet and user and account):
+        raise ValueError("в owner.toml [wallets.sol_hl] не заданы solana_address / hl_user_address / "
+                         "hl_account_address")
+    dex = cfg.get(f"profiles.{SOL_HL}.perp_dex") or "para"
+    network = cfg.get(f"profiles.{SOL_HL}.perp_network") or "mainnet"
+    genesis = cfg.get("spot.solana.expected_genesis_hash") or MAINNET_GENESIS
+    loader = owner_loader
+
+    def mode_state():
+        return loader().profile_mode(SOL_HL), bool(paused()) if paused is not None else \
+            store.is_paused(conns.get())
+
+    hl, fee_rate = build_hl_component(cfg, conns, mode=mode, keys=keys, mode_state=mode_state,
+                                     hl_session=hl_session, clock=clock, sleep=sleep)
+    ex, router, chain = build_sol_component(cfg, mode=mode, keys=keys, mode_state=mode_state,
+                                           rpc_session=rpc_session, jup_session=jup_session, okx=okx,
+                                           clock=clock, mono=mono, sleep=sleep)
+    live = mode == "live" and keys is not None and keys.hl is not None and keys.sol is not None
+    def native_obs():
+        try:
+            mids = hl.http.info({"type": "allMids"})
+            return PriceObs(NATIVE_SOL, USDC_MINT, R.to_dec(mids["SOL"], "SOL"), mono(), "HL allMids SOL")
+        except Exception as e:           # noqa — нет цены: расходы в SOL «неизвестны», не 0
+            log.warning("sol-hl: цена SOL не получена: %s", type(e).__name__)
+            return None
+
     npx = lambda: (lambda o: None if o is None else o.price)(native_obs())      # noqa: E731
     acct = hl_account_id(network, user, account, dex)
     if sim:

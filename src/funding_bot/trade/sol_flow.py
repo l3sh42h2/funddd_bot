@@ -1198,51 +1198,22 @@ class SolEngine:
 
     @staticmethod
     def _agent_gate(run: SolRun, what: str) -> None:
-        """Агент HL действует (userRole, срок) — до ноги Solana: иначе своп/продажа пройдут, а заявку HL отвергнут
-        и нога останется голой. Только чтения; не прочитано — пауза до отправки."""
-        if run.legs.sim:
-            return
-        why = run.legs.perp.agent_refusals()
-        if why:
-            raise Pause("hl_agent", "; ".join(why) + f" — {what}")
+        from .adapters.hl_preflight import agent_gate, PreflightRefused
+        try:
+            agent_gate(run.legs.perp, sim=run.legs.sim, what=what)
+        except PreflightRefused as e:
+            raise Pause(e.code, str(e)) from None
 
     def _hl_preflight(self, run: SolRun) -> None:
-        """Всё про HL — ДО свопа (H02/H03/H09/H19): привязка рынка, режим и маржа нужного dex, чужая позиция,
-        isolated."""
-        perp, inst = run.legs.perp, run.inst
+        from .adapters.hl_preflight import entry, PreflightRefused
         try:
-            ref = perp.identity()
-        except Exception as e:        # noqa
-            raise Pause("hl_meta", f"мета Hyperliquid не прочитана: {redact(e)}") from None
-        if ref.fullcoin != inst.perp_symbol or ref.is_delisted or (
-                inst.perp_asset_id is not None and ref.asset != inst.perp_asset_id):
-            raise Pause("hl_meta", f"рынок {inst.perp_symbol} изменился (asset {ref.asset}) — нужен новый план")
-        lev = run.cfg.get("perp.hyperliquid.leverage")
-        if lev is None:
-            if run.legs.sim:
-                return
-            raise Pause("owner_missing", "плечо perp.hyperliquid.leverage не задано")
-        if not run.legs.sim:
-            book = perp.book(run.symbol, BOOK_LEVELS)
-            cap = D(str(run.spec.get("hedge_capacity") or 0))
-            need = margin_for(cap, book.asks[0][0], D(lev), run.legs.fee_rate()) if book.asks else None
-            if need is None or need <= 0:
-                raise Pause("margin", "маржа под шорт не посчитана (пустые аски или нулевой объём)")
-            refusals = perp.entry_margin_refusals(need, _lim(run.cfg, "min_hl_margin_reserve_usdc"))
-            if refusals:
-                raise Pause("margin", "; ".join(refusals) + " — своп не начинаю")
-            pos = perp.position(run.symbol)
-            bk = deal_book(self.con, run.did)
-            if pos is None:
-                raise Pause("position_unknown", f"позиция {run.symbol} не прочитана — своп не начинаю")
-            if bk.short is None or pos != -bk.short:
-                raise Pause("position_mismatch", f"позиция HL {pos} ≠ журнал сделки {-(bk.short or 0)} — своп не "
-                                                 "начинаю")
-            self._agent_gate(run, "своп не начинаю")    # setup при уже isolated ничего не подписывает — агент не виден
-        try:
-            perp.setup(run.symbol, int(lev), "ISOLATED")
-        except Exception as e:        # noqa — настройка отдельным действием; сбой — до свопа
-            raise Pause("setup", f"настройка {run.symbol}: {redact(e)}") from None
+            entry(run.legs.perp, run.inst, sim=run.legs.sim,
+                  leverage=run.cfg.get("perp.hyperliquid.leverage"),
+                  capacity=D(str(run.spec.get("hedge_capacity") or 0)), fee_rate=run.legs.fee_rate,
+                  reserve=_lim(run.cfg, "min_hl_margin_reserve_usdc"),
+                  expected_short=deal_book(self.con, run.did).short, book_levels=BOOK_LEVELS)
+        except PreflightRefused as e:
+            raise Pause(e.code, str(e)) from None
 
     def _requote(self, run: SolRun, amount_raw: int):
         """Свежий сбор у кнопки (§5.1 п.7): тот же запрос и политика best; победитель — в одобренных границах (R13)."""
@@ -1411,7 +1382,8 @@ class SolEngine:
                 known.append(int(fill.order_id))
             if fill.status == "REJECTED":
                 kind = getattr(fill, "err_kind", None) or "other"
-                st = "reduce_only_reject" if kind == "reduce_only" else "deficit"
+                from .adapters.outcomes import rejection
+                st = "reduce_only_reject" if rejection(fill) == "reduce_only" else "deficit"
                 return HedgeResult(filled, quote, st, f"Hyperliquid: {kind} {getattr(fill, 'err_text', '') or ''}"
                                    .strip())
             if remaining > 0:

@@ -252,10 +252,6 @@ def _allow_multiplier(cfg, venue: str = VENUE) -> bool:
 
 # --- EVM-связки прежнего движка (спот OKX DEX × перп): сеть и площадка — пары/сделки, а не константы модуля --------
 # (FATCOIN 13.09: okx·robinhood × gate рядом с okx·bsc × aster; путь BSC × Aster — ровно прежний)
-# finish_as Gate (reduce_only/position_closed/reduce_out) и label отказа reduce-only (по докам Gate, живыми не
-# подтверждены — пересмотреть по первым отказам); чужое — perp_rejected, пауза та же
-REDUCE_ONLY_CODES = frozenset({"reduce_only", "position_closed", "reduce_out", "REDUCE_ONLY", "REDUCE_ONLY_FAIL",
-                               "POSITION_EMPTY", "REDUCE_EXCEEDED", "INCREASE_POSITION"})
 
 
 def _chain_tag(chain: str) -> str:
@@ -590,7 +586,7 @@ class Runtime:
 
 
 def build_runtime(cfg: OwnerCfg, conns: Conns, *, holder: CfgHolder | None = None, mode: str | None = None,
-                  environ=None, okx=None, rpc=None, aster=None) -> Runtime:
+                  environ=None, okx=None, rpc=None, aster=None, credentials=None) -> Runtime:
     """Ноги по режиму owner.toml (mode — только понизить). dry: keys.load НЕ вызывается вовсе — ни один ключ не
     читается из окружения; readonly: подписанные чтения, симуляция входов с настоящими балансами; live: всё."""
     from ..okxdex import OkxDex
@@ -616,7 +612,7 @@ def build_runtime(cfg: OwnerCfg, conns: Conns, *, holder: CfgHolder | None = Non
         sim = Legs(SimSpot(spot_ro, native_px=native_px, wallet_known=bool(wallet)), SimPerp(perp_pub), True, native_px)
         return Runtime(m, None, sim, None, holder, native_px)
     from . import keys as keys_mod
-    k = keys_mod.load(cfg, m, environ=environ)
+    k = credentials.legacy(cfg, m) if credentials is not None else keys_mod.load(cfg, m, environ=environ)
     perp = aster if aster is not None else AsterTrade.from_keys(k, mode_state)
     sender = None
     if k.evm is not None:
@@ -2289,9 +2285,7 @@ class Engine:
                                         known_order_ids=frozenset(known))
                 if s.status == "NOT_FOUND":
                     store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED,
-                                            err=("-2013 трижды, позиция и сделки неизменны — не выставлена"
-                                                 if perp.venue == "aster" else
-                                                 "не найдена, позиция и сделки неизменны — не выставлена"))
+                                            err="адаптер доказал: не найдена, позиция и сделки неизменны — не выставлена")
                     attempt += 1
                     if attempt > PERP_ATTEMPTS_MAX:
                         raise Pause("perp_unknown", f"заявка не выставляется {PERP_ATTEMPTS_MAX} раза подряд")
@@ -2303,7 +2297,9 @@ class Engine:
                                    else None)
             if fill.status == "REJECTED":
                 code = fill.err_code
-                if code == -1111 and not rerounded:
+                from .adapters.outcomes import rejection
+                category = rejection(fill)
+                if category == "precision" and not rerounded:
                     rerounded = True
                     f2 = perp.filters(run.symbol)
                     q = floor_step(q, f2.step)
@@ -2312,7 +2308,7 @@ class Engine:
                         raise Pause("perp_rejected", "после округления заявка нулевая")
                     attempt += 1
                     continue
-                reason = "reduce_only_reject" if (code == -2022 or code in REDUCE_ONLY_CODES) else "perp_rejected"
+                reason = "reduce_only_reject" if category == "reduce_only" else "perp_rejected"
                 v = _views()                   # владельцу: «Aster −2022», а не «aster -2022» (минус — «−»)
                 c = "?" if code is None else str(code).replace("-", v.MINUS)
                 raise Pause(reason, f"{v.VENUE_LABEL.get(perp.venue, perp.venue)} {c}: "

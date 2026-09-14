@@ -552,12 +552,15 @@ class OkxEvmSpot:
         return replace(b, est_gas=est, gas_limit=gas_limit_for(b.api_gas, est),
                        gas_price=self._net_gas_price(b.api_gas_price), preflight="ok")
 
-    def swap(self, token_in: str, token_out: str, amount_units: int, clip_ref: str) -> EvmSwapResult:
+    def swap(self, token_in: str, token_out: str, amount_units: int, clip_ref: str, *,
+             approved_min_receive: int | None = None) -> EvmSwapResult:
         """Своп клипа. SentUnknown / TxRejected / NoncePending пробрасываются как есть — движок ставит паузу."""
         if self.sender is None:
             raise GuardError("mode", "отправителя нет — своп только в live (в dry исполняет SimSpot)")
         cfg = self._cfg()
         b = self.build_swap(token_in, token_out, amount_units, preflight=True, cfg=cfg)
+        if approved_min_receive is not None and b.min_receive < approved_min_receive:
+            raise GuardError("approval_bounds", "новый маршрут хуже одобренного min_receive")
         self._check_native(b.gas_limit, b.gas_price, cfg)
         h, rc = self.sender.send_and_wait(b.to, b.data, 0, b.gas_limit, b.gas_price, kind=DexTxKind.SWAP,
                                           meta={"clip_id": _clip_id(clip_ref), "min_receive": b.min_receive})
