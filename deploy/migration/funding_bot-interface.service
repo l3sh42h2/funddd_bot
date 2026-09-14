@@ -1,7 +1,7 @@
 [Unit]
 Description=funding_bot Telegram and dashboard interface
-After=network-online.target
-Wants=network-online.target
+After=network-online.target funding_bot-core.service
+Wants=network-online.target funding_bot-core.service
 Conflicts=funding_bot-trader.service funding_bot-web.service
 
 [Service]
@@ -10,7 +10,10 @@ Group=funding-interface
 SupplementaryGroups=funding-ipc funding-market
 WorkingDirectory=/opt/funding-bot/current
 EnvironmentFile=/var/lib/funding-bot/secrets/interface.env
-ExecStart=/opt/funding-bot/current/.venv/bin/funding_bot interface --port 8792 --host 127.0.0.1
+Environment=PYTHONPATH=/opt/funding-bot/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=FUNDING_RELEASE_MANIFEST=/opt/funding-bot/current/release-manifest.json
+ExecStart=/opt/funding-bot/current/.venv/bin/python -m funding_bot.cli interface --port 8792 --host 127.0.0.1
 UMask=0077
 Restart=on-failure
 RestartSec=5

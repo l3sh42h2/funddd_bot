@@ -41,7 +41,7 @@ def prepare(root, secret_env, cabinet_env=None, *, final_root='/var/lib/funding-
         raise ValueError('legacy FUNDING_* routing must be migrated explicitly')
     if interface_uid is None:
         raise ValueError('explicit interface UID required')
-    root.mkdir(mode=0o750, parents=True)
+    root.mkdir(mode=0o755, parents=True)
     for name in ('core','collector','interface','secrets'):
         (root/name).mkdir(mode=0o700)
     (root/'shared').mkdir(mode=0o770)

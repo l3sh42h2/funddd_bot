@@ -6,9 +6,16 @@ import time
 from pathlib import Path
 from . import config
 from .build_info import BUILD_ID
+from .core.release import load_release
 
 SCHEMA = 1
 HEALTH_MAX = 16384
+HEALTH_BOOT_ID = os.urandom(12).hex()
+RELEASE = load_release()
+
+
+def release_identity():
+    return {key: RELEASE.get(key) for key in ('release_id', 'source_sha256', 'artifact_sha256')}
 
 
 def atomic_json(path, value, mode=0o640):
@@ -54,6 +61,9 @@ def publish_health(table, table_path=None):
             'n_stale_ff','n_stale_sf','src_age','backfill')
     h = {k:table.get(k) for k in keep}
     h["build_id"] = BUILD_ID
+    h.update(release_identity(), boot_id=HEALTH_BOOT_ID, updated_at=time.time())
+    tick = h.get('tick_ts')
+    h['ready'] = isinstance(tick, (int, float)) and 0 <= time.time() - tick <= config.STALE_S
     # Provider notes/error strings may grow without bound; not included in health.
     if len(json.dumps(h).encode()) > HEALTH_MAX:
         h.pop('src_age', None)

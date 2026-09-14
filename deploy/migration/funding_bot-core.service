@@ -10,14 +10,20 @@ Group=funding-core
 SupplementaryGroups=funding-ipc funding-market funding-pace
 WorkingDirectory=/opt/funding-bot/current
 EnvironmentFile=/var/lib/funding-bot/secrets/core.env
-ExecStart=/opt/funding-bot/current/.venv/bin/funding_bot core
+Environment=PYTHONPATH=/opt/funding-bot/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=FUNDING_RELEASE_MANIFEST=/opt/funding-bot/current/release-manifest.json
+ExecStart=/opt/funding-bot/current/.venv/bin/python -m funding_bot.cli core
 RuntimeDirectory=funding-bot
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 UMask=0027
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=78
-TimeoutStopSec=280
+# An unresolved executor is never killed for a deploy deadline. The supervised
+# deploy job remains pending until core releases ownership.
+TimeoutStopSec=infinity
 KillSignal=SIGTERM
 NoNewPrivileges=true
 ProtectSystem=strict

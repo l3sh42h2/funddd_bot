@@ -10,6 +10,7 @@ from ..ipc.paths import interface_state
 from ..ipc.protocol import Client, RpcError
 from ..market_snapshot import atomic_json
 from ..build_info import BUILD_ID
+from ..core.release import load_release
 
 log = logging.getLogger(__name__)
 
@@ -61,12 +62,15 @@ class Interface:
         self.last_core = None
         self.inflight = set()
         self.inflight_lock = threading.RLock()
+        self.boot_id = os.urandom(12).hex()
+        self.release = load_release()
 
     def health(self):
         now = time.time()
-        return dict(schema_version=1,build_id=BUILD_ID,pid=os.getpid(),updated_at=now,
+        return dict(schema_version=1,build_id=BUILD_ID,pid=os.getpid(),boot_id=self.boot_id,updated_at=now,
                     last_poll_at=self.last_poll,last_core_at=self.last_core,
-                    ready=self.last_poll is not None and 0 <= now-self.last_poll <= 105)
+                    ready=self.last_poll is not None and 0 <= now-self.last_poll <= 105,
+                    **{k:self.release.get(k) for k in ('release_id','source_sha256','artifact_sha256')})
 
     def poll_once(self):
         if self.check_startup:

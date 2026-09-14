@@ -1,56 +1,96 @@
 #!/usr/bin/env bash
-# Выкат funding_bot на VPS ireland. Внешнее ревью 11.09 (п.8) и проверка исправлений:
-#   1. тесты на Маке — здесь есть JavaScriptCore, и тест страницы не пропускается;
-#   2. замок выката на сервере: второй одновременный выкат останавливается, а не подменяет .next первому;
-#   3. код → ~/hyper/funding_bot.next, тесты там на Python 3.11 сервера; боевая папка не тронута;
-#   4. .prev = последняя ПРОВЕРЕННАЯ версия, .next → боевая, рестарт; упало переключение — откат;
-#   5. проверки: оба сервиса active, /status отвечает, таблицу пишет новый процесс (pid = MainPID) и живёт 20 с без
-#      рестартов, таблицы непустые — версия помечается проверенной; иначе откат и ненулевой код выхода.
-# Миграции БД только добавляют колонки и таблицы — прежняя версия работает с новой схемой, откат безопасен.
-# runtime/ и .env на сервере не трогаются никогда.
+# The only entry point for M5 build, base inspection, install and status.
 set -euo pipefail
-VPS="admin@34.65.234.12"
-SSH_OPTS=(-i "$HOME/.ssh/google_compute_engine" -o IdentitiesOnly=yes -o UserKnownHostsFile="$HOME/.ssh/google_compute_known_hosts")
-NEXT=/home/admin/hyper/funding_bot.next
-LOCK=/home/admin/hyper/.funding_bot.deploy.lock
-TOKEN="$(hostname -s)-$$-$(date +%s)"
-SRC="$(cd "$(dirname "$0")/.." && pwd)"
-EXCL=(--exclude .venv --exclude runtime --exclude logs --exclude __pycache__ --exclude '*.egg-info' --exclude .env --exclude .pytest_cache)
-on_vps() { ssh "${SSH_OPTS[@]}" "$VPS" "$@"; }
-remote() { local s=$1; shift; on_vps "bash $NEXT/deploy/$s $*"; }
-rollback() {
-  echo '!! возвращаю последнюю проверенную версию'
-  if remote remote_rollback.sh "$TOKEN" && remote remote_verify.sh "$TOKEN" loose; then
-    echo '==> прежняя версия поднята'
-  else
-    echo '!! И ПРЕЖНЯЯ ВЕРСИЯ НЕ ПОДНЯЛАСЬ — нужен человек'
-  fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+M5="$ROOT/deploy/migration"
+VPS="${FUNDING_DEPLOY_VPS:-admin@34.65.234.12}"
+SSH_KEY="${FUNDING_DEPLOY_SSH_KEY:-$HOME/.ssh/google_compute_engine}"
+KNOWN_HOSTS="${FUNDING_DEPLOY_KNOWN_HOSTS:-$HOME/.ssh/google_compute_known_hosts}"
+SSH=(ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$KNOWN_HOSTS")
+SCP=(scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$KNOWN_HOSTS")
+
+die() { echo "ERROR: $*" >&2; exit 2; }
+need_file() { [ -f "$1" ] || die "missing file: $1"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  deploy/deploy.sh build --output ARTIFACT.tar --patchnote PATCHNOTES/name.md [--python /linux/python]
+  deploy/deploy.sh inspect-base --output expected-base.json
+  deploy/deploy.sh install --artifact ARTIFACT.tar --receipt ARTIFACT.tar.receipt.json --expected-base expected-base.json
+  deploy/deploy.sh status RELEASE_ID
+
+Build must run in the compatible Linux verification environment. Install uploads
+only immutable inputs, then starts one detached systemd job which owns flock,
+drain, backup, switch, readiness and any compatible code-only rollback.
+EOF
 }
 
-echo "==> 1/5 тесты на Маке (с тестом страницы в JavaScriptCore)"
-( cd "$SRC" && .venv/bin/python -m pytest tests -q -p no:cacheprovider ) \
-  || { echo '!! ТЕСТЫ НА МАКЕ КРАСНЫЕ — выкат остановлен, сервер не тронут'; exit 1; }
+export FUNDING_M5_ENTRY=deploy/deploy.sh
+cmd="${1:-}"; [ -n "$cmd" ] || { usage; exit 2; }; shift
 
-echo "==> 2/5 замок выката"
-if ! on_vps "mkdir $LOCK && echo $TOKEN > $LOCK/owner"; then
-  echo "!! на сервере идёт другой выкат: $(on_vps "cat $LOCK/owner; stat -c %y $LOCK" 2>/dev/null || true)"
-  echo "   если он мёртв — снять замок руками: ssh $VPS rm -rf $LOCK"
-  exit 1
-fi
-trap 'on_vps "[ \"\$(cat $LOCK/owner 2>/dev/null)\" = $TOKEN ] && rm -rf $LOCK" || true' EXIT
-
-echo "==> 3/5 код -> $NEXT, тесты на сервере (боевая папка не тронута)"
-rsync -az --delete "${EXCL[@]}" -e "ssh ${SSH_OPTS[*]}" "$SRC/" "$VPS:$NEXT/"
-remote remote_test.sh "$TOKEN" || { echo '!! ТЕСТЫ НА СЕРВЕРЕ КРАСНЫЕ — выкат остановлен, боевая версия не тронута'; exit 1; }
-
-echo "==> 4/5 снимок проверенной версии, переключение, рестарт"
-remote remote_switch.sh "$TOKEN" || { echo '!! ПЕРЕКЛЮЧЕНИЕ УПАЛО НА ПОЛПУТИ'; rollback; exit 1; }
-
-echo "==> 5/5 проверки после рестарта"
-if remote remote_verify.sh "$TOKEN" strict; then
-  echo "==> done"
-else
-  echo '!! ПРОВЕРКИ НЕ ПРОШЛИ'
-  rollback
-  exit 1
-fi
+case "$cmd" in
+  build)
+    output= patchnote= python="${PYTHON:-python3}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --output) output="${2:-}"; shift 2;;
+        --patchnote) patchnote="${2:-}"; shift 2;;
+        --python) python="${2:-}"; shift 2;;
+        *) die "unknown build argument: $1";;
+      esac
+    done
+    [ -n "$output" ] && [ -n "$patchnote" ] || die "--output and --patchnote are required"
+    exec "$python" "$M5/build_verified.py" --root "$ROOT" --output "$output" \
+      --profile "$M5/test-profile-linux.json" --compatibility "$M5/compatibility.json" \
+      --patchnote "$patchnote" --python "$python"
+    ;;
+  inspect-base)
+    output=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in --output) output="${2:-}"; shift 2;; *) die "unknown inspect argument: $1";; esac
+    done
+    [ -n "$output" ] || die "--output is required"
+    incoming="$("${SSH[@]}" "$VPS" "mktemp -d /var/tmp/funding-m5-inspect.XXXXXXXX")"
+    [[ "$incoming" =~ ^/var/tmp/funding-m5-inspect\.[a-zA-Z0-9]+$ ]] || die "unsafe remote temporary path"
+    "${SCP[@]}" "$M5/artifacts.py" "$M5/deploy_ipc.py" "$M5/prepare_layout.py" "$M5/server_job.py" "$VPS:$incoming/" >/dev/null
+    "${SSH[@]}" "$VPS" "sudo env FUNDING_M5_ENTRY=deploy/deploy.sh /usr/bin/python3 '$incoming/server_job.py' inspect-base" > "$output"
+    "${SSH[@]}" "$VPS" "rm -rf '$incoming'"
+    echo "base snapshot: $output"
+    ;;
+  install)
+    artifact= receipt= expected=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --artifact) artifact="${2:-}"; shift 2;;
+        --receipt) receipt="${2:-}"; shift 2;;
+        --expected-base) expected="${2:-}"; shift 2;;
+        *) die "unknown install argument: $1";;
+      esac
+    done
+    [ -n "$artifact" ] && [ -n "$receipt" ] && [ -n "$expected" ] || die "artifact, receipt and expected base required"
+    need_file "$artifact"; need_file "$receipt"; need_file "$expected"
+    release_id="$("${PYTHON:-python3}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["release_id"])' "$receipt")"
+    [[ "$release_id" =~ ^[a-zA-Z0-9._-]{8,80}$ ]] || die "unsafe release id"
+    incoming="$("${SSH[@]}" "$VPS" "mktemp -d /var/tmp/funding-m5-$release_id.XXXXXXXX")"
+    [[ "$incoming" =~ ^/var/tmp/funding-m5-[a-zA-Z0-9._-]+\.[a-zA-Z0-9]+$ ]] || die "unsafe remote temporary path"
+    "${SCP[@]}" "$artifact" "$VPS:$incoming/artifact.tar" >/dev/null
+    "${SCP[@]}" "$receipt" "$VPS:$incoming/receipt.json" >/dev/null
+    "${SCP[@]}" "$expected" "$VPS:$incoming/expected-base.json" >/dev/null
+    "${SCP[@]}" "$M5/artifacts.py" "$M5/deploy_ipc.py" "$M5/prepare_layout.py" "$M5/server_job.py" "$VPS:$incoming/" >/dev/null
+    unit="funding-bot-deploy-$release_id"
+    "${SSH[@]}" "$VPS" "sudo systemd-run --quiet --collect --unit '$unit' --property=Type=oneshot \
+      --property=TimeoutStartSec=infinity --setenv=FUNDING_M5_ENTRY=deploy/deploy.sh \
+      /usr/bin/python3 '$incoming/server_job.py' install --artifact '$incoming/artifact.tar' \
+      --receipt '$incoming/receipt.json' --expected-base '$incoming/expected-base.json'"
+    echo "supervised job started: $unit"
+    echo "rerun: deploy/deploy.sh status $release_id"
+    ;;
+  status)
+    release_id="${1:-}"; [[ "$release_id" =~ ^[a-zA-Z0-9._-]{8,80}$ ]] || die "release id required"
+    unit="funding-bot-deploy-$release_id"
+    "${SSH[@]}" "$VPS" "sudo systemctl status --no-pager '$unit' || true; sudo journalctl -u '$unit' -n 80 --no-pager"
+    ;;
+  *) usage; die "unknown command: $cmd";;
+esac

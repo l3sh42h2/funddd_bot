@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "platform": "linux",
+  "argv": ["-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"],
+  "paths": ["tests"],
+  "environment": {"PYTHONDONTWRITEBYTECODE": "1"}
+}

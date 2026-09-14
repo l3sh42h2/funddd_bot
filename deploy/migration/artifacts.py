@@ -15,6 +15,8 @@ import sys
 import tempfile
 from contextlib import contextmanager
 
+HASH_LEN = 64
+
 
 class Refused(RuntimeError):
     pass
@@ -26,6 +28,16 @@ def digest(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def value_digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def require_sha256(value, label='sha256'):
+    if not isinstance(value, str) or len(value) != HASH_LEN or any(c not in '0123456789abcdef' for c in value):
+        raise Refused(f'invalid {label}')
+    return value
 
 
 def canonical(value):
@@ -56,6 +68,66 @@ def source_manifest(root, paths):
     return out
 
 
+def tree_manifest(root, *, excluded=()):
+    """Hash every regular file below root; refuse links and special files.
+
+    ``excluded`` contains top-level names.  It is intended for non-source state
+    such as .git/.venv/runtime, never for selecting a convenient source subset.
+    """
+    root = Path(root).resolve(strict=True)
+    skip = set(excluded)
+    names = []
+    for p in sorted(root.rglob('*')):
+        rel = p.relative_to(root)
+        if rel.parts and rel.parts[0] in skip:
+            continue
+        if p.is_symlink():
+            raise Refused(f'source symlink: {rel}')
+        if p.is_dir():
+            continue
+        if not p.is_file():
+            raise Refused(f'non-regular source path: {rel}')
+        names.append(rel.as_posix())
+    return source_manifest(root, names)
+
+
+def dependency_fingerprint(lockfile, wheelhouse):
+    wheelhouse = Path(wheelhouse).resolve(strict=True)
+    wheels = tree_manifest(wheelhouse)
+    if not wheels or any(not name.endswith('.whl') for name in wheels):
+        raise Refused('wheelhouse must contain wheels only')
+    return {'lock_sha256': digest(lockfile), 'wheels': wheels,
+            'wheelset_sha256': value_digest(wheels)}
+
+
+def profile_fingerprint(profile, root):
+    """Bind the test argv/config plus every named test or fixture byte."""
+    if not isinstance(profile, dict) or type(profile.get('version')) is not int:
+        raise Refused('invalid test profile')
+    argv, paths = profile.get('argv'), profile.get('paths')
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
+        raise Refused('invalid test argv')
+    if not isinstance(paths, list) or not paths:
+        raise Refused('test profile paths required')
+    files = []
+    base = Path(root).resolve(strict=True)
+    for name in paths:
+        p = Path(name)
+        if p.is_absolute() or '..' in p.parts or str(p) != name:
+            raise Refused('invalid test profile path')
+        target = base / p
+        if target.is_dir():
+            files.extend(x.relative_to(base).as_posix() for x in sorted(target.rglob('*')) if x.is_file())
+        elif target.is_file():
+            files.append(name)
+        else:
+            raise Refused('test profile path missing')
+    manifest = source_manifest(base, sorted(set(files)))
+    body = json.loads(canonical(profile))
+    return {'definition': body, 'definition_sha256': value_digest(body),
+            'inputs': manifest, 'inputs_sha256': value_digest(manifest)}
+
+
 def verification_identity(*, artifact, sources, dependencies, runtime, profile):
     if not sources or not dependencies or not runtime or not profile:
         raise Refused('incomplete verification identity')
@@ -67,10 +139,7 @@ def verified_receipt(identity, *, exit_code, passed, failed, evidence_sha256):
     if (type(exit_code) is not int or exit_code != 0 or type(passed) is not int or passed <= 0
             or type(failed) is not int or failed != 0):
         raise Refused('test profile did not pass')
-    if not isinstance(evidence_sha256, str) or len(evidence_sha256) != 64 or any(
-        c not in '0123456789abcdef' for c in evidence_sha256
-    ):
-        raise Refused('test output fingerprint required')
+    require_sha256(evidence_sha256, 'test output fingerprint')
     return dict(identity=json.loads(canonical(identity)), passed=passed, failed=0,
                 exit_code=0, evidence_sha256=evidence_sha256)
 
@@ -90,6 +159,7 @@ def require_verified(receipt, expected):
 
 def atomic_json(path, value):
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     body = canonical(value).encode() + b'\n'
     fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
     try:
