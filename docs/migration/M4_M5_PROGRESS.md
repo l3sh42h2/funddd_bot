@@ -79,3 +79,17 @@ Linux checkpoint выполнен после последних code-право�
 - Новые интеграционные проверки подтверждают fresh approval только остатка и отсутствие лишних отправок.
 - M5 supervised runner реализован в ветке, но повторное Astra review обнаружило незакрытые crash/retry/rollback случаи.
 - Последний целевой профиль EVM/root/SOL callbacks: 57 passed. Полная приёмка и выкат ещё впереди.
+
+### Реальный срез и Linux DAC (не полная приёмка)
+
+- По отдельному разрешению владельца снят read-only whitelist финансовых записей двух EVM сделок в приватные
+  локальные `/tmp` файлы. Ни ключи/подписанные payload, ни raw snapshots в Git не передавались.
+- Offline subprocess replay frozen `95354c4` против `3cdfaee` не обнаружил различий проекций на обеих записях.
+  Это НЕ verified-known-complete: у legacy EVM нет durable evidence полноты fills/funding;
+  при отсутствующей цене native gas итог cash basis/PnL остаётся неизвестным в обеих версиях.
+- Срезы SHA256: `0b445c3ec31fd0f8f3a157d7668fe310fd2dae3a4cb622adcadc3f704861512f`,
+  `28f519d6cc275170f1d50ba1273706d089ab58908e546451baa0f6f5c516bdc1`.
+- После отдельного разрешения владельца код `3cdfaee` загружен во временную папку Ireland VPS для одного Linux
+  root DAC fixture: `test_shared_pace_dac_allows_two_uids_but_denies_private_controls` — **1 passed, 0.20s**.
+  Использованы синтетические UID/файлы; source archive и временные каталоги удалены. Production services/data не менялись.
+- Это отдельный тест прав, не полная проверка Linux-артефакта и не боевой выкат. M4/M5 остаются in_progress.
