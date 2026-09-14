@@ -972,11 +972,11 @@ def recover_transition(paths, commands, client_factory, transition):
                 if previous.get('status') != 'healthy':
                     prove_inactive_offline_fence(paths, commands, previous)
                 else:
+                    if transition.get('ui_only'):
+                        raise DeployFailure('UI_RECOVERY_CORE_INACTIVE')
                     try:
                         durable_drain(paths.state / 'core/trade.db')
                     except DeployFailure:
-                        if transition.get('ui_only'):
-                            raise DeployFailure('UI_RECOVERY_CORE_INACTIVE')
                         install_units(previous_release, commands)
                         commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
                         commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)

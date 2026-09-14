@@ -381,7 +381,7 @@ def test_ui_only_recovery_never_restarts_inactive_core(tmp_path, monkeypatch):
         def run(self, argv, **kwargs):
             events.append(' '.join(map(str, argv)))
             return subprocess.CompletedProcess(argv, 3, '')
-    monkeypatch.setattr(job, 'durable_drain', lambda *a: (_ for _ in ()).throw(job.DeployFailure('undrained')))
+    monkeypatch.setattr(job, 'durable_drain', lambda *a: pytest.fail('UI-only recovery must not inspect/start core'))
     with pytest.raises(job.DeployFailure, match='UI_RECOVERY_CORE_INACTIVE'):
         job.recover_transition(paths, Commands(), object(), transition)
     assert not any(x == 'systemctl start funding_bot-core.service' for x in events)
