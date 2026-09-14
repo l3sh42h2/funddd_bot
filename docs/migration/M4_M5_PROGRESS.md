@@ -1,7 +1,8 @@
 # M4/M5 — промежуточное состояние, НЕ акт приёмки
 
 Исполнитель: Codex. Ветка `codex/migration-m4-m5`, исходная база `95354c4`.
-Независимый ревьюер пока не назначен владельцем. Дата: 2026-09-14.
+Независимый ревьюер: GPT-6 Astra xhigh, назначен владельцем. Дата: 2026-09-14.
+Ниже сохранена история checkpoint; актуальное дополнение — в конце документа.
 
 ## Реализовано и подключено
 
@@ -70,3 +71,11 @@ Linux checkpoint выполнен после последних code-право�
 - Targeted monetary/ledger/drain tests: 124 passed; local IPC/process tests: 17 passed (Unix sockets require sandbox exemption).
 - Helpers: GPT-5.6 Sol high for replay and deploy, isolated worktrees. Independent reviewer GPT-6 Astra xhigh is reviewing this checkpoint.
 - This is an integration checkpoint, NOT M4/M5 acceptance: replay, generic adapter wiring, presenter boundary, integrated deploy/health verification and VPS switch remain outstanding.
+
+### Общие корневые операции и повторное ревью M5
+
+- EVM подключён к operations: fresh approval, запуск, reserve/settle, пауза и ручной resume той же цели.
+- operation_roots детерминированно отображает незавершённые legacy intents, не меняя исторические JSON/hash.
+- Новые интеграционные проверки подтверждают fresh approval только остатка и отсутствие лишних отправок.
+- M5 supervised runner реализован в ветке, но повторное Astra review обнаружило незакрытые crash/retry/rollback случаи.
+- Последний целевой профиль EVM/root/SOL callbacks: 57 passed. Полная приёмка и выкат ещё впереди.

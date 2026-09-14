@@ -874,16 +874,30 @@ def approve_intent(con, intent_id: str, nonce: str, now: float | None = None) ->
     одобрение. False — уже принято/истекло/чужой nonce. StoreBusy — другое намерение уже идёт."""
     ts = time.time() if now is None else now
     try:
-        return con.execute("UPDATE intents SET status=?, approved=? WHERE id=? AND nonce=? AND status=? AND expires>?",
-                           (str(IntentStatus.APPROVED), ts, intent_id, nonce, str(IntentStatus.PROPOSED),
-                            ts)).rowcount == 1
+        with tx(con):
+            n = con.execute("UPDATE intents SET status=?, approved=? WHERE id=? AND nonce=? AND status=? AND expires>?",
+                            (str(IntentStatus.APPROVED), ts, intent_id, nonce, str(IntentStatus.PROPOSED), ts)).rowcount
+            if n:
+                from .operation_roots import approve_linked
+                approve_linked(con, get_intent(con, intent_id))
+            return n == 1
     except sqlite3.IntegrityError:
         raise StoreBusy("уже идёт другое исполнение") from None
 
 
+def _close_proposed_root(con, intent_id, state):
+    op = operation_of_intent(con, intent_id)
+    if op is not None and op['state'] == OpState.PROPOSED:
+        set_operation_state(con, op['id'], state, expect=OpState.PROPOSED)
+
+
 def reject_intent(con, intent_id: str, nonce: str) -> bool:
-    return con.execute("UPDATE intents SET status=? WHERE id=? AND nonce=? AND status=?",
-                       (str(IntentStatus.REJECTED), intent_id, nonce, str(IntentStatus.PROPOSED))).rowcount == 1
+    with tx(con):
+        n = con.execute("UPDATE intents SET status=? WHERE id=? AND nonce=? AND status=?",
+                        (str(IntentStatus.REJECTED), intent_id, nonce, str(IntentStatus.PROPOSED))).rowcount
+        if n:
+            _close_proposed_root(con, intent_id, OpState.REJECTED)
+        return n == 1
 
 
 def expire_intents(con, now: float | None = None) -> list[str]:
@@ -895,6 +909,8 @@ def expire_intents(con, now: float | None = None) -> list[str]:
         if ids:
             con.executemany("UPDATE intents SET status=? WHERE id=? AND status=?",
                             [(str(IntentStatus.EXPIRED), i, str(IntentStatus.PROPOSED)) for i in ids])
+            for iid in ids:
+                _close_proposed_root(con, iid, OpState.EXPIRED)
     return ids
 
 
@@ -1151,6 +1167,8 @@ def supersede_intents(con, deal_id: str, keep: str) -> list[str]:
                                          (deal_id, str(IntentStatus.PROPOSED), keep))]
         con.executemany("UPDATE intents SET status=?, err=COALESCE(err, 'superseded') WHERE id=? AND status=?",
                         [(str(IntentStatus.EXPIRED), i, str(IntentStatus.PROPOSED)) for i in ids])
+        for iid in ids:
+            _close_proposed_root(con, iid, OpState.EXPIRED)
     return ids
 
 

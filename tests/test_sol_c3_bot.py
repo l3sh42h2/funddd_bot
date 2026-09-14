@@ -135,7 +135,8 @@ def test_engine_refuses_button_whose_operation_is_no_longer_the_approved_one(tmp
     x = w.desk.propose_exit(prop.deal_id, None, False, chat=None)
     op = store.operation_of_intent(w.con, x.intent_id)
     assert store.approve_intent(w.con, x.intent_id, x.nonce, now=w.clock())
-    store.set_operation_state(w.con, op["id"], OpState.EXPIRED)
+    store.set_operation_state(w.con, op["id"], OpState.STOPPED)
+    store.set_operation_state(w.con, op["id"], OpState.ABANDONED)
     n = len(w.sol.sends)
     w.engine.execute(x.intent_id)
     assert store.get_intent(w.con, x.intent_id)["status"] == IntentStatus.FAILED

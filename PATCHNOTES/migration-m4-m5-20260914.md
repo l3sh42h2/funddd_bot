@@ -28,3 +28,15 @@ Scope: OperationController, Ledger/recovery/replay, архитектурные �
 - Linux checkpoint: 158 passed / 82.12s, DAC 1 passed / 0.05s, без live-данных и нагрузочного теста.
 
 Владелец разрешил двух помощников: m4_replay — GPT-5.6 Sol high (replay/учёт), m5_deploy — GPT-5.6 Sol high (deploy). Каждый работает в отдельном worktree; интеграция и выкат остаются у основного Codex.
+
+Checkpoint общего lifecycle и корневых операций (2026-09-14, ещё in_progress):
+- EVM и SOL используют общий цикл клипов; EVM approval/start/reserve/settle/resume теперь связаны с существующей
+  таблицей operations. Новая команда продолжения сохраняет исходную цель и требует свежего одобрения остатка.
+- Детерминированное отображение незавершённого legacy intent в root не переписывает исторические JSON/hash;
+  подтверждённое списание и неизвестный резерв восстанавливаются отдельно. Неполное доказательство блокирует миграцию.
+- Refused/requote до первого действия освобождает неиспользованный root; approved intent и root принимаются атомарно.
+- Профильные результаты при интеграции: 78 passed/1 fixture mismatch (исправлено), SOL 58 passed/1 старый transition
+  в тесте (исправлено), затем EVM/root integration + SOL callbacks 57 passed. Финальный полный набор ещё не выполнен.
+- M5 получил durable transition journal, проверку артефакта/runner/runtime при reuse, независимые health identities,
+  повтор доказательства drain после UI ACK. Astra повторно проверяет crash/retry/rollback; замечания ещё открыты.
+- Это исходный код ветки, не установленный релиз. M4/M5 и итоговая приёмка остаются незавершёнными.

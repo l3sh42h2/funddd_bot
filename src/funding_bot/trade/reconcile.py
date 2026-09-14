@@ -176,8 +176,10 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
                        "(?,?) ORDER BY c.id", (deal["id"], str(ClipState.DEX_SENT), str(ClipState.DEX_UNKNOWN))).fetchall()
     for c in rows:
         cid, st = int(c["id"]), c["state"]
+        op = store.operation_of_intent(con, c['intent_id'])
+        root = dict(operation_id=op['id'], reserve_raw=int(c['planned_in'])) if op else {}
         if legs.sim:
-            OperationController(con).settle_spot(cid, SpotSettlement(False))
+            OperationController(con).settle_spot(cid, SpotSettlement(False), **root)
             store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st,
                         why="симуляция: состояние потеряно при перезапуске — клип не случился")
             continue
@@ -188,7 +190,7 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
             ok = _refetch_amounts(con, legs.spot, ok, tok.get(cid, (None, None)))
         if ok is not None and ok["amount_in"] is not None and ok["amount_out"] is not None:
             OperationController(con).settle_spot(
-                cid, SpotSettlement(True, int(ok["amount_in"]), int(ok["amount_out"])))
+                cid, SpotSettlement(True, int(ok["amount_in"]), int(ok["amount_out"])), **root)
             store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st, now="DEX_OK", tx=ok["tx_hash"])
             continue
         unknown = ok is not None or any(t["state"] in UNRESOLVED_TX for t in txs) \
@@ -199,7 +201,7 @@ def resolve_clips(con, deal: dict, legs: Legs) -> list[str]:
             out.append(f"клип {cid}: исход свопа неизвестен")
             continue
         # не подписан (строки нет — отправки не было: запись идёт ДО неё) / выброшен / откатился / отменён
-        OperationController(con).settle_spot(cid, SpotSettlement(False))
+        OperationController(con).settle_spot(cid, SpotSettlement(False), **root)
         store.event(con, "reconcile_clip", deal_id=deal["id"], clip_id=cid, was=st, now="DEX_REVERTED",
                     txs=[(t["tx_hash"], t["state"]) for t in txs])
     return out
@@ -475,6 +477,19 @@ def startup(con, legs_fn: Callable[[bool], Legs | None], *, now: float | None = 
             store.set_deal_state(con, d["id"], new, reason=reason, **fields)
         store.event(con, "restart_check", deal_id=d["id"], old=d["state"], new=str(new), matched=chk.matched,
                     detail=chk.detail, now=ts)
+        try:
+            from .operation_roots import adopt_legacy
+            oid = adopt_legacy(con, store.get_deal(con, d['id']))
+            if oid:
+                op = store.get_operation(con, oid)
+                if op['state'] in (store.OpState.APPROVED, store.OpState.RUNNING, store.OpState.PAUSED_UNKNOWN):
+                    target = store.OpState.PAUSED_UNKNOWN if int(op['reserved_raw']) else store.OpState.STOPPED
+                    store.set_operation_state(con, oid, target, reason='restart: fresh owner approval required')
+        except (store.StoreError, ValueError) as e:
+            store.event(con, 'operation_migration_blocked', deal_id=d['id'], why=str(e))
+            if store.get_deal(con, d['id'])['state'] not in (DealState.CLOSED, DealState.ABORTED):
+                store.set_deal_state(con, d['id'], DealState.HALTED_MISMATCH, reason='operation evidence incomplete')
+                new = DealState.HALTED_MISMATCH
         out.append(DealRestart(deal=d, check=chk, old=d["state"], new=str(new), intents=ints.get(d["id"], [])))
     return StartupReport(interrupted, expired, drafts, out, wallet_problems, bf)
 

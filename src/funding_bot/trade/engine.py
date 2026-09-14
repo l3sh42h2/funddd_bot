@@ -1081,6 +1081,21 @@ class Desk:
             raise Refused(v.refused(f"дневной стоп: издержки сегодня {v.money(used, html=False)} ≥ {v.leg(stop)} — "
                                     "вход запрещён"))
 
+    def _root_proposal(self, deal, kind, spec, plan, chat, operation_id=None):
+        from .operation_roots import propose
+        profile = owner_mod.EVM_PROFILE_OF.get(_deal_cv(deal), owner_mod.LEGACY_PROFILE)
+        spec = dict(spec)
+        spec["approval"] = {
+            "side": kind,
+            "target_raw": sum(c.dex_in_units for c in plan.clips) if kind == "entry" else int(spec["units"]),
+            "approved_total_pct": plan.est.get("total_pct"),
+            "plan_cost_drift_pct": OwnerCfg.from_frozen(spec["owner"]).get("exec.plan_cost_drift_pct"),
+        }
+        if kind == "entry":
+            spec["approval"]["funding_h"] = spec.get("funding_h")
+        return propose(self.conns.get(), deal=deal, kind=kind, spec=spec, plan=plan,
+                       profile_id=profile, chat=chat, operation_id=operation_id)
+
     def propose_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, chat: int | None,
                       deal_id: str | None = None) -> Proposal:
         plan, ctx = self.plan_entry(coin, spot_s, perp_s, usd)
@@ -1107,7 +1122,7 @@ class Desk:
                 "token_dec": pair.token_dec, "symbol": pair.symbol, "period_h": pair.period_h, "sim": sim,
                 "owner": cfg.frozen_json(), "funding_h": ctx["mkt"].funding_h,
                 "instrument": inst.as_dict(), "inst_hash": inst.inst_hash()}
-        iid, nonce = store.create_intent(con, deal_id=deal_id, kind="entry", spec=spec, plan=plan, chat=chat)
+        iid, nonce = self._root_proposal(store.get_deal(con, deal_id), "entry", spec, plan, chat)
         html = _views().plan(self.plan_view(iid, plan, ctx))
         store.event(con, "proposed", deal_id=deal_id, intent_id=iid, total_usd=plan.est.get("total_usd"),
                     n=plan.est.get("n"), sim=sim)
@@ -1311,7 +1326,10 @@ class Desk:
                 "inst_hash": inst.inst_hash(),
                 "root": None, "root_units": ctx.get("units", 0)}      # корень цепочки «продолжить» — само намерение
         con = self.conns.get()
-        iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="exit", spec=spec, plan=plan, chat=chat)
+        if perp_only:
+            iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="exit", spec=spec, plan=plan, chat=chat)
+        else:
+            iid, nonce = self._root_proposal(deal, "exit", spec, plan, chat)
         html = _views().plan(self.plan_view(iid, plan, ctx))
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"),
                     sim=bool(deal["sim"]))
@@ -1417,25 +1435,35 @@ class Desk:
         if last is None:
             raise Refused(v.refused("у сделки нет входа — продолжать нечего"))
         spec = json.loads(last["spec_json"])
+        op = None
+        if not spec.get('perp_only'):
+            from .operation_roots import adopt_legacy
+            try:
+                oid = adopt_legacy(con, deal)
+                op = store.get_operation(con, oid) if oid else None
+            except (store.StoreError, ValueError) as e:
+                raise Refused(v.refused(f'цель операции не подтверждена: {e}')) from None
+            if op and int(op['reserved_raw']):
+                raise Refused(v.refused('исход прошлой отправки неизвестен — сначала «позиции»'))
+            if op and op['state'] == store.OpState.PAUSED_UNKNOWN:
+                store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason='reservation resolved')
         if last["kind"] == "entry" and last["status"] in (IntentStatus.PARTIAL, IntentStatus.INTERRUPTED,
                                                           IntentStatus.FAILED):
-            spent = sum((int(c["dex_in"] or 0) for c in con.execute(
-                "SELECT c.dex_in FROM clips c JOIN intents i ON c.intent_id=i.id WHERE i.deal_id=? AND i.kind='entry' "
-                "AND c.state NOT IN ('PLANNED','DEX_REVERTED')", (deal["id"],))), 0)
+            if not op:
+                raise Refused(v.refused('нет подтверждённой корневой цели входа'))
             stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
-            rest = D(str(deal["leg_usd"])) - D(spent) / D(10) ** sdec
+            rest = D(store.operation_remaining(op)) / D(10) ** sdec
             if rest <= 0:
                 raise Refused(v.refused("вход уже набран полностью"))
-            rest = rest.quantize(D("0.01"), ROUND_FLOOR)
-            if deal["state"] != DealState.PAUSED:
+            if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
                 raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
-            return self._propose_entry_more(deal, rest, spec, chat)
+            return self._propose_entry_more(deal, rest, spec, chat, operation_id=op["id"])
         if last["kind"] == "exit" and last["status"] in (IntentStatus.PARTIAL, IntentStatus.INTERRUPTED,
                                                          IntentStatus.FAILED):
-            if not spec.get("all") and not spec.get("perp_only"):
+            if not spec.get("perp_only") and op:
                 # ревью 13.09, Н1: повтор исходной суммы продал бы её ещё раз (150-200 % заказанного) — остаток в
                 # токенах от замороженной цели прерванного намерения
-                return self._propose_exit_more(deal, dict(last), spec, chat)
+                return self._propose_exit_more(deal, dict(last), spec, chat, operation_id=op["id"])
             return self.propose_exit(deal["id"], None if spec.get("all") else dget(spec.get("usd")),
                                      bool(spec.get("perp_only")), chat)          # весь спот / весь шорт — повтор верен
         raise Refused(v.refused(f"последнее намерение {last['id']} — {last['status']}: продолжать нечего"))
@@ -1446,7 +1474,7 @@ class Desk:
         return sum((int(c["dex_in"] or 0) for c in clips
                     if c["state"] not in (ClipState.PLANNED, ClipState.DEX_REVERTED)), 0)
 
-    def _propose_exit_more(self, deal: dict, last: dict, spec0: dict, chat: int | None) -> Proposal:
+    def _propose_exit_more(self, deal: dict, last: dict, spec0: dict, chat: int | None, *, operation_id=None) -> Proposal:
         """«продолжить» прерванного частичного выхода (ревью 13.09, Н1): остаток = цель прерванного намерения в токенах −
         продано им. Каждое звено хранит свою цель, у кнопки её не пересчитывают — по цепочке это цель корня − Σ продаж.
         Частичный остаётся частичным (all=False); полный выход идёт веткой spec.all и остаётся полным."""
@@ -1470,26 +1498,31 @@ class Desk:
                                     f"{deal['coin']} — остаток не вычислить; «выход {deal['id']} <остаток $>»"))
         root = spec0.get("root") or last["id"]
         root_units = int(spec0.get("root_units") or target)
-        rest = target - sold
+        op = store.get_operation(con, operation_id) if operation_id else None
+        if op and int(op['reserved_raw']):
+            raise Refused(v.refused('резерв операции ещё не разрешён'))
+        rest = store.operation_remaining(op) if op else target - sold
+        if op:
+            root_units = int(op['target_raw'])
         if rest <= 0:
             ts = D(10) ** dec
             raise Refused(v.refused(f"выход {root} выполнен: продано {v.tok(D(root_units - rest) / ts)} из "
                                     f"{v.tok(D(root_units) / ts)} {deal['coin']}"))
         plan, ctx = self.plan_exit(deal, None, False, units=rest, cfg=cfg, write_checks=False)
         inst = ctx["inst"]
-        full = bool(ctx.get("m2_full"))        # m ≠ 1: остаток меньше шага·m — выход всей сделки (ревью 13.09, M2)
+        full = bool(spec0.get("all")) or bool(ctx.get("m2_full"))        # m ≠ 1: остаток меньше шага·m — выход всей сделки (ревью 13.09, M2)
         usd = plan.leg_usd.quantize(D("0.01"), ROUND_HALF_EVEN)  # ≈ $ остатка — только шапка и кнопка («50 из 200 $»)
         spec = {"kind": "exit", "coin": deal["coin"], "usd": usd, "units": int(ctx["units"]), "all": full,
                 "perp_only": False, "token": deal["token"], "token_dec": dec, "symbol": deal["symbol"],
                 "period_h": ctx["pair"].period_h, "sim": sim, "owner": cfg.frozen_json(), "resume": True,
                 "root": root, "root_units": root_units, "instrument": inst.as_dict(), "inst_hash": inst.inst_hash()}
-        iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="exit", spec=spec, plan=plan, chat=chat)
+        iid, nonce = self._root_proposal(deal, "exit", spec, plan, chat, operation_id=operation_id)
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"), sim=sim)
         if not full:
             ctx.update(resume=True, exit_root_units=root_units, usd=usd, full=False)  # «Остаток выхода: 1 222 из 2 445»
         return Proposal(iid, nonce, deal["id"], "exit", v.plan(self.plan_view(iid, plan, ctx)), plan)
 
-    def _propose_entry_more(self, deal: dict, usd: D, spec0: dict, chat: int | None) -> Proposal:
+    def _propose_entry_more(self, deal: dict, usd: D, spec0: dict, chat: int | None, *, operation_id=None) -> Proposal:
         inst = deal_instrument(self.conns.get(), deal)
         if not inst.verified:                  # m не подтверждён (ревью 13.09, R6): наращивать нельзя, закрывать можно
             raise Refused(_views().refused(f"инструмент сделки {deal['id']} не подтверждён ({inst.why}) — добор "
@@ -1506,7 +1539,7 @@ class Desk:
         spec.update(token=inst.token, token_dec=inst.token_dec, symbol=inst.perp_symbol, instrument=inst.as_dict(),
                     inst_hash=inst.inst_hash())                 # всё — от инструмента СДЕЛКИ, не свежей строки
         con = self.conns.get()
-        iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="entry", spec=spec, plan=plan, chat=chat)
+        iid, nonce = self._root_proposal(deal, "entry", spec, plan, chat, operation_id=operation_id)
         ctx.update(resume=True, deal_leg_usd=dget(deal["leg_usd"]))      # «Остаток входа: 250 из 500 $»
         return Proposal(iid, nonce, deal["id"], "entry", _views().plan(self.plan_view(iid, plan, ctx)), plan)
 
@@ -1634,6 +1667,7 @@ class Run:
     seq: int = 0
     n_total: int = 0
     sim_txs: list = field(default_factory=list)
+    op_id: str | None = None
     m: D = D(1)                       # токенов в контракте — из инструмента сделки (заполняет _execute)
     inst: InstrumentSpec | None = None
     m_known: bool = True              # False — m не известен (ревью 13.09, M3): m = 1 лишь заглушка
@@ -1774,6 +1808,11 @@ class Engine:
         con = self.conns.get()
         try:
             store.set_intent_status(con, iid, IntentStatus.FAILED, expect=expect, err=text)
+            op = store.operation_of_intent(con, iid)
+            if op and op['state'] == store.OpState.APPROVED and not int(op['reserved_raw']):
+                store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason=text)
+                if not int(op['confirmed_raw']):
+                    store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason=text)
         except store.StoreError as e:
             log.error("намерение %s → failed: %s", iid, e)
         self.hooks.report(_views().refused(text))
@@ -1815,12 +1854,14 @@ class Engine:
         try:
             f = legs.perp.filters(deal["symbol"])
         except Exception as e:                 # noqa — ничего не отправлено
-            store.set_intent_status(con, iid, IntentStatus.FAILED, err=f"фильтры перпа: {redact(e)}")
-            self.hooks.report(_views().refused(f"фильтры {deal['symbol']} не прочитаны: {redact(e)}"))
+            self._fail(iid, f"фильтры {deal['symbol']} не прочитаны: {redact(e)}",
+                       expect=IntentStatus.RUNNING)
             return
         run = Run(it=it, deal=deal, kind=it["kind"], spec=spec, plan=plan_from_json(it["plan_json"]), legs=legs,
                   cfg=cfg, token=deal["token"], dec=int(deal["token_dec"]), symbol=deal["symbol"], stable=stable,
                   sdec=int(sdec), f=f, started=self.clock())
+        op = store.operation_of_intent(con, iid)
+        run.op_id = op['id'] if op else None
         run.inst = inst                        # единицы сделки (ревью 13.09, С1): токены ↔ контракты через m
         run.m, run.m_known = inst.m, m_known(inst)
         store.event(con, "start", deal_id=run.did, intent_id=iid, intent_kind=run.kind, sim=legs.sim)
@@ -1830,6 +1871,9 @@ class Engine:
                 return
             run.plan = fresh
         try:
+            if run.op_id:
+                from .operation_roots import start_linked
+                start_linked(con, store.get_intent(con, iid))
             if run.kind != "undo":
                 self._perp_ab(run)             # «auto» без чисел плана — пауза до первого действия, а не посреди клипа
             {"entry": self._entry, "exit": self._exit, "rehedge": self._rehedge, "undo": self._undo}[run.kind](run)
@@ -1898,6 +1942,7 @@ class Engine:
         if reasons:
             why = "; ".join(reasons)
             store.set_intent_status(con, run.iid, IntentStatus.FAILED, err=f"перекотировка: {why}")
+            self._release_unstarted_root(run)
             store.event(con, "requote", deal_id=run.did, intent_id=run.iid, why=why)
             self.hooks.requote(run.iid, why)
             return None
@@ -1906,7 +1951,15 @@ class Engine:
                     exec_time_max_s=fresh.est.get("exec_time_max_s"))    # числа, с которыми пойдут заявки
         return fresh
 
+    def _release_unstarted_root(self, run: Run) -> None:
+        con = self.conns.get()
+        op = store.operation_of_intent(con, run.iid)
+        if op and op['state'] == store.OpState.APPROVED and not int(op['reserved_raw']):
+            store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason='plan not started')
+            if not int(op['confirmed_raw']):
+                store.set_operation_state(con, op['id'], store.OpState.ABANDONED, reason='plan not started')
     def _abort_draft(self, run: Run) -> None:
+        self._release_unstarted_root(run)
         con = self.conns.get()
         d = store.get_deal(con, run.did)
         if d and d["state"] == DealState.DRAFT:
@@ -2042,8 +2095,24 @@ class Engine:
         except store.BadTransition as e:
             log.error("сделка %s: %s", did, e)
 
+    def _root_stopped(self, run, reason):
+        if not getattr(run, "op_id", None):
+            return
+        con = self.conns.get()
+        op = store.get_operation(con, run.op_id)
+        if op['state'] in store.OP_DONE:
+            return
+        if int(op['reserved_raw']):
+            target = store.OpState.PAUSED_UNKNOWN
+        elif reason in ('stop', 'terminate', 'drain'):
+            target = store.OpState.STOPPED
+        else:
+            target = store.OpState.PAUSED_RISK
+        store.set_operation_state(con, run.op_id, target, reason=reason)
+
     def _paused(self, run: Run, p: Pause) -> None:
         con = self.conns.get()
+        self._root_stopped(run, p.reason)
         deal = store.get_deal(con, run.did)
         bk = deal_book(con, run.did)
         progressed = self._progressed(run.iid)
@@ -2164,14 +2233,16 @@ class Engine:
         DEX_UNKNOWN и пауза; откат в сети — один повтор по свежей котировке, второй — пауза."""
         con = self.conns.get()
         from .evm import SentUnknown
-        OperationController(con).begin_spot(clip_id, retry_reverted=True)
+        OperationController(con).begin_spot(clip_id, operation_id=run.op_id,
+                                              reserve_raw=int(units) if run.op_id else None, retry_reverted=True)
         try:
             res = run.legs.spot.swap(t_in, t_out, int(units), str(clip_id))
         except Exception as e:                 # noqa
             if isinstance(e, SentUnknown) or (not run.legs.sim and self._dex_touched(clip_id)):
                 store.set_clip_state(con, clip_id, ClipState.DEX_UNKNOWN)
                 raise Pause("dex_unknown", f"исход свопа неизвестен: {redact(e)}") from None
-            OperationController(con).settle_spot(clip_id, SpotSettlement(False))
+            OperationController(con).settle_spot(clip_id, SpotSettlement(False), operation_id=run.op_id,
+                                                  reserve_raw=int(units) if run.op_id else None)
             store.event(con, "dex_not_sent", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, err=redact(e))
             raise Pause("dex_refused", f"своп не отправлен: {redact(e)}") from None
         if run.legs.sim:
@@ -2181,10 +2252,12 @@ class Engine:
                     tx=res.tx_hash, a_in=res.amount_in, a_out=res.amount_out, gas_usd=res.gas_usd)
         if res.status == "ok":
             OperationController(con).settle_spot(
-                clip_id, SpotSettlement(True, int(res.amount_in), int(res.amount_out)))
+                clip_id, SpotSettlement(True, int(res.amount_in), int(res.amount_out)),
+                operation_id=run.op_id, reserve_raw=int(units) if run.op_id else None)
             return res
         if res.status == "reverted":
-            OperationController(con).settle_spot(clip_id, SpotSettlement(False))
+            OperationController(con).settle_spot(clip_id, SpotSettlement(False), operation_id=run.op_id,
+                                                  reserve_raw=int(units) if run.op_id else None)
             if retry:
                 log.warning("своп клипа %s откатился — один повтор по свежей котировке", clip_id)
                 return self._dex(run, clip_id, t_in, t_out, units, retry=False)
@@ -2552,9 +2625,14 @@ class Engine:
             remaining, r = self._after_clip(run, cid, remaining, ticket[0], ticket[1], r, done)
             return remaining
 
+        def select_amount(planned, last):
+            amount = self._all_units(run) if full and last else planned
+            if run.op_id:
+                amount = min(amount, store.operation_remaining(store.get_operation(self.conns.get(), run.op_id)))
+            return amount
         OperationController(self.conns.get()).run_clips(ClipLifecycle(
             intent_id=run.iid, amounts=amounts, progress=progress, guard=lambda: self.guard(run),
-            select_amount=lambda u, last: self._all_units(run) if full and last else u,
+            select_amount=select_amount,
             prepare=prepare,
             spot=lambda cid, u, ticket: self._dex(run, cid, run.stable if entry else run.token,
                                                  run.token if entry else run.stable, u),
@@ -2790,7 +2868,15 @@ class Engine:
             store.event(con, "exit_residual", deal_id=run.did, intent_id=run.iid, tokens=bk.tokens(run.dec),
                         short=bk.short, m=bk.m if bk.m_known else None)  # роутер DEX вернул часть токенов: остаток
             #                                                                 захеджирован (ревью 13.09, С2)
-        store.set_intent_status(con, run.iid, IntentStatus.DONE)
+        partial = False
+        if run.op_id:
+            op = store.get_operation(con, run.op_id)
+            if int(op['reserved_raw']):
+                raise Pause('book_unknown', 'операция имеет неразрешённый резерв')
+            partial = store.operation_remaining(op) > 0
+            state = store.OpState.PARTIAL if partial else (store.OpState.OPEN if run.kind == 'entry' else store.OpState.CLOSED)
+            store.set_operation_state(con, run.op_id, state)
+        store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if partial else IntentStatus.DONE)
         html, cost, liq = self._final(run, finished, closed=new == DealState.CLOSED)
         store.event(con, "final", deal_id=run.did, intent_id=run.iid, cost_usd=cost, state=str(new), sim=run.legs.sim,
                     **liq)                     # порог тревоги ликвидации замораживается на входе («позиции» его читают)

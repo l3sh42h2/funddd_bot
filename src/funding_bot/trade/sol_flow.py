@@ -1079,7 +1079,7 @@ class SolEngine:
         if it["kind"] in ("entry", "exit"):
             # кнопка привязана к корневой операции: та же операция, те же одобренные границы (хеш), ещё не начата
             want = spec.get("operation_id")
-            if op is None or op["id"] != want or op["state"] != OpState.PROPOSED or \
+            if op is None or op["id"] != want or op["state"] != OpState.APPROVED or \
                     op["bounds_hash"] != store._json_hash(spec.get("approval")):
                 store.event(con, "stale_button", deal_id=deal["id"], intent_id=iid, operation_id=want,
                             op_state=op["state"] if op else None)
@@ -1110,7 +1110,7 @@ class SolEngine:
 
     def _fail_op(self, it: dict) -> None:
         op = store.operation_of_intent(self.con, it["id"])
-        if op is not None and op["state"] == OpState.PROPOSED:
+        if op is not None and op["state"] in (OpState.PROPOSED, OpState.APPROVED):
             _op_to(self.con, op["id"], OpState.APPROVED, OpState.STOPPED, OpState.ABANDONED, reason="не начата")
 
     # --- ворота ---
@@ -1179,7 +1179,7 @@ class SolEngine:
         for o in con.execute("SELECT id, state FROM operations WHERE deal_id=? AND id<>? AND state IN ('PARTIAL', "
                              "'STOPPED', 'PAUSED_RISK')", (run.did, run.op_id)).fetchall():
             _op_to(con, o[0], OpState.ABANDONED, reason=f"новая операция {run.op_id}")
-        if not _op_to(con, run.op_id, OpState.APPROVED, OpState.RUNNING):
+        if not _op_to(con, run.op_id, OpState.RUNNING):
             raise Pause("state", f"операция {run.op_id} не запускается (другая активна или исход неизвестен)")
 
     @staticmethod
