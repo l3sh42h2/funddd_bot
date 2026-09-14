@@ -239,7 +239,12 @@ def test_transition_with_undrained_old_core_only_clears_journal(tmp_path, monkey
     with pytest.raises(job.DeployFailure, match='RESNAPSHOT'):
         job.recover_transition(paths, Commands(), Client, transition)
     assert verified == [True] and not paths.transition.exists()
-    assert json.loads(paths.release_state.read_text()) == previous
+    restored = json.loads(paths.release_state.read_text())
+    assert restored['release_id'] == 'release-old'
+    if phase == 'switched':
+        assert restored['components'] == {name: 'release-old' for name in ('collector', 'core', 'interface')}
+    else:
+        assert restored == previous
 
 
 def test_committed_healthy_target_wins_over_leftover_transition(tmp_path, monkeypatch):
@@ -331,6 +336,56 @@ def test_mixed_ui_components_normalize_after_drained_full_restore(tmp_path, monk
     with pytest.raises(job.DeployFailure, match='RECOVERED_RESNAPSHOT'):
         job.recover_transition(paths, Commands(), Client, transition)
     assert json.loads(paths.release_state.read_text())['components'] == normalized
+
+
+def test_inactive_mixed_full_recovery_stops_readers_then_normalizes(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release_b = paths.releases / 'release-B'; release_b.mkdir(parents=True)
+    manifest_b = release_manifest('release-B')
+    af.atomic_json(release_b / 'release-manifest.json', manifest_b)
+    paths.current.symlink_to(release_b)
+    previous = {'release_id': 'release-B', 'status': 'healthy', 'drain': False,
+                'components': {'core': 'release-A', 'collector': 'release-A', 'interface': 'release-B'}}
+    af.atomic_json(paths.release_state, previous)
+    transition = {'operation_id': 'op-C', 'phase': 'prepared', 'target_release_id': 'release-C',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': False}
+    af.atomic_json(paths.transition, transition)
+    events = []
+    class Commands:
+        def run(self, argv, **kwargs):
+            events.append(' '.join(map(str, argv)))
+            return subprocess.CompletedProcess(argv, 3 if argv[:3] == ['systemctl', 'is-active', '--quiet'] else 0, '')
+    monkeypatch.setattr(job, 'durable_drain', lambda *a: (_ for _ in ()).throw(job.DeployFailure('undrained')))
+    monkeypatch.setattr(job, '_wait_inactive', lambda *a: events.append('inactive'))
+    monkeypatch.setattr(job, 'execution_lock_free', lambda *a: events.append('lock_free'))
+    monkeypatch.setattr(job, 'wait_core_live_ready', lambda *a, **k: events.append('core_ready'))
+    monkeypatch.setattr(job, 'wait_components', lambda *a, **k: events.append('components_ready'))
+    with pytest.raises(job.DeployFailure, match='RECOVERED_RESNAPSHOT'):
+        job.recover_transition(paths, Commands(), lambda: object(), transition)
+    assert events.index('systemctl stop funding_bot-collector.service') < events.index('systemctl start funding_bot-collector.service')
+    assert json.loads(paths.release_state.read_text())['components'] == {
+        name: 'release-B' for name in ('collector', 'core', 'interface')}
+
+
+def test_ui_only_recovery_never_restarts_inactive_core(tmp_path, monkeypatch):
+    paths = job.Paths(tmp_path / 'opt', tmp_path / 'state', tmp_path / 'legacy')
+    release_b = paths.releases / 'release-B'; release_b.mkdir(parents=True)
+    af.atomic_json(release_b / 'release-manifest.json', release_manifest('release-B'))
+    paths.current.symlink_to(release_b)
+    previous = {'release_id': 'release-B', 'status': 'healthy', 'drain': False, 'components': {}}
+    transition = {'operation_id': 'op-C', 'phase': 'switching', 'target_release_id': 'release-C',
+                  'db_authority': 'state', 'previous_state': previous, 'ui_only': True}
+    af.atomic_json(paths.transition, transition)
+    events = []
+    class Commands:
+        def run(self, argv, **kwargs):
+            events.append(' '.join(map(str, argv)))
+            return subprocess.CompletedProcess(argv, 3, '')
+    monkeypatch.setattr(job, 'durable_drain', lambda *a: (_ for _ in ()).throw(job.DeployFailure('undrained')))
+    with pytest.raises(job.DeployFailure, match='UI_RECOVERY_CORE_INACTIVE'):
+        job.recover_transition(paths, Commands(), object(), transition)
+    assert not any(x == 'systemctl start funding_bot-core.service' for x in events)
+    assert paths.transition.exists()
 
 
 def test_inactive_first_target_without_core_meta_is_fenced_by_start_config_and_lock(tmp_path):

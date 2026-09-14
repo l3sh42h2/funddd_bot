@@ -958,12 +958,16 @@ def recover_transition(paths, commands, client_factory, transition):
                                    require_recovery=False)
                     commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                     commands.run(['systemctl', 'start', 'funding_bot-interface.service'])
-                    if transition.get('phase') == 'prepared' or transition.get('ui_only'):
+                    preserve_mixed = transition.get('phase') == 'prepared' or transition.get('ui_only')
+                    if preserve_mixed:
                         wait_components(paths, commands, previous_manifest,
                                         collector_manifest=component_manifest(paths, previous, 'collector', previous_manifest),
                                         interface_manifest=component_manifest(paths, previous, 'interface', previous_manifest))
                     else:
                         wait_components(paths, commands, previous_manifest)
+                        previous = reconciled_previous(
+                            previous, {name: previous_manifest['release_id']
+                                       for name in ('collector', 'core', 'interface')})
             else:
                 if previous.get('status') != 'healthy':
                     prove_inactive_offline_fence(paths, commands, previous)
@@ -971,7 +975,15 @@ def recover_transition(paths, commands, client_factory, transition):
                     try:
                         durable_drain(paths.state / 'core/trade.db')
                     except DeployFailure:
+                        if transition.get('ui_only'):
+                            raise DeployFailure('UI_RECOVERY_CORE_INACTIVE')
                         install_units(previous_release, commands)
+                        commands.run(['systemctl', 'stop', 'funding_bot-interface.service'], check=False)
+                        commands.run(['systemctl', 'stop', 'funding_bot-collector.service'], check=False)
+                        commands.run(['systemctl', 'stop', 'funding_bot-core.service'], check=False)
+                        _wait_inactive(commands, 'funding_bot-core.service')
+                        _wait_inactive(commands, 'funding_bot-collector.service')
+                        execution_lock_free(paths.execution_lock)
                         commands.run(['systemctl', 'start', 'funding_bot-collector.service'])
                         commands.run(['systemctl', 'start', 'funding_bot-core.service'])
                         wait_core_live_ready(client_factory(), previous_manifest, commands=commands)
