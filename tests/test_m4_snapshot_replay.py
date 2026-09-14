@@ -15,18 +15,30 @@ FIXTURES = ROOT / "tests" / "replay_fixtures"
 
 def _snapshot(name: str) -> dict:
     source = json.loads((FIXTURES / name).read_text())
+    cut = source["as_of_ms"]
+
+    def within_cut(table: str, row: dict) -> bool:
+        column = rs.MILLISECOND_TIME_COLUMNS.get(table)
+        if column and row.get(column) is not None:
+            return row[column] <= cut
+        if table == "fee_events" and row.get("ts") is not None:
+            return float(row["ts"]) * 1000 <= cut
+        return True
+
     columns = dict(rs.COMMON_COLUMNS)
     if source["family"] == "solana":
         columns.update(rs.SOL_COLUMNS)
     tables = {}
     for table, allowed in columns.items():
         tables[table] = [{k: v for k, v in row.items() if k in allowed}
-                         for row in source.get("tables", {}).get(table, [])]
+                         for row in source.get("tables", {}).get(table, []) if within_cut(table, row)]
     if source["family"] == "evm":
         seen = set()
         for batch in source["ingest_batches"]["perp_fills"]:
             for raw in batch["rows"]:
                 row = {**raw, "venue": batch["venue"]}
+                if not within_cut("perp_fills", row):
+                    continue
                 key = row["venue"], row["trade_id"]
                 if key not in seen:
                     tables["perp_fills"].append({k: v for k, v in row.items() if k in columns["perp_fills"]})
@@ -35,6 +47,8 @@ def _snapshot(name: str) -> dict:
         for batch in source["ingest_batches"]["funding_income"]:
             for raw in batch["rows"]:
                 row = {**raw, "venue": batch["venue"]}
+                if not within_cut("funding_income", row):
+                    continue
                 key = row["venue"], row["tran_id"]
                 if key not in seen:
                     tables["funding_income"].append({k: v for k, v in row.items() if k in columns["funding_income"]})
@@ -44,6 +58,8 @@ def _snapshot(name: str) -> dict:
         for batch in source["ingest_batches"]["hl_fills"]:
             for raw in batch["rows"]:
                 row = {**raw, "account": raw["account"].lower()}
+                if not within_cut("hl_fills", row):
+                    continue
                 key = row["network"], row["account"], row["coin"], row["time"], row["tid"]
                 if key not in seen:
                     tables["hl_fills"].append({k: v for k, v in row.items() if k in columns["hl_fills"]})
@@ -52,6 +68,8 @@ def _snapshot(name: str) -> dict:
         for batch in source["ingest_batches"]["hl_funding"]:
             for raw in batch["rows"]:
                 row = {**raw, "account": raw["account"].lower(), "hash": raw.get("hash") or ""}
+                if not within_cut("hl_funding", row):
+                    continue
                 key = row["network"], row["account"], row["coin"], row["time"], row["hash"]
                 if key not in seen:
                     tables["hl_funding"].append({k: v for k, v in row.items() if k in columns["hl_funding"]})
@@ -91,6 +109,61 @@ def test_solana_known_slice_is_exact_across_frozen_baseline_and_target(tmp_path:
     assert result["target"]["accounting"]["funding"] == "0.15"
     assert result["target"]["accounting"]["fees"] == "0.007"
     assert result["target"]["accounting"]["cash_basis_quote"] == "0.83935"
+
+
+def test_solana_missing_fill_coverage_is_never_verified(tmp_path: Path) -> None:
+    doc = _snapshot("m4_solana_known.json")
+    doc["tables"]["hl_fills"] = []
+
+    result = rs.replay(_write(tmp_path, doc), target_root=ROOT, repo_root=ROOT)
+
+    assert result["verified_equivalent"] is False
+    assert result["classification"] == "unsafe_shared_fallback"
+    assert result["target"]["accounting"]["fees_estimated"] is True
+    assert result["target"]["accounting"]["accounting_complete"] is False
+    assert set(result["projection_gaps"]["target"]) >= {"fees_estimated", "accounting_complete"}
+    assert "order:fb-DSOLK1-e01-c1-a1:fee_coverage" in result["strict_evidence"]["missing_monetary_evidence"]
+    assert "order:fb-DSOLK1-x01-c1-a1:fee_coverage" in result["strict_evidence"]["missing_monetary_evidence"]
+
+
+def test_solana_missing_receipt_fee_evidence_is_never_verified(tmp_path: Path) -> None:
+    doc = _snapshot("m4_solana_known.json")
+    doc["tables"]["fee_events"] = []
+
+    result = rs.replay(_write(tmp_path, doc), target_root=ROOT, repo_root=ROOT)
+
+    assert result["verified_equivalent"] is False
+    assert result["classification"] == "unsafe_shared_fallback"
+    assert result["target"]["accounting"]["gas_native_raw"] == 0
+    assert result["target"]["accounting"]["cash_basis_quote"] == "0.843"
+    assert "clip:11:network_fee_evidence" in result["strict_evidence"]["missing_monetary_evidence"]
+    assert "clip:12:network_fee_evidence" in result["strict_evidence"]["missing_monetary_evidence"]
+
+
+def test_solana_explicit_zero_receipt_fee_is_known_evidence(tmp_path: Path) -> None:
+    doc = _snapshot("m4_solana_known.json")
+    for event in doc["tables"]["fee_events"]:
+        if event["kind"] == "network_total":
+            event["amount_raw"] = "0"
+
+    result = rs.replay(_write(tmp_path, doc), target_root=ROOT, repo_root=ROOT)
+
+    assert result["verified_equivalent"] is True
+    assert result["strict_evidence"]["missing_monetary_evidence"] == []
+    assert result["target"]["accounting"]["gas_native_raw"] == 0
+
+
+def test_snapshot_rejects_rows_later_than_accounting_cut(tmp_path: Path) -> None:
+    doc = _snapshot("m4_solana_known.json")
+    doc["tables"]["deals"][0]["state"] = "OPEN"
+    doc["tables"]["hl_funding"].append({
+        "network": "mainnet", "account": "0xabc123", "coin": "para:SYN",
+        "time": doc["as_of_ms"] + 1, "hash": "after-cut", "usdc": "8",
+        "szi": "0", "rate": "0", "ingested": doc["as_of_ms"] / 1000,
+    })
+
+    with pytest.raises(rs.SnapshotError, match=r"hl_funding.*time is outside 0\.\.as_of_ms"):
+        rs.replay(_write(tmp_path, doc), target_root=ROOT, repo_root=ROOT)
 
 
 def test_same_cut_excludes_later_funding_and_reports_evm_coverage_unknown(tmp_path: Path) -> None:

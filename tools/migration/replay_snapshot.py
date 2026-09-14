@@ -61,6 +61,9 @@ FILLED_STATES = {"FILLED", "PARTIALLY_FILLED"}
 OPEN_DEX_STATES = {"DEX_SENT", "DEX_UNKNOWN"}
 OPEN_PERP_STATES = {"INTENT", "SENT", "UNKNOWN"}
 STABLES = {"USD", "USDC", "USDT", "USD1"}
+SOL_NETWORK_FEE_KINDS = {"network_total", "network_base", "network_priority", "tip", "rent_nonrefundable"}
+MILLISECOND_TIME_COLUMNS = {"perp_fills": "ts", "funding_income": "ts", "hl_fills": "time",
+                            "hl_funding": "time"}
 
 
 class SnapshotError(RuntimeError):
@@ -143,6 +146,17 @@ def load_snapshot(path: Path) -> dict[str, Any]:
             forbidden = set(row) - columns[table]
             if forbidden:
                 raise SnapshotError(f"tables.{table}[{index}] forbidden columns: {sorted(forbidden)}")
+            time_column = MILLISECOND_TIME_COLUMNS.get(table)
+            if time_column and row.get(time_column) is not None:
+                timestamp = row[time_column]
+                if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                    raise SnapshotError(f"tables.{table}[{index}].{time_column} must be integer milliseconds")
+                if timestamp < 0 or timestamp > doc["as_of_ms"]:
+                    raise SnapshotError(f"tables.{table}[{index}].{time_column} is outside 0..as_of_ms")
+            if table == "fee_events" and row.get("ts") is not None:
+                timestamp = _decimal(row["ts"])
+                if timestamp is None or timestamp < 0 or timestamp * 1000 > doc["as_of_ms"]:
+                    raise SnapshotError(f"tables.fee_events[{index}].ts is outside 0..as_of_ms")
     approvals = doc["approve_tx_hashes"]
     if not isinstance(approvals, list):
         raise SnapshotError("approve_tx_hashes must be an array")
@@ -340,7 +354,16 @@ def _strict_evidence(doc: dict[str, Any]) -> dict[str, Any]:
                 missing.append(f"funding:{row.get('venue')}:{row.get('tran_id')}:income")
         completeness = {"fills": None, "funding": None}
     else:
-        for row in doc["tables"]["hl_fills"]:
+        try:
+            inst = json.loads(doc["tables"]["deals"][0].get("inst_json") or "{}")
+        except ValueError:
+            inst = {}
+        parts = str(inst.get("perp_account") or "").split(":")
+        scope = ((parts[1], parts[3].lower(), str(inst.get("perp_symbol"))) if len(parts) == 5 else None)
+        scoped_fills = [row for row in doc["tables"]["hl_fills"]
+                        if scope is not None and
+                        (row.get("network"), str(row.get("account") or "").lower(), row.get("coin")) == scope]
+        for row in scoped_fills:
             for field in ("px", "sz", "fee"):
                 value = _decimal(row.get(field))
                 if value is None or (field != "fee" and value < 0):
@@ -348,18 +371,60 @@ def _strict_evidence(doc: dict[str, Any]) -> dict[str, Any]:
             if str(row.get("fee_token") or "").upper() not in STABLES:
                 missing.append(f"hl_fill:{row.get('time')}:{row.get('tid')}:fee_token")
         for row in doc["tables"]["hl_funding"]:
+            if scope is None or (row.get("network"), str(row.get("account") or "").lower(), row.get("coin")) != scope:
+                continue
             if _decimal(row.get("usdc")) is None:
                 missing.append(f"hl_funding:{row.get('time')}:{row.get('hash')}:usdc")
-        for row in doc["tables"]["fee_events"]:
+        fee_events = [row for row in doc["tables"]["fee_events"] if row.get("deal_id") == doc["deal_id"]]
+        for row in fee_events:
             if not row.get("included") and not row.get("superseded") and _raw(row.get("amount_raw")) is None:
                 missing.append(f"fee_event:{row.get('id')}:amount_raw")
-        try:
-            inst = json.loads(doc["tables"]["deals"][0].get("inst_json") or "{}")
-        except ValueError:
-            inst = {}
-        parts = str(inst.get("perp_account") or "").split(":")
+            if not row.get("included") and not row.get("superseded") and row.get("estimated"):
+                missing.append(f"fee_event:{row.get('id')}:estimated")
+
+        attempts = {}
+        for row in doc["tables"]["hl_order_attempts"]:
+            client_id = str(row.get("client_id") or "")
+            same_deal = row.get("deal_id") == doc["deal_id"] or client_id.startswith(deal_prefix)
+            same_scope = scope is not None and (
+                row.get("network"), str(row.get("account") or "").lower(), row.get("fullcoin")) == scope
+            if same_deal and same_scope and row.get("cloid"):
+                attempts[client_id] = str(row["cloid"])
+        fills_by_cloid: dict[str, list[dict[str, Any]]] = {}
+        for row in scoped_fills:
+            if row.get("cloid") is not None:
+                fills_by_cloid.setdefault(str(row["cloid"]), []).append(row)
+        for order in (row for row in orders if row.get("state") in FILLED_STATES):
+            client_id = str(order.get("client_id") or "")
+            fill_rows = fills_by_cloid.get(attempts.get(client_id, ""), [])
+            covered = Decimal(0)
+            valid_coverage = bool(fill_rows)
+            for fill in fill_rows:
+                price, qty = _decimal(fill.get("px")), _decimal(fill.get("sz"))
+                if price is None or qty is None or price < 0 or qty < 0:
+                    valid_coverage = False
+                else:
+                    covered += price * qty
+            total = _decimal(order.get("cum_quote"))
+            if not valid_coverage or total is None or abs(total - covered) > Decimal("0.000001"):
+                missing.append(f"order:{client_id}:fee_coverage")
+
+        if not doc["tables"]["deals"][0].get("sim"):
+            for clip in doc["tables"]["clips"]:
+                if clip.get("state") not in FLOW_STATES:
+                    continue
+                exact_fee = any(
+                    row.get("clip_id") == clip.get("id") and not row.get("included") and
+                    not row.get("superseded") and not row.get("estimated") and
+                    row.get("asset") == "native:solana" and row.get("kind") in SOL_NETWORK_FEE_KINDS and
+                    _raw(row.get("amount_raw")) is not None
+                    for row in fee_events
+                )
+                if not exact_fee:
+                    missing.append(f"clip:{clip.get('id')}:network_fee_evidence")
+
         scopes = {}
-        if len(parts) == 5:
+        if scope is not None:
             prefix = f"hl:{parts[1]}:{parts[3].lower()}:{inst.get('perp_symbol')}:"
             cursor_rows = {row.get("scope"): row for row in doc["tables"]["ingest_cursors"]}
             deal = doc["tables"]["deals"][0]
@@ -386,7 +451,7 @@ def _strict_evidence(doc: dict[str, Any]) -> dict[str, Any]:
     else:
         gas_paid = any(not row.get("included") and not row.get("superseded") and
                        row.get("asset") == "native:solana" and (_raw(row.get("amount_raw")) or 0) > 0
-                       for row in doc["tables"]["fee_events"])
+                       for row in fee_events)
     if gas_paid and _decimal(doc["marks"]["native_quote"]) is None:
         missing.append("mark:native_quote")
     if token_raw not in (None, 0) and _decimal(doc["marks"]["spot_quote"]) is None:
@@ -396,6 +461,26 @@ def _strict_evidence(doc: dict[str, Any]) -> dict[str, Any]:
     accounting_complete = not missing and all(value is True for value in completeness.values())
     return {"missing_monetary_evidence": sorted(set(missing)), "source_complete": completeness,
             "accounting_complete": accounting_complete}
+
+
+def _projection_gaps(projection: dict[str, Any], family: str) -> list[str]:
+    """Projection-owned proof gates; equality alone cannot establish complete accounting."""
+    if family != "solana":
+        return []
+    accounting = projection.get("accounting", {})
+    gaps = []
+    if accounting.get("fees_estimated") is not False:
+        gaps.append("fees_estimated")
+    for field in ("fills_complete", "funding_complete", "accounting_complete"):
+        if accounting.get(field) is not True:
+            gaps.append(field)
+    if accounting.get("missing_flows"):
+        gaps.append("missing_flows")
+    if accounting.get("other_unknown"):
+        gaps.append("other_unknown")
+    if accounting.get("foreign_fill_ids"):
+        gaps.append("foreign_fill_ids")
+    return gaps
 
 
 def _flatten_diff(old: Any, new: Any, path: str = "") -> list[dict[str, Any]]:
@@ -485,6 +570,8 @@ def replay(snapshot: Path, *, target_root: Path, repo_root: Path | None = None,
         new_dir.mkdir()
         baseline = _run_revision(baseline_root.resolve(), snapshot.resolve(), old_dir)
         target = _run_revision(target_root.resolve(), snapshot.resolve(), new_dir)
+    projection_gaps = {"baseline": _projection_gaps(baseline, doc["family"]),
+                       "target": _projection_gaps(target, doc["family"])}
     differences = _flatten_diff(baseline, target)
     unsafe_paths = ("accounting.spot_", "accounting.perp_", "accounting.fees", "accounting.funding",
                     "accounting.gas_", "accounting.cash_basis_quote", "accounting.missing_flows", "same_cut_pnl_quote")
@@ -501,6 +588,8 @@ def replay(snapshot: Path, *, target_root: Path, repo_root: Path | None = None,
                           _missing_is_projected_unknown(baseline, evidence["missing_monetary_evidence"]) and
                           _missing_is_projected_unknown(target, evidence["missing_monetary_evidence"])
                           else "unsafe_shared_fallback")
+    elif projection_gaps["baseline"] or projection_gaps["target"]:
+        classification = "exact_incomplete_projection"
     elif not evidence["accounting_complete"]:
         classification = "exact_observed_slice_incomplete_sources"
     else:
@@ -514,6 +603,7 @@ def replay(snapshot: Path, *, target_root: Path, repo_root: Path | None = None,
             "deal_id": doc["deal_id"], "family": doc["family"],
             "classification": classification, "verified_equivalent": classification == "verified_known_exact",
             "strict_evidence": evidence, "baseline": baseline, "target": target,
+            "projection_gaps": projection_gaps,
             "unsafe_projection_differences": unsafe_differences,
             "safer_unknown_transitions": safer, "mismatches": mismatches}
 
