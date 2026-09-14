@@ -102,3 +102,81 @@ class StatusView:
     daily_used_usd: Decimal | None = None
     checks: tuple[tuple[str, bool | None, str], ...] = ()    # (что, ок?, подробность) — readonly-проверки
     missing_owner_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FinalView:
+    intent_id: str
+    kind: str                           # entry | exit
+    coin: str
+    chain: str
+    perp_venue: str
+    deal_id: str
+    leg_usd: Decimal | None = None      # вход: размер на ногу из команды
+    deal_leg_usd: Decimal | None = None # размер сделки на ногу (частичный выход «200 из 500 $»)
+    spot_qty: Decimal | None = None     # модуль
+    spot_usd: Decimal | None = None
+    perp_qty: Decimal | None = None     # модуль
+    impact_usd: Decimal | None = None   # против котировки плана
+    planned_impact_usd: Decimal | None = None
+    gas_usd: Decimal | None = None      # свопы
+    approve_gas_usd: Decimal | None = None
+    swaps: int = 0                      # свопов с чеком (газ на один своп — для запаса BNB)
+    native_px: Decimal | None = None
+    leverage: int | None = None
+    margin_type: str | None = None
+    liq_dist_pct: Decimal | None = None
+    liq_alert_pct: Decimal | None = None    # порог тревоги, замороженный на входе
+    dust_qty: Decimal | None = None     # спот − |перп|
+    dust_usd: Decimal | None = None
+    step: Decimal | None = None
+    basis_pct: Decimal | None = None    # взвешенный
+    expected_usd_h: Decimal | None = None
+    cost_usd: Decimal | None = None
+    planned_cost_usd: Decimal | None = None
+    exit_cost_usd: Decimal | None = None
+    breakeven_h: Decimal | None = None
+    wallet_stable: Decimal | None = None
+    wallet_native: Decimal | None = None
+    margin_avail: Decimal | None = None
+    open_deals: int | None = None       # после этой команды
+    max_open_deals: int | None = None
+    tx_hashes: tuple[str, ...] = ()
+    pnl_spot_usd: Decimal | None = None     # выход: итог сделки
+    pnl_perp_usd: Decimal | None = None
+    funding_usd: Decimal | None = None
+    pnl_total_usd: Decimal | None = None
+    partial: bool = False               # выход: сделка осталась открытой
+    exit_all: bool = True               # выход заказан на всю сделку (частичный итог тогда — недовыполнен)
+    rest_qty: Decimal | None = None     # выход: токенов сделки осталось
+    partial_reason: str | None = None
+    sim: bool = False
+    m: Decimal | None = None            # токенов в контракте: perp_qty — контракты, пыль и спот — токены
+
+
+@dataclass(frozen=True)
+class SolFinalView:
+    kind: str                           # entry | exit
+    coin: str
+    fullcoin: str
+    deal_id: str
+    state: str                          # состояние сделки после
+    tokens: Decimal | None = None       # куплено / продано
+    usdc: Decimal | None = None         # списано / получено
+    path: str | None = None
+    perp_qty: Decimal | None = None
+    perp_px: Decimal | None = None
+    basis_bps: Decimal | None = None
+    net_sol: Decimal | None = None      # сеть Solana, SOL (безвозвратно)
+    net_usd: Decimal | None = None
+    perp_fee_usd: Decimal | None = None
+    rest_tokens: Decimal | None = None  # выход: остаток спота сделки
+    rest_usd: Decimal | None = None
+    dust: bool = False
+    hedged: bool | None = None
+    sim: bool = False
+    warn: tuple[str, ...] = ()          # ⚠️ — только отклонения (голая нога дольше лимита)
+    signature: str | None = None        # подпись свопа Solana → Solscan
+    hl_hashes: tuple[str, ...] = ()     # хэши fills HL → обозреватель HL
+    pnl_usdc: Decimal | None = None     # выход, сделка закрыта: итог сделки (потоки, комиссии, сеть, фандинг)
+    pnl_complete: bool = True           # учёт полон (fills и фандинг HL добраны)

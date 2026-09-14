@@ -25,7 +25,7 @@ class Journal:
         con = self.conns.get()
         if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_meta'").fetchone():
             version = con.execute("SELECT value FROM core_meta WHERE key='schema_version'").fetchone()
-            if version and version[0] not in ('1', '2'):
+            if version and version[0] not in ('1', '2', '3'):
                 raise RpcError('unsupported_core_schema')
         con.executescript(SCHEMA)
         con.execute("INSERT OR IGNORE INTO core_meta VALUES('schema_version','1')")
@@ -98,12 +98,15 @@ class Journal:
         # A new wire event and its rollback reader fence must commit together.
         from ..trade import store
         with store.tx(con):
-            if payload.get('dto_version') == 2:
+            if payload.get('dto_version') in (2, 3):
                 # Old Journal implementations already enforce this gate. A
                 # previous artifact's runner must not boot an unaware core.
-                con.execute("UPDATE core_meta SET value='2' WHERE key='schema_version'")
-                con.execute("INSERT INTO core_meta(key,value) VALUES('notification_dto_version','2') "
-                            "ON CONFLICT(key) DO UPDATE SET value='2'")
+                version = str(payload['dto_version'])
+                con.execute("UPDATE core_meta SET value=CAST(MAX(CAST(value AS INT),?) AS TEXT) WHERE key='schema_version'",
+                            (int(version),))
+                con.execute("INSERT INTO core_meta(key,value) VALUES('notification_dto_version',?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INT),CAST(excluded.value AS INT)) AS TEXT)",
+                            (version,))
             cur = con.execute('INSERT INTO core_notifications(payload,created) VALUES(?,?)', (body, time.time()))
             return cur.lastrowid
 
@@ -220,6 +223,15 @@ class Outbox:
             raise RpcError('invalid_status_snapshot')
         return self._emit(dict(kind='status_report', dto_version=DTO_VERSION,
                                chat_id=chat_id, snapshot=encode(asdict(snapshot))))
+
+    def final_report(self, chat_id, snapshot):
+        from dataclasses import asdict
+        from ..ipc.notifications import EXECUTION_REPORT_VERSION
+        from ..ipc.reports import FinalView, SolFinalView, encode
+        if type(snapshot) not in (FinalView, SolFinalView):
+            raise RpcError('invalid_final_snapshot')
+        return self._emit(dict(kind='final_report', dto_version=EXECUTION_REPORT_VERSION,
+                               chat_id=chat_id, snapshot=encode(asdict(snapshot)), solana=type(snapshot) is SolFinalView))
 
     def positions_report(self, chat_id, snapshots, *, at, matched, mismatch, sim):
         from dataclasses import asdict

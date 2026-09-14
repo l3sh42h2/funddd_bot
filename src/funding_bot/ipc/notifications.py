@@ -2,6 +2,7 @@
 import json
 
 DTO_VERSION = 2
+EXECUTION_REPORT_VERSION = 3
 APPROVAL_REASONS = frozenset((
     'unknown', 'cancelled', 'paused', 'busy', 'accepted', 'stale', 'old_button',
     'expired', 'already', 'running', 'already_cancelled', 'done', 'interrupted',

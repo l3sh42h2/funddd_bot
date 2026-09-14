@@ -1,5 +1,5 @@
 """Render durable domain notifications at the interface boundary."""
-from ..ipc.notifications import DTO_VERSION, APPROVAL_REASONS
+from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, APPROVAL_REASONS
 from ..ipc.protocol import RpcError
 
 
@@ -7,9 +7,20 @@ def present(event, *, transport_health=None):
     kind = event.get('kind')
     if kind in ('send', 'edit', 'answer'):
         return event  # Already queued legacy messages remain deliverable.
-    if type(event.get('dto_version')) is not int or event['dto_version'] != DTO_VERSION:
+    expected = EXECUTION_REPORT_VERSION if kind == 'final_report' else DTO_VERSION
+    if type(event.get('dto_version')) is not int or event['dto_version'] != expected:
         raise RpcError('unsupported_notification_version')
     from ..tg import views
+    if kind == 'final_report':
+        from ..ipc.reports import decode, FinalView, SolFinalView
+        if type(event.get('solana', False)) is not bool:
+            raise RpcError('invalid_final_snapshot')
+        if event.get('solana', False):
+            from ..tg import sol_views
+            return dict(kind='send', chat_id=event['chat_id'],
+                        text=sol_views.final(SolFinalView(**decode(event['snapshot']))), html=True)
+        return dict(kind='send', chat_id=event['chat_id'],
+                    text=views.final(FinalView(**decode(event['snapshot']))), html=True)
     if kind == 'restart_report':
         from ..ipc.reports import decode, RestartView
         renderer = views

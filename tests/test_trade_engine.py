@@ -29,7 +29,7 @@ RAW_NUM = re.compile(r"\d\.\d{10,}")                 # сырой Decimal (18 з
 ASCII_MINUS = re.compile(r"(?:^|[\s(])-\d", re.M)    # минус в числах — только «−»
 flat = lambda s: s.replace(views.NBSP, " ")         # noqa: E731 — неразрывные пробелы обычными
 EXAMPLE = (ROOT / "deploy" / "owner.toml.example").read_text()
-WALLET = "0xE4Ebf0815d0980E5a03f7D675F86dc5079fB8919"
+WALLET = "0x" + "b2" * 20  # synthetic fixture identity, independent of any configured account
 STABLE = "0x55d398326f99059ff775485246999027b3197955"
 TOKEN = "0x" + "a1" * 20
 ROUTER = "0x5994814f2c4040b863a0125a45de152a8c2a4dec"
@@ -179,6 +179,9 @@ class RecHooks(Hooks):
 
     def report(self, html):
         self.reports.append(html)
+
+    def final_report(self, snapshot):
+        self.reports.append(views.final(snapshot))
 
     def requote(self, iid, reason):
         self.requotes.append((iid, reason))

@@ -1661,6 +1661,7 @@ class Hooks:
 
     def progress(self, iid: str, html: str) -> None: ...
     def report(self, html: str) -> None: ...
+    def final_report(self, snapshot) -> None: ...
     def requote(self, iid: str, reason: str) -> None: ...
 
 
@@ -2899,10 +2900,10 @@ class Engine:
             state = store.OpState.PARTIAL if partial else (store.OpState.OPEN if run.kind == 'entry' else store.OpState.CLOSED)
             store.set_operation_state(con, run.op_id, state)
         store.set_intent_status(con, run.iid, IntentStatus.PARTIAL if partial else IntentStatus.DONE)
-        html, cost, liq = self._final(run, finished, closed=new == DealState.CLOSED)
+        snapshot, cost, liq = self._final(run, finished, closed=new == DealState.CLOSED)
         store.event(con, "final", deal_id=run.did, intent_id=run.iid, cost_usd=cost, state=str(new), sim=run.legs.sim,
                     **liq)                     # порог тревоги ликвидации замораживается на входе («позиции» его читают)
-        self.hooks.report(html)
+        self.hooks.final_report(snapshot)
 
     def _deal_pnl(self, run: Run) -> tuple[D | None, D | None, D | None, D | None]:
         """Итог закрытой сделки: спот (выручка выходов − стоимость входов), перп (продано − откуплено − комиссии),
@@ -2949,8 +2950,8 @@ class Engine:
         total = spot + perp + fund - gas if (spot is not None and perp is not None and fund is not None and gas is not None) else None
         return spot, perp, fund, total
 
-    def _final(self, run: Run, finished: float, closed: bool) -> tuple[str, D | None]:
-        v = _views()
+    def _final(self, run: Run, finished: float, closed: bool):
+        from ..ipc.reports import FinalView
         con = self.conns.get()
         legs, perp = run.legs, run.legs.perp
         fee = D(str(config.FEES_TAKER[perp.venue]))
@@ -3014,7 +3015,7 @@ class Engine:
         plan_impact = ((dget(est.get("dex_fee_usd")) or ZERO) + (dget(est.get("dex_impact_usd")) or ZERO)
                        if "dex_fee_usd" in est else None)       # удар спота по плану — порог показа «×1.5»
         swaps = sum(1 for t in txs if t.get("kind") in report.SWAP_KINDS and t.get("gas_used") is not None)
-        fv = v.FinalView(
+        fv = FinalView(
             intent_id=run.iid, kind="entry" if entry else "exit", coin=run.deal["coin"], chain=run.deal["chain"],
             perp_venue=run.deal["perp_venue"], deal_id=run.did, leg_usd=run.plan.leg_usd if entry else None,
             deal_leg_usd=dget(run.deal["leg_usd"]), spot_qty=dex["tokens"], spot_usd=dex["usd"], perp_qty=pl["qty"],
@@ -3037,7 +3038,7 @@ class Engine:
         extra = {"liq_dist_pct": liq_pct, "liq_alert_pct": liq_thr}
         if bound:
             extra['accounting_cost_revision'] = cost_source_after if cost_source_before == cost_source_after else None
-        return v.final(fv), cost, extra
+        return fv, cost, extra
 
 
 # --- CLI `funding_bot plan` ------------------------------------------------------------------------------------

@@ -148,32 +148,7 @@ def progress(v: SolProgressView) -> str:
     return V._compose("⏳", head, [], [line], v.sim)
 
 
-@dataclass(frozen=True)
-class SolFinalView:
-    kind: str                           # entry | exit
-    coin: str
-    fullcoin: str
-    deal_id: str
-    state: str                          # состояние сделки после
-    tokens: Decimal | None = None       # куплено / продано
-    usdc: Decimal | None = None         # списано / получено
-    path: str | None = None
-    perp_qty: Decimal | None = None
-    perp_px: Decimal | None = None
-    basis_bps: Decimal | None = None
-    net_sol: Decimal | None = None      # сеть Solana, SOL (безвозвратно)
-    net_usd: Decimal | None = None
-    perp_fee_usd: Decimal | None = None
-    rest_tokens: Decimal | None = None  # выход: остаток спота сделки
-    rest_usd: Decimal | None = None
-    dust: bool = False
-    hedged: bool | None = None
-    sim: bool = False
-    warn: tuple[str, ...] = ()          # ⚠️ — только отклонения (голая нога дольше лимита)
-    signature: str | None = None        # подпись свопа Solana → Solscan
-    hl_hashes: tuple[str, ...] = ()     # хэши fills HL → обозреватель HL
-    pnl_usdc: Decimal | None = None     # выход, сделка закрыта: итог сделки (потоки, комиссии, сеть, фандинг)
-    pnl_complete: bool = True           # учёт полон (fills и фандинг HL добраны)
+from ..ipc.reports import SolFinalView
 
 
 def final(v: SolFinalView) -> str:

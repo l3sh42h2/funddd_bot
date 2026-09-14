@@ -440,6 +440,10 @@ class RecHooks(Hooks):
     def report(self, html):
         self.reports.append(html)
 
+    def final_report(self, snapshot):
+        from funding_bot.tg import sol_views
+        self.reports.append(sol_views.final(snapshot))
+
     def progress(self, iid, html):
         self.progresses.append((iid, html))
 

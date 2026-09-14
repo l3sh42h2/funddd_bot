@@ -93,6 +93,13 @@ class BotHooks(Hooks):
     def report(self, html: str) -> None:
         self.bot.say(html)
 
+    def final_report(self, snapshot) -> None:
+        chat = self.bot.chat()
+        if chat is None:
+            log.warning('owner_id не задан — итог не доставлен')
+            return
+        self.bot.sender.final_report(chat, snapshot)
+
     def requote(self, iid: str, reason: str) -> None:
         self.bot.jobs.put("requote", lambda: self.bot.requote(iid, reason))
 

@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "ipc_version": 1,
-  "dto_version": 2,
+  "dto_version": 3,
   "schema_version": 3,
   "min_reader": 2,
   "compatible_readers": [

@@ -108,6 +108,14 @@ class BotHooks(Hooks):
     def report(self, html: str) -> None:
         self.bot.say(html)
 
+    def final_report(self, snapshot) -> None:
+        from ..ipc.reports import SolFinalView
+        if type(snapshot) is SolFinalView:
+            from . import sol_views
+            self.bot.say(sol_views.final(snapshot))
+        else:
+            self.bot.say(views.final(snapshot))
+
     def requote(self, iid: str, reason: str) -> None:
         self.bot.jobs.put("requote", lambda: self.bot.requote(iid, reason))
 

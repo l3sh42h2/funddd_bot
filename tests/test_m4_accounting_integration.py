@@ -248,8 +248,6 @@ def final_run(con, monkeypatch):
         stable=legacy.STABLE,sdec=18,f=legs.perp.filters(legacy.SYMBOL),started=legacy.T0)
     worker=object.__new__(engine.Engine)
     worker.conns=SimpleNamespace(get=lambda:con)
-    views=engine._views()
-    monkeypatch.setattr(views,'final',lambda fv:fv)
     return worker,run
 
 

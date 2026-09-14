@@ -1644,11 +1644,11 @@ class SolEngine:
             pnl = self._deal_total(run)
         _net_sol, net_usd, perp_fee = self._costs(run)
         cost = (net_usd + perp_fee) if (net_usd is not None and perp_fee is not None) else None
-        html = self._final(run, str(new), bk, dust, tuple(warn), hashes=hashes, pnl=pnl)
+        snapshot = self._final(run, str(new), bk, dust, tuple(warn), hashes=hashes, pnl=pnl)
         store.event(con, "final", deal_id=run.did, intent_id=run.iid, state=str(new), sim=run.legs.sim,
                     path=run.swap.path if run.swap else None, signature=run.swap.signature if run.swap else None,
                     cost_usd=cost, unit="USDC")
-        self.e.hooks.report(html)
+        self.e.hooks.final_report(snapshot)
 
     def _progress(self, run: SolRun, stage: str, *, path: str | None = None, tokens: D | None = None,
                   qty: D | None = None) -> None:
@@ -1713,8 +1713,9 @@ class SolEngine:
         return net_sol, net_usd, perp_fee
 
     def _final(self, run: SolRun, state: str, bk, dust: bool, warn: tuple = (), *, hashes: tuple = (),
-               pnl: tuple | None = None) -> str:
-        sv, o, inst = _sv(), run.swap, run.inst
+               pnl: tuple | None = None):
+        from ..ipc.reports import SolFinalView
+        o, inst = run.swap, run.inst
         qd = int(inst.quote_dec)
         if run.kind == "entry":
             tokens, usdc = _h(o.out_raw, run.dec), _h(o.in_raw, qd)
@@ -1728,14 +1729,14 @@ class SolEngine:
         rest = bk.tokens(run.dec) if run.kind == "exit" else None
         spx = (usdc / tokens) if (usdc and tokens) else None
         dl = _delta(inst, bk.tokens(run.dec), bk.short)
-        return sv.final(sv.SolFinalView(
+        return SolFinalView(
             kind=run.kind, coin=run.deal["coin"], fullcoin=inst.perp_symbol, deal_id=run.did, state=state,
             tokens=tokens, usdc=usdc, path=o.path, perp_qty=run.perp_filled, perp_px=pxp, basis_bps=basis,
             net_sol=net_sol, net_usd=net_usd, perp_fee_usd=perp_fee, rest_tokens=rest,
             rest_usd=(rest * spx) if (rest and spx) else None, dust=dust,
             hedged=ZERO <= dl < _tokens_per_step(inst, run.step), sim=run.legs.sim, warn=warn,
             signature=o.signature, hl_hashes=tuple(hashes), pnl_usdc=pnl[0] if pnl else None,
-            pnl_complete=bool(pnl[1]) if pnl else True))
+            pnl_complete=bool(pnl[1]) if pnl else True)
 
     # --- пауза ---
     def _paused(self, run: SolRun, p: Pause) -> None:
