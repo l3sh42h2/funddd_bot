@@ -79,7 +79,7 @@ def test_fresh_db_is_schema_2_and_reconnect_changes_nothing(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (2, 2)
+    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (3, 2)
     assert NEW_TABLES | set(LEGACY_TABLES) <= _tables(con)
     assert [r[1] for r in con.execute("PRAGMA table_info(deals)")][-2:] == ["inst_json", "perp_scope"]
     before = _objects(con)
@@ -102,7 +102,7 @@ def test_live_like_dqa9q_db_migrates_without_touching_rows(tmp_path, monkeypatch
             assert [r[:-1] for r in rows1[t]] == rows0[t] and all(r[-1] is None for r in rows1[t])
         else:
             assert rows1[t] == rows0[t], f"{t}: исполнения и суммы не переписаны"
-    assert store.schema_info(con)["version"] == 2 and NEW_TABLES <= _tables(con)
+    assert store.schema_info(con)["version"] == store.SCHEMA_VERSION and NEW_TABLES <= _tables(con)
     deal = store.get_deal(con, "DQA9Q")
     assert InstrumentSpec.from_json(deal["inst_json"]).inst_hash() == DQA9Q_HASH
     assert eng.deal_instrument(con, deal).inst_hash() == DQA9Q_HASH, "отпечаток DQA9Q не изменился"
@@ -126,7 +126,7 @@ def test_live_like_dqa9q_db_migrates_without_touching_rows(tmp_path, monkeypatch
     assert old.get_deal(oc, "DQA9Q")["inst_json"] == deal["inst_json"]
     oc.close()
     con2 = store.connect(p)                                                 # и снова новый код
-    assert store.get_deal(con2, did)["state"] == DealState.ENTERING and store.schema_info(con2)["version"] == 2
+    assert store.get_deal(con2, did)["state"] == DealState.ENTERING and store.schema_info(con2)["version"] == store.SCHEMA_VERSION
     con.close(), con2.close()
 
 
@@ -164,7 +164,7 @@ def test_migration_failure_leaves_no_half_schema(tmp_path, monkeypatch):
     raw.close()
     monkeypatch.setattr(store, "SCHEMA_V2", good)
     con = store.connect(p)                                                  # повтор той же миграции — целиком
-    assert store.schema_info(con)["version"] == 2 and NEW_TABLES <= _tables(con)
+    assert store.schema_info(con)["version"] == store.SCHEMA_VERSION and NEW_TABLES <= _tables(con)
     con.close()
 
 
@@ -173,7 +173,7 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     tm.dqa9q(con)
-    con.execute("UPDATE schema_version SET version=3, min_reader=3")
+    con.execute("UPDATE schema_version SET version=4, min_reader=4")
     objs, rows = _objects(con), _dump(con)
     with pytest.raises(store.SchemaTooNew, match="не запускаюсь"):
         store.connect(p)
@@ -190,7 +190,7 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     con.execute("UPDATE schema_version SET min_reader=2")
     store.connect(p).close()
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (3, 2)
+    assert (info["version"], info["min_reader"]) == (4, 2)
     con.close()
 
 
@@ -199,7 +199,7 @@ def test_require_reader_only_grows(tmp_path):
     store.require_reader(con, 1)
     store.require_reader(con, 2)
     assert store.schema_info(con)["min_reader"] == 2
-    for bad in (3, 0, True, "2"):
+    for bad in (store.SCHEMA_VERSION+1, 0, True, "2"):
         with pytest.raises(ValueError):
             store.require_reader(con, bad)
     con.close()

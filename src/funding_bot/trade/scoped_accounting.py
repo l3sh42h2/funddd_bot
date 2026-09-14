@@ -401,6 +401,9 @@ def bind_deal(con, deal_id: str, scope: ProvenScope, *, now=None):
                           (deal_id,)).fetchone()
         if old is not None and tuple(old) != scope.key:
             raise ScopedAccountingError('deal account attribution is immutable')
+        if _table_exists(con, 'schema_version'):
+            from .store import require_reader
+            require_reader(con, 3, now=stamp)
         _ensure_scope(con, scope, stamp)
         con.execute('INSERT OR IGNORE INTO scoped_deal_accounts VALUES(?,?,?,?,?)',
                     (deal_id, *scope.key, stamp))

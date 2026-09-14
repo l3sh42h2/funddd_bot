@@ -491,7 +491,18 @@ class Bot:
         if cfg is not None and isinstance(cfg.get("limits.daily_loss_stop_usd"), Decimal):
             day0 = int(now // 86400) * 86400
             used = Decimal(0)
-            for r in con.execute("SELECT json FROM exec_events WHERE kind='final' AND ts>=?", (day0,)):
+            from ..trade.accounting import is_bound, event_cost
+            for r in con.execute("SELECT json,deal_id,intent_id FROM exec_events WHERE kind='final' AND ts>=?", (day0,)):
+                if is_bound(con, r[1]):
+                    try:
+                        cost = event_cost(con, r[1], r[2], json.loads(r[0]))
+                    except Exception:
+                        cost = None
+                    if cost is None:
+                        used = None
+                        break
+                    used -= cost
+                    continue
                 try:
                     used -= Decimal(str(json.loads(r[0]).get("cost_usd") or 0))
                 except (ValueError, InvalidOperation, AttributeError, TypeError):

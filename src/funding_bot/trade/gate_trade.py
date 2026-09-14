@@ -907,7 +907,20 @@ class GateTrade:
                 "maker": str(t.get("role") or "").lower() == "maker", "realized_pnl": None,   # Gate my_trades его не даёт
                 "ts": _ms(t.get("create_time", 0))}
 
-    def fills(self, symbol: str, from_id: int | None) -> list[dict]:
+    def history_account(self):
+        from .accounting import _hash
+        uid = self.account().get('user')
+        if type(uid) is not int or uid <= 0:
+            raise GateError('authenticated futures account user ID is missing')
+        return 'acct:v1:gate:' + _hash((self.base, self.SETTLE, uid))
+
+    def history_fills(self, symbol, from_id):
+        return self.fills(symbol, from_id, _strict=True)
+
+    def history_funding(self, symbol, start_ms):
+        return self.funding_income(symbol, start_ms, _strict=True)
+
+    def fills(self, symbol: str, from_id: int | None, *, _strict=False) -> list[dict]:
         """Сделки my_trades (строки для store.add_perp_fills). ИСПРАВЛЕНО (GATE-1, 13.09): live-проба публичного
         /trades 13.09 показала реальную семантику Gate — last_id листает СТРОГО НАЗАД (id < last_id, новые
         сделки первыми), это НЕ курсор «после X», как fromId у Aster. Раньше модуль слал last_id=from_id−1 и шёл
@@ -927,8 +940,18 @@ class GateTrade:
             body = self._signed_ok("GET", f"/futures/{self.SETTLE}/my_trades", params, "my_trades")
             if not isinstance(body, list):
                 raise GateError("my_trades: не список")
+            if _strict and any(not isinstance(t, dict) or t.get('contract') != symbol or
+                               any(t.get(k) is None for k in ('id','order_id','price','size','create_time')) for t in body):
+                raise GateError('history fill identity or execution fields are missing')
             rows = [self._trade_row(symbol, t, m) for t in body if isinstance(t, dict)]
+            if _strict:
+                for raw, parsed in zip(body, rows):
+                    # point_fee is a separate currency; never silently call fee=0 complete.
+                    if raw.get('point_fee') is None or _d(raw['point_fee']) != 0:
+                        parsed['commission_abs'] = None
             for r in rows:
+                if _strict and r['trade_id'] in out and out[r['trade_id']] != r:
+                    raise GateError('history fill duplicate conflict')
                 out[r["trade_id"]] = r
             if from_id is None:
                 return [out[k] for k in sorted(out)]
@@ -938,7 +961,7 @@ class GateTrade:
             lid = page_min
         raise GateError(f"my_trades {symbol}: больше {MAX_PAGES} страниц — сузь from_id")
 
-    def funding_income(self, symbol: str, start_ms: int) -> list[dict]:
+    def funding_income(self, symbol: str, start_ms: int, *, _strict=False) -> list[dict]:
         """account_book?type=fund с start_ms (строки для store.add_funding_income); дедуп по id. Пагинация —
         offset (доки не документируют лимит окна времени, в отличие от Aster/7 суток — не выдумываем предел,
         останавливаемся по MAX_PAGES, как везде в проекте)."""
@@ -953,12 +976,27 @@ class GateTrade:
             if not isinstance(body, list):
                 raise GateError("account_book: не список")
             for r in body:
+                if _strict and (not isinstance(r, dict) or r.get('type') != 'fund' or
+                                r.get('contract') != symbol or
+                                any(r.get(k) is None for k in ('id','time','change'))):
+                    raise GateError('history funding identity or money fields are missing')
                 if not isinstance(r, dict) or r.get("type") != "fund":
                     continue        # защита в глубину: type=fund уже в запросе, но не доверяем фильтру площадки вслепую
                 try:
                     tid = int(r["id"])
                     t_s = int(_d(r.get("time", 0)))
                 except (KeyError, GateError, TypeError, ValueError):
+                    if _strict:
+                        raise GateError('history funding id or time is invalid') from None
+                    continue
+                if _strict:
+                    row = {'tran_id': tid, 'symbol': r['contract'], 'income': _d(r['change']), 'ts': _ms(r['time']),
+                           'asset': self.SETTLE.upper()}
+                    if row['ts'] < start_ms:
+                        continue
+                    if tid in out and out[tid] != row:
+                        raise GateError('history funding duplicate conflict')
+                    out[tid] = row
                     continue
                 if t_s < start_s:      # секундная точность account_book — сравниваем в секундах (как в запросе from=
                     continue           # start_s), а не в мс: округление start_ms→сек не должно отсекать свою же границу

@@ -90,7 +90,7 @@ CREATE TRIGGER IF NOT EXISTS deal_marks_no_update BEFORE UPDATE ON deal_marks BE
 # --- схема 2: версия, ворота, журналы SOL×HL ---------------------------------------------------------------------
 # Версия схемы и ворота (M06): код откажется стартовать, если min_reader БД больше его SCHEMA_VERSION — старый код на
 # БД со сделками, которых он не понимает, выбрал бы не те ноги. min_reader только растёт (require_reader).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIN_READER = 2
 
 # состояния trade/solana/journal.AttemptState для частичных индексов (журнал сверяет их с собой при открытии)
@@ -517,7 +517,7 @@ def _migrate(con, now: float | None = None) -> None:
         con.execute("INSERT INTO schema_version(id, version, min_reader, updated, note) VALUES(1, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET version=excluded.version, "
                     "min_reader=MAX(schema_version.min_reader, excluded.min_reader), updated=excluded.updated, "
-                    "note=excluded.note", (SCHEMA_VERSION, MIN_READER, ts, "SOL×HL: журналы, операции, маршруты, расходы"))
+                    "note=excluded.note", (SCHEMA_VERSION, MIN_READER, ts, "SOL×HL journals; account-scoped reader available (activated on binding)"))
 
 
 def require_reader(con, version: int, now: float | None = None) -> None:

@@ -745,7 +745,19 @@ class AsterTrade:
         return _pf(client_id, "NOT_FOUND", code=NO_SUCH_ORDER)
 
     # --- учёт ------------------------------------------------------------------------------------
-    def fills(self, symbol: str, from_id: int | None) -> list[dict]:
+    def history_account(self):
+        from .accounting import _hash
+        if self.signer is None or not self.signer.send_user:
+            raise AsterError('history account needs an explicit signed user or verified signer-owner mapping')
+        return 'acct:v1:aster:' + _hash((self.base, self.signer.user.lower()))
+
+    def history_fills(self, symbol, from_id):
+        return self.fills(symbol, from_id, _strict=True)
+
+    def history_funding(self, symbol, start_ms):
+        return self.funding_income(symbol, start_ms, _strict=True)
+
+    def fills(self, symbol: str, from_id: int | None, *, _strict=False) -> list[dict]:
         """Сделки userTrades (строки для store.add_perp_fills). from_id=None — последняя страница; иначе все с
         fromId постранично (1000 за раз, до MAX_PAGES). По trade_id без повторов, по возрастанию."""
         out: dict[int, dict] = {}
@@ -757,13 +769,16 @@ class AsterTrade:
                 raise AsterError("userTrades: не список")
             rows = [_trade_row(t) for t in body]
             for r in rows:
+                if _strict and (r['symbol'] != symbol or
+                                (r['trade_id'] in out and out[r['trade_id']] != r)):
+                    raise AsterError('history fill namespace or duplicate conflict')
                 out[r["trade_id"]] = r
             if fid is None or len(body) < PAGE_LIMIT:
                 return [out[k] for k in sorted(out)]
             fid = max(r["trade_id"] for r in rows) + 1
         raise AsterError(f"userTrades {symbol}: больше {MAX_PAGES} страниц — сузь from_id")
 
-    def funding_income(self, symbol: str, start_ms: int) -> list[dict]:
+    def funding_income(self, symbol: str, start_ms: int, *, _strict=False) -> list[dict]:
         """Начисления FUNDING_FEE с start_ms до сейчас (строки для store.add_funding_income): окна по 7 сут
         (предел документации), внутри окна — страницы по времени; дедуп по tranId."""
         seen: dict[int, dict] = {}
@@ -778,12 +793,19 @@ class AsterTrade:
             if not isinstance(body, list):
                 raise AsterError("income: не список")
             for r in body:
+                if _strict and (not isinstance(r, dict) or r.get('incomeType') != 'FUNDING_FEE' or
+                                r.get('symbol') != symbol):
+                    raise AsterError('history funding namespace or type is unproven')
                 if isinstance(r, dict) and r.get("incomeType", "FUNDING_FEE") == "FUNDING_FEE":
                     row = _income_row(r)
+                    if _strict and row['tran_id'] in seen and seen[row['tran_id']] != row:
+                        raise AsterError('history funding duplicate conflict')
                     seen[row["tran_id"]] = row
             if len(body) >= PAGE_LIMIT:
                 last = max(int(r["time"]) for r in body)
-                s = last if last > s else s + 1     # включительно: дубли по tranId отсеются
+                if _strict and last <= s:
+                    raise AsterError('history funding timestamp saturated; coverage gap')
+                s = last if last > s else s + 1     # legacy pagination; strict reader refuses timestamp loss
             else:
                 s = e + 1
         else:

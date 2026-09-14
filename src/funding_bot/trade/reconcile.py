@@ -287,8 +287,8 @@ def backfill(con, deal: dict, legs: Legs) -> str | None:
         return None
     venue = legs.fill_venue
     try:
-        last = store.last_trade_id(con, venue)
-        store.add_perp_fills(con, venue, legs.perp.fills(deal["symbol"], None if last is None else last + 1))
+        from .accounting import sync_fills
+        sync_fills(con, deal, legs)
     except Exception as e:                     # noqa — отчёт возьмёт итоги заявок; на сверку не влияет
         return f"userTrades не добраны: {redact(e)[:120]}"
     return None
@@ -623,10 +623,13 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
             if not legs.sim and not sol:
                 start = int(float(d["created"]) * 1000)
                 try:
-                    store.add_funding_income(con, legs.perp.venue, legs.perp.funding_income(d["symbol"], start))
+                    from .accounting import sync_funding
+                    sync_funding(con, d, legs.perp)
                 except Exception as e:         # noqa
                     log.warning("фандинг %s не добран: %s", d["symbol"], redact(e))
-                income = [dict(r) for r in con.execute(
+                from .scoped_accounting import deal_funding
+                scoped_income = deal_funding(con, d)
+                income = scoped_income if scoped_income is not None else [dict(r) for r in con.execute(
                     "SELECT income FROM funding_income WHERE venue=? AND symbol=? AND ts>=?",
                     (legs.perp.venue, d["symbol"], start))]
                 pr = getattr(legs.perp, "position_risk", None)
@@ -649,6 +652,9 @@ def positions(con, legs_fn: Callable[[bool], Legs | None], *, now: float, busy_d
         num = report.positions_numbers(spot_units=spot_units, dec_token=dec, spot_px=spot_px, position_amt=pos,
                                        mark=mark, unrealized=None, income_rows=income, created=float(d["created"]),
                                        now=now, book_tokens=bk.tokens(dec), book_short=bk.short, m=bk.m)
+        from . import accounting
+        if accounting.is_bound(con, d['id']):
+            num['funding_usd'] = accounting.sources(con, d['id'], until_ms=int(now * 1000)).funding
         m_unknown = not getattr(bk, "m_known", True)
         if m_unknown:                                  # ревью 13.09, M3: дельта по m-заглушке была бы ложной голой ногой
             num["delta"] = num["delta_usd"] = None
@@ -766,11 +772,12 @@ def _period_h(con, deal_id: str) -> D:
 def _entry_costs(con, deal_id: str) -> tuple[D | None, D | None]:
     """Издержки входов сделки (факт — из итога) и оценка выхода (= издержки входов по плану, как в плане и итоге).
     Чего-то нет (итог без издержек, план без оценки) — (None, None): окупаемость тогда «—», а не выдуманная."""
+    from .accounting import event_cost
     cost = plan = None
-    for js, pj in con.execute("SELECT e.json, i.plan_json FROM exec_events e JOIN intents i ON i.id = e.intent_id "
+    for js, pj, iid in con.execute("SELECT e.json, i.plan_json, i.id FROM exec_events e JOIN intents i ON i.id = e.intent_id "
                               "WHERE e.deal_id=? AND e.kind='final' AND i.kind='entry'", (deal_id,)):
         try:
-            c = dget((json.loads(js) if js else {}).get("cost_usd"))
+            c = event_cost(con, deal_id, iid, json.loads(js) if js else {})
             p = dget(((json.loads(pj) if pj else {}).get("est") or {}).get("total_usd"))
         except (TypeError, ValueError, AttributeError):
             return None, None

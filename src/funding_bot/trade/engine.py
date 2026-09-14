@@ -490,6 +490,10 @@ def _partial_closes_short(bk: DealBook, units: int, dec: int, step: D) -> bool:
 
 def deal_fills(con, deal_id: str, intent_id: str | None = None) -> list[dict]:
     """userTrades сделки (или одного намерения): perp_fills ↔ perp_orders по (venue, order_id)."""
+    from . import scoped_accounting
+    scoped = scoped_accounting.deal_fills(con, deal_id, intent_id)
+    if scoped is not None:
+        return scoped
     prefix = f"fb-{deal_id}-"
     sql = ("SELECT f.* FROM perp_fills f JOIN perp_orders o ON f.venue = o.venue AND f.order_id = o.order_id "
            "WHERE substr(o.client_id, 1, ?)=?")
@@ -1071,7 +1075,18 @@ class Desk:
             raise Refused(_views().refused(f"дневной стоп по «{basis}» пока не считается — вход запрещён"))
         day0 = math.floor(self.clock() / 86400) * 86400
         used = ZERO
-        for r in self.conns.get().execute("SELECT json FROM exec_events WHERE kind='final' AND ts>=?", (day0,)):
+        from . import accounting
+        con = self.conns.get()
+        for r in con.execute("SELECT json,deal_id,intent_id FROM exec_events WHERE kind='final' AND ts>=?", (day0,)):
+            if accounting.is_bound(con, r[1]):
+                try:
+                    cost = accounting.event_cost(con, r[1], r[2], json.loads(r[0]))
+                except Exception:
+                    cost = None
+                if cost is None:
+                    raise Refused(_views().refused('дневные издержки не подтверждены для счёта — вход запрещён'))
+                used += cost
+                continue
             try:
                 used += D(str(json.loads(r[0]).get("cost_usd") or 0))
             except (ValueError, InvalidOperation, AttributeError):
@@ -2842,8 +2857,8 @@ class Engine:
         con = self.conns.get()
         venue = run.legs.fill_venue
         try:
-            last = store.last_trade_id(con, venue)
-            store.add_perp_fills(con, venue, run.legs.perp.fills(run.symbol, None if last is None else last + 1))
+            from .accounting import sync_fills
+            sync_fills(con, run.deal, run.legs)
         except Exception as e:                 # noqa — отчёт возьмёт итоги заявок (комиссия — оценка)
             log.warning("userTrades %s не добраны: %s", run.symbol, redact(e))
 
@@ -2893,6 +2908,22 @@ class Engine:
         """Итог закрытой сделки: спот (выручка выходов − стоимость входов), перп (продано − откуплено − комиссии),
         фандинг (income с открытия; в симуляции не начисляется — «—»)."""
         con = self.conns.get()
+        from . import accounting
+        if accounting.is_bound(con, run.did):
+            try:
+                accounting.sync_funding(con, run.deal, run.legs.perp)
+            except Exception as exc:
+                log.warning('scoped funding not refreshed: %s', type(exc).__name__)
+            from .marks import journal
+            source = journal(con, run.deal)
+            spot = source.spot_flow
+            perp = source.perp_flow - source.fees if source.fees is not None and source.perp_flow is not None else None
+            total = None
+            if spot is not None and perp is not None and source.funding is not None and not source.missing_flows:
+                gas = source.gas_usd(run.legs.native_px())
+                if gas is not None:
+                    total = spot + perp + source.funding - gas
+            return spot, perp, source.funding, total
         spot = spot_quote_flows(con, run.did, run.sdec).net
         perps = perp_quote_flows(con, run.did)
         sell, buy = perps.credit, perps.debit
@@ -2923,8 +2954,14 @@ class Engine:
         con = self.conns.get()
         legs, perp = run.legs, run.legs.perp
         fee = D(str(config.FEES_TAKER[perp.venue]))
+        from . import accounting
+        bound = accounting.is_bound(con, run.did)
+        cost_source_before = accounting.cost_revision(con, run.did, run.iid) if bound else None
         txs = run.sim_txs if legs.sim else intent_txs(con, run.iid)
-        fills = deal_fills(con, run.did, run.iid) or orders_as_fills(con, run.iid, fee)
+        execution = accounting.execution_summary(con, run.did, run.iid) if bound else None
+        fills = deal_fills(con, run.did, run.iid)
+        if not fills and not bound:
+            fills = orders_as_fills(con, run.iid, fee)
         inp = run.plan.inputs
         fh = nxt = None
         try:
@@ -2945,7 +2982,8 @@ class Engine:
                                   ref_px=dget((inp.get("calib") or {}).get("p_ref")),
                                   perp_mid_ref=dget((inp.get("book_top") or {}).get("mid")), plan_total_usd=plan_total,
                                   est_exit_usd=plan_total if entry else None, funding_h=fh, next_funding_ms=nxt,
-                                  position=posrow, started=run.started, finished=finished, m=run.m)
+                                  position=posrow, started=run.started, finished=finished, m=run.m,
+                                  perp_summary=execution, gas_complete=not bound or accounting.gas_complete(txs))
         try:
             bal = legs.spot.balances(run.token)
         except Exception:                      # noqa
@@ -2963,6 +3001,11 @@ class Engine:
             margin = perp.available_margin()
         except Exception:                      # noqa
             margin = None
+        cost_source_after = accounting.cost_revision(con, run.did, run.iid) if bound else None
+        if bound and (any(x != 'funding:coverage_unproven' for x in accounting.sources(con, run.did).missing)
+                      or cost_source_before != cost_source_after):
+            fn['total_complete'] = False
+            fn['breakeven_h'] = None
         cost = fn["total_usd"] if fn["total_complete"] else None
         liq_pct = (fn["liq_dist_frac"] * 100) if fn["liq_dist_frac"] is not None else None
         liq_set = run.cfg.get(f"perp.{run.deal['perp_venue']}.liq_alert_pct") if entry else None
@@ -2991,7 +3034,10 @@ class Engine:
             exit_all=bool(run.spec.get("all")), rest_qty=None if entry else bk.tokens(run.dec),
             partial_reason=(f"DEX продал не все токены — «выход {run.did}» ещё раз"
                             if (not entry and not closed and run.spec.get("all")) else None), sim=legs.sim, m=run.mv)
-        return v.final(fv), cost, {"liq_dist_pct": liq_pct, "liq_alert_pct": liq_thr}
+        extra = {"liq_dist_pct": liq_pct, "liq_alert_pct": liq_thr}
+        if bound:
+            extra['accounting_cost_revision'] = cost_source_after if cost_source_before == cost_source_after else None
+        return v.final(fv), cost, extra
 
 
 # --- CLI `funding_bot plan` ------------------------------------------------------------------------------------

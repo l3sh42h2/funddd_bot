@@ -229,7 +229,8 @@ def final_numbers(*, kind: str, clips: list[Mapping], txs: Iterable[Mapping], fi
                   dec_token: int, dec_stable: int, native_px: D | None, ref_px: D | None, perp_mid_ref: D | None,
                   plan_total_usd: D | None = None, est_exit_usd: D | None = None, funding_h: D | None = None,
                   next_funding_ms: int | None = None, position: Mapping | None = None,
-                  started: float | None = None, finished: float | None = None, m: D = ONE) -> dict:
+                  started: float | None = None, finished: float | None = None, m: D = ONE,
+                  perp_summary: Mapping | None = None, gas_complete: bool = True) -> dict:
     """«✅ Вход завершён»: ноги, дисбаланс (пыль), базис, издержки факт против плана, окупаемость, ликвидация.
 
     Издержки считаются против опорных цен ПЛАНА (ref_px — DEX, perp_mid_ref — мид перпа): удар спота, проскальзывание
@@ -239,22 +240,23 @@ def final_numbers(*, kind: str, clips: list[Mapping], txs: Iterable[Mapping], fi
     """
     tx_list = list(txs)
     dex = dex_leg(clips, kind, dec_token, dec_stable)
-    gas = gas_totals(tx_list, native_px)
-    perp = perp_leg(fills)
-    dust = dex["tokens"] - perp["qty"] * m
+    gas = (gas_totals(tx_list, native_px) if gas_complete else
+           dict.fromkeys(('swap_native', 'approve_native', 'native', 'swap_usd', 'approve_usd', 'usd', 'txs')))
+    perp = perp_leg(fills) if perp_summary is None else dict(perp_summary)
+    dust = dex["tokens"] - perp["qty"] * m if perp["qty"] is not None else None
     basis = ((perp["vwap"] / m / dex["avg_px"] - 1) * BPS) if (perp["vwap"] and dex["avg_px"]) else None
     impact = None
     if ref_px is not None and dex["tokens"] > 0:
         impact = dex["usd"] - dex["tokens"] * ref_px if kind == "entry" else dex["tokens"] * ref_px - dex["usd"]
     slip = None
-    if perp_mid_ref is not None and perp["qty"] > 0:
+    if perp_mid_ref is not None and perp["qty"] is not None and perp["qty"] > 0 and perp["quote"] is not None:
         slip = (perp_mid_ref * perp["qty"] - perp["quote"]) if kind == "entry" else (perp["quote"] - perp_mid_ref * perp["qty"])
     parts = {"impact_usd": impact, "perp_slip_usd": slip, "commission_usd": perp["commission_usd"],
              "gas_usd": gas["usd"]}
     unknown = [k for k, v in parts.items() if v is None]
     total = _sum(parts.values())
     leg = dex["usd"]
-    usd_h = funding_h * perp["quote"] if (funding_h is not None and perp["quote"] > 0) else None
+    usd_h = funding_h * perp["quote"] if (funding_h is not None and perp["quote"] is not None and perp["quote"] > 0) else None
     breakeven = None
     if kind == "entry" and not unknown:
         breakeven = payback_h(total, est_exit_usd if est_exit_usd is not None else ZERO, usd_h)

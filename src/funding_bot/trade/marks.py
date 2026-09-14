@@ -74,11 +74,12 @@ class Journal:
     spot_out: D                 # USDT получено на выходах и откатах
     perp_sell: D                # Σ cum_quote продаж перпа
     perp_buy: D                 # Σ cum_quote покупок перпа
-    fees: D                     # комиссии перпа, $
+    fees: D | None              # комиссии перпа; None — scoped completeness не доказана
     fees_est: bool              # хоть одна заявка — оценкой по тарифу (userTrades не добраны)
     funding: D | None           # фандинг: + получили, − заплатили; None — симуляция (не начисляется)
-    gas_native: D               # газ всех транзакций сделки в нативной монете
+    gas_native: D | None        # None when receipt coverage is unproven
     missing_flows: tuple[str, ...] = ()  # исполнено, но сумма котировки отсутствует/битая: это неизвестно, не 0
+    accounting_revision: str | None = None
 
     @property
     def spot_flow(self) -> D | None:
@@ -96,7 +97,7 @@ class Journal:
         """Газ в $: газа не было — 0; был, а цена BNB неизвестна — None (не 0)."""
         if self.gas_native == 0:
             return ZERO
-        return None if native_px is None else self.gas_native * native_px
+        return None if native_px is None or self.gas_native is None else self.gas_native * native_px
 
 
 def deal_txs(con, deal_id: str) -> list[dict]:
@@ -109,9 +110,15 @@ def deal_txs(con, deal_id: str) -> list[dict]:
     return [seen[k] for k in sorted(seen)]
 
 
+from .scoped_accounting import _consistent_read
+
+
+@_consistent_read
 def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
     """Денежные потоки сделки по trade.db. until_ms — верхняя граница начислений фандинга (закрытая сделка: следующая
     сделка на том же символе не должна дописать свой фандинг в её итог)."""
+    from . import accounting
+    scoped = accounting.sources(con, deal["id"], until_ms=until_ms)
     did = deal["id"]
     _stable, sdec = stable_of(deal["chain"])
     spot = spot_quote_flows(con, did, sdec)
@@ -122,9 +129,8 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
     # в стейблах (скидка BNB) в $ не переводится, недобранные userTrades дают неполную сумму — непокрытый оборот ниже
     # оценивается по тарифу (fees_est). Раньше такая комиссия молча становилась 0 и PnL завышался.
     comm: dict[tuple, list] = {}
-    for f in con.execute("SELECT f.venue, f.order_id, f.price, f.qty, f.quote_qty, f.commission_abs, f.commission_asset "
-                         "FROM perp_fills f JOIN perp_orders o ON f.venue = o.venue AND f.order_id = o.order_id "
-                         "WHERE substr(o.client_id, 1, ?)=?", (len(prefix), prefix)):
+    from .engine import deal_fills
+    for f in (scoped.fills if scoped is not None else deal_fills(con, did)):
         if (f["commission_asset"] or "USDT").upper() not in report.STABLE_ASSETS:
             continue
         acc = comm.setdefault((f["venue"], int(f["order_id"])), [ZERO, ZERO, False])
@@ -154,7 +160,9 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
             fees += (q - covered) * rate
             est = True
     fund = None
-    if not deal["sim"]:
+    if scoped is not None:
+        fund = scoped.funding
+    elif not deal["sim"]:
         start = int(float(deal["created"]) * 1000)
         sql, args = "SELECT income FROM funding_income WHERE venue=? AND symbol=? AND ts>=?", [deal["perp_venue"],
                                                                                               deal["symbol"], start]
@@ -162,8 +170,16 @@ def journal(con, deal: Mapping, *, until_ms: int | None = None) -> Journal:
             sql += " AND ts<=?"
             args.append(int(until_ms))
         fund = sum((_dv(r[0]) or ZERO for r in con.execute(sql, args)), ZERO)
-    gas = report.gas_totals(deal_txs(con, did), None)["native"]
-    return Journal(s_in, s_out, sell, buy, fees, est, fund, gas, spot.missing + perp.missing)
+    txs = deal_txs(con, did)
+    gas = (None if scoped is not None and not accounting.gas_complete(txs)
+           else report.gas_totals(txs, None)["native"])
+    missing = spot.missing + perp.missing
+    revision = None
+    if scoped is not None:
+        fees, est = scoped.fees, scoped.fees is None
+        missing += scoped.missing
+        revision = accounting._hash((scoped.revision, s_in, s_out, sell, buy, fees, est, fund, gas, missing))
+    return Journal(s_in, s_out, sell, buy, fees, est, fund, gas, missing, revision)
 
 
 # --- оценка ----------------------------------------------------------------------------------------------------
@@ -251,6 +267,9 @@ def funding_since(con, deal: Mapping, venue: str) -> int:
     """С какого момента добирать начисления. Не с открытия каждый проход: income — 30 веса Aster за окно 7 сут, сделке
     30 сут — 5 окон каждые MARK_S, и растёт с возрастом. От последнего записанного минус сутки; дубли отсеет tran_id."""
     start = int(float(deal["created"]) * 1000)
+    from .accounting import is_bound
+    if 'id' not in deal or is_bound(con, deal['id']):
+        return start
     r = con.execute("SELECT MAX(ts) FROM funding_income WHERE venue=? AND symbol=? AND ts>=?",
                     (venue, deal["symbol"], start)).fetchone()
     last = r[0] if r else None
@@ -405,6 +424,12 @@ def _liq(m: Mark, perp, symbol: str, venue: str, gate: Callable[[], None]) -> No
                       "mark": mark if mark is not None and mark > 0 else None, "ts": m.ts}
 
 
+@_consistent_read
+def _valuation_sources(con, deal, until_ms):
+    from .engine import deal_book
+    return deal_book(con, deal['id']), journal(con, deal, until_ms=until_ms)
+
+
 def mark_deal(con, deal: Mapping, legs, *, now: float, fetch_funding: bool = True, px_ask: D | None = None,
               busy: Callable[[], bool] | None = None) -> Mark:
     """Оценка одной сделки (только чтение сети). px_ask — уже прочитанный spot.pool_price (цена ПОКУПКИ; не читать
@@ -422,22 +447,23 @@ def mark_deal(con, deal: Mapping, legs, *, now: float, fetch_funding: bool = Tru
         return m
     symbol, dec = deal["symbol"], int(deal["token_dec"])
     venue = deal["perp_venue"]
-    bk = deal_book(con, deal["id"])
+    if not sim and fetch_funding:
+        gate()
+        pv = legs.perp.venue
+        try:                                   # добор начислений, как engine._deal_pnl; сбой — считаем по записанному
+            from .accounting import sync_funding
+            sync_funding(con, deal, legs.perp, legacy_start=funding_since(con, deal, pv))
+        except Exception as e:                 # noqa
+            m.err(f"фандинг не добран: {type(e).__name__}: {redact(e)[:120]}")
+    from .accounting import is_bound
+    bk, j = _valuation_sources(con, deal, int(now * 1000) if is_bound(con, deal['id']) else None)
     if not bk.known:
         m.err(f"книга сделки неизвестна: {bk.why}")
         return m
     q_tok, q_short = bk.tokens(dec), bk.short
     m.flags.update(q_tok=q_tok, q_short=q_short)
-    if bk.m != 1:                              # q_short — контракты (× мид контракта = $); m = 1 — флаги прежние
-        m.flags["m"] = bk.m
-    if not sim and fetch_funding:
-        gate()
-        pv = legs.perp.venue
-        try:                                   # добор начислений, как engine._deal_pnl; сбой — считаем по записанному
-            store.add_funding_income(con, pv, legs.perp.funding_income(symbol, funding_since(con, deal, pv)))
-        except Exception as e:                 # noqa
-            m.err(f"фандинг не добран: {type(e).__name__}: {redact(e)[:120]}")
-    j = journal(con, deal)
+    if bk.m != 1:
+        m.flags['m'] = bk.m
     native = _Once(getattr(legs, "native_px", None))
     m.fees = j.fees
     if j.fees_est:
@@ -447,13 +473,16 @@ def mark_deal(con, deal: Mapping, legs, *, now: float, fetch_funding: bool = Tru
     m.gas = j.gas_usd(native() if j.gas_native else None)
     if m.gas is None:
         m.err("цена BNB не получена — газ сделки в $ неизвестен")
-    m.funding = j.funding if j.funding is not None else ZERO
+    m.funding = j.funding if j.accounting_revision is not None or j.funding is not None else ZERO
     m.flags["accounting_complete"] = not j.missing_flows
+    if j.accounting_revision is not None:
+        m.flags["accounting_revision"] = j.accounting_revision
     if j.missing_flows:
         m.flags["missing_flows"] = list(j.missing_flows)
         m.err("в исполненном журнале отсутствуют денежные суммы: " + ", ".join(j.missing_flows))
     base = None
-    if m.gas is not None and j.spot_flow is not None and j.perp_flow is not None:
+    if (m.gas is not None and j.spot_flow is not None and j.perp_flow is not None
+            and not (j.accounting_revision is not None and j.missing_flows)):
         base = j.spot_flow + j.perp_flow - j.fees - m.gas + m.funding
     m.px_dex = _dex_mid(m, legs, deal, int(bk.tokens_raw), dec, px_ask, gate) if q_tok != 0 else None
     gate()
@@ -493,15 +522,18 @@ def final_mark(con, deal: Mapping, legs, *, now: float) -> Mark:
     if deal["sim"]:
         m.flags["sim"] = True
     j = journal(con, deal, until_ms=int(float(deal["updated"] or now) * 1000))
-    m.fees, m.funding = j.fees, (j.funding if j.funding is not None else ZERO)
+    m.fees, m.funding = j.fees, (j.funding if j.accounting_revision is not None or j.funding is not None else ZERO)
     if j.fees_est:
         m.flags["fees_est"] = True
     m.gas = j.gas_usd(_Once(getattr(legs, "native_px", None))() if j.gas_native else None)
     m.flags["accounting_complete"] = not j.missing_flows
+    if j.accounting_revision is not None:
+        m.flags["accounting_revision"] = j.accounting_revision
     if j.missing_flows:
         m.flags["missing_flows"] = list(j.missing_flows)
         m.err("в исполненном журнале отсутствуют денежные суммы: " + ", ".join(j.missing_flows))
-    if m.gas is not None and j.spot_flow is not None and j.perp_flow is not None:
+    if (m.gas is not None and j.spot_flow is not None and j.perp_flow is not None
+            and not (j.accounting_revision is not None and j.missing_flows)):
         m.pnl_now = j.spot_flow + j.perp_flow - j.fees - m.gas + m.funding
     return m
 
@@ -552,6 +584,24 @@ def run_pass(con, legs_fn: Callable[[bool], Any], *, now: float,
             continue
         if m.pnl_now is not None:              # без цены BNB — в следующий проход, а не итог без газа навсегда
             save(con, m)
+    # Account binding invalidates legacy final marks. Append a new projection;
+    # never rewrite a historical mark/event or keep its scope-blind money cache.
+    from .accounting import is_bound
+    for d in [dict(r) for r in con.execute("SELECT * FROM deals WHERE state='CLOSED' AND updated>=?",
+                                          (now - tconfig.MARK_KEEP_S,))]:
+        if busy():
+            return out, False
+        if is_sol_deal(d) or not is_bound(con, d['id']):
+            continue
+        try:
+            last = decode(store.last_mark(con, d['id']))
+            j = journal(con, d, until_ms=int(float(d['updated']) * 1000))
+            if last is not None and last['flags'].get('accounting_revision') == j.accounting_revision and last['pnl_now'] is not None:
+                continue
+            from .runtime import legs_of
+            save(con, final_mark(con, d, legs_of(legs_fn, d), now=now))
+        except Exception as exc:
+            log.warning('scoped final projection %s unavailable: %s', d['id'], type(exc).__name__)
     # связка SOL × HL: итог, посчитанный при неполной истории HL, пересчитывается (новая ревизия), пока учёт не полон
     for d in [dict(r) for r in con.execute(
             "SELECT * FROM deals WHERE state='CLOSED' AND updated>=? AND id IN (SELECT deal_id FROM deal_marks WHERE "
@@ -618,6 +668,11 @@ def for_positions(con, deal: Mapping, legs, *, now: float, fresh: bool, px_ask: 
     """Оценка для «позиций»: последняя строка deal_marks, если она моложе MARK_S; иначе свежая той же функцией (и она
     же пишется в deal_marks). fresh=False (идёт исполнение) — только таблица, не старше MARK_STALE_S."""
     last = decode(store.last_mark(con, deal["id"]))
+    from .accounting import is_bound
+    if last is not None and is_bound(con, deal['id']):
+        j = journal(con, deal, until_ms=int(last['ts'] * 1000))
+        if last['flags'].get('accounting_revision') != j.accounting_revision or j.missing_flows:
+            last = None
     recent = last if (last is not None and not last["flags"].get("final")
                       and now - last["ts"] < tconfig.MARK_STALE_S) else None
     if recent is not None and (now - recent["ts"] < tconfig.MARK_S or not fresh):

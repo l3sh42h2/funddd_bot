@@ -113,7 +113,7 @@ def load_deals(con: sqlite3.Connection, limit: int = DEALS_MAX, now: float | Non
         v["pnl"] = _pnl_view(con, d, now)
         if d.get("state") not in _TERMINAL:
             v["liq"] = None if v["sim"] else _liq_view(con, d, now)
-            v["hist"] = None if v["sim"] else funding_history(con, d)
+            v["hist"] = None if v["sim"] else funding_history(con, d, now=now)
         out.append(v)
     return {"deals": out, "drafts": drafts}
 
@@ -144,11 +144,15 @@ def _liq_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
 HIST_MAX = 200                          # строк истории выплат в карточке (всего — по всем)
 
 
-def funding_history(con: sqlite3.Connection, d: dict) -> dict:
+def funding_history(con: sqlite3.Connection, d: dict, *, now: float | None = None) -> dict:
     """Выплаты фандинга сделки: funding_income площадки и символа сделки с её открытия — те же границы, что у фандинга в
     PnL (marks.journal). rows — (время с, сумма $, итог с начала), новые сверху, не больше HIST_MAX; total — по всем.
     Связка Solana × Hyperliquid — фактические userFunding счёта сделки в её окне (sol_ledger), USDC."""
-    if _is_sol(d):
+    from ..trade import accounting
+    bound = accounting.sources(con, d['id'], until_ms=int((time.time() if now is None else now) * 1000))
+    if bound is not None:
+        rows = [(r['ts'], r['income']) for r in bound.funding_rows]
+    elif _is_sol(d):
         from ..trade import sol_ledger
         try:
             rows = [(int(t * 1000), x) for t, x in sol_ledger.funding_rows(con, d)]
@@ -164,11 +168,18 @@ def funding_history(con: sqlite3.Connection, d: dict) -> dict:
     acc, out = ZERO, []
     for ts, inc in rows:
         x = _dv(inc)
+        if bound is not None:
+            acc = acc + x if acc is not None and x is not None else None
+            out.append((int(ts) / 1000, x, acc))
+            continue
         if x is None or ts is None:
             continue
         acc += x
         out.append((int(ts) / 1000, x, acc))
-    return {"rows": out[::-1][:HIST_MAX], "n": len(out), "total": acc}
+    result = {"rows": out[::-1][:HIST_MAX], "n": len(out), "total": acc}
+    if bound is not None:
+        result.update(total=bound.funding, incomplete=bool(bound.missing), source_revision=bound.revision)
+    return result
 
 
 def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
@@ -188,9 +199,13 @@ def _pnl_view(con: sqlite3.Connection, d: dict, now: float) -> dict | None:
     evm_missing: tuple[str, ...] = ()
     if not _is_sol(d):
         try:
-            evm_missing = tmarks.journal(
-                con, d, until_ms=int(float(d.get("updated") or now) * 1000) if st == "CLOSED" else None
-            ).missing_flows
+            journal = tmarks.journal(
+                con, d, until_ms=int(float(d.get("updated") or now) * 1000) if st == "CLOSED" else
+                (int(mk["ts"] * 1000) if mk is not None else int(now * 1000)))
+            evm_missing = journal.missing_flows
+            if journal.accounting_revision is not None and mk is not None and (
+                    mk['flags'].get('accounting_revision') != journal.accounting_revision):
+                mk = None
         except (sqlite3.Error, ArithmeticError, ValueError, TypeError, KeyError):
             evm_missing = ("journal:unreadable",)
     if st == "CLOSED":
