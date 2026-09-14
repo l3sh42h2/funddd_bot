@@ -122,6 +122,13 @@ def perpetual(fill, scope, *, spec=None, side=None, partial_terminal=False):
     ref = _perp_ref(fill)
     evidence = (redact(str((scope, fill.client_id, fill.order_id, fill.status, side))),)
 
+    # Terminal cancellation/rejection also carries execution evidence. A missing
+    # or negative quantity must not escape as a raw native zero/negative fill;
+    # a proven zero requires exact, consistent zero quote and average price.
+    if quantity is None or (terminal and quantity == 0 and (quote != 0 or avg != 0)):
+        return Result(Status.UNKNOWN, None, 'invalid_exchange_execution', True, evidence,
+                      error=ErrorKind.UNKNOWN, **_identity(spec, ref))
+
     # A native UNKNOWN zero is a placeholder, never proof of flat execution.
     if status == Status.UNKNOWN and quantity == 0:
         quantity = None
@@ -139,6 +146,9 @@ def perpetual(fill, scope, *, spec=None, side=None, partial_terminal=False):
         cumulative = QuoteAmount(quote, spec.quote_currency)
         amounts = dict(perp_quote=cumulative, trade_notional=cumulative,
                        avg_price=QuoteAmount(avg, spec.quote_currency))
+    if status == Status.REJECTED and has_execution:
+        return Result(Status.UNKNOWN, quantity, 'rejection_with_execution', True, evidence,
+                      error=ErrorKind.UNKNOWN, **_identity(spec, ref), **amounts)
     return Result(status, quantity, 'exchange_terminal' if terminal else 'exchange_observation', not terminal,
                   evidence, terminal=terminal,
                   error=ErrorKind.UNKNOWN if status == Status.UNKNOWN else

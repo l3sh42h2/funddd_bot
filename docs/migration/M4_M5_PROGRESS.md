@@ -148,3 +148,42 @@ Linux checkpoint выполнен после последних code-право�
   AST трёх report dataclass идентичен прежнему; 28 differential stop/resume/positions сценариев сохранили
   сообщения, durable pause/event state и параметры reconciliation. Reviewer profile: 175 passed, 2.88s.
   Проверенный code checkpoint: 6e0c50f; это публикация ветки, не выкат и не завершение M4/M5.
+
+### Продолжение: production submit SOL через общий adapter port
+
+- Добавлен `adapters.execution.submit_ioc`: production registry → native futures binding → PerpJournal → Result v2.
+  `sol_flow._hl_hedge` использует этот порт вместо прямого IOC. Native object передаётся старому clip accounting
+  только после нормализации terminal result; чужой client ID/неполные суммы дают UNKNOWN без повторной отправки.
+- Перед native quote проверяются связи persisted deal → intent → clip, исторические inst_json, client ID,
+  venue и simulation namespace. map_perpetual не требует противоположную спотовую ногу.
+- Astra обнаружил два существенных случая: pre-send отказ оставлял вечный UNKNOWN; неатомарная проверка отсутствия
+  native attempt могла гоняться с живой отправкой. Исправления используют common prepared proof account/instrument
+  и native HL journal: BEGIN IMMEDIATE, доказанная общая DB, затем NOT_PLACED; обязательный on_signed отказывает
+  перед POST. PREPARED/SIGNED и отсутствие только common nonce не считаются доказательством отсутствия отправки.
+- Проверены pre-send отказ → manual rehedge, crash между common claim/native prepare → настоящий startup → manual
+  rehedge, и конкурентные recovery/native prepare с двумя потоками. Последнее bounded review ещё ожидается.
+- Базовый профиль после scope guards: 94 passed, 1.92s; новая двухпоточная regression отдельно: 1 passed, 0.29s.
+  Это не полный Linux artifact profile. M4/M5 остаются in_progress: EVM/spot ports, scoped readers, оставшиеся
+  presentation dependencies, final replay/acceptance и production cutover ещё не завершены.
+
+- Astra подтвердил закрытие race: 95 tests, 10 дополнительных namespace/DB сценариев и обратный порядок
+  native SIGNED перед recovery. Другая DB, чужой account, отсутствующий common proof, PREPARED/SIGNED отказаны.
+- Найден ещё один путь: malformed persisted FINAL без filled/avg_px через старый settle становился нулём и мог
+  вызвать второй хедж. SOL immediate/startup recovery переведены на metadata-free `adapters.execution.settle_ioc`:
+  persisted scope/side + native proof resolver + тот же Result v2 gate. NOT_FOUND не выводится из одного query.
+  RecoveryScope хранит только доказанную идентичность, без выдуманных торговых tick/step; новые filters не запрашиваются.
+  Проверки malformed FINAL → UNKNOWN → восстановление исходного доказанного row без второго send и legacy
+  recovery без нового common proof прошли (2 passed, 0.42s). Последнее bounded review этого расширения ожидается.
+
+- Terminal matrix дополнена: invalid qty для отмены/отказа тоже UNKNOWN; raw compatibility fill допускается
+  только при совпадении quantities/quote/avg с нормализованным результатом. Positive REJECTED остаётся UNKNOWN.
+- Положительный CANCELLED (включая native EXPIRED/CANCELED/CANCELLED) проецируется в PARTIALLY_FILLED;
+  нулевая отмена — в EXPIRED. Native journal сохраняет исходный статус. Иначе старые cash-flow/fee readers
+  пропускали бы частично исполненную отменённую заявку при правильно посчитанном количестве позиции.
+- Три actual SOL сценария partial 400 + fill 503 проверяют exact позицию, perp quote flow, SOL ledger и суммы
+  комиссий. Они прошли (3 passed, 0.55s); изменённый профиль — 118 passed, 2.28s. Final closure pending.
+
+- Final bounded Astra closure получена: новых blocking findings в SOL futures submit/settle пакете нет.
+  Независимый профиль 161 passed, 2.25s; дополнительный persisted EXPIRED400 → PARTIALLY_FILLED + FILLED503
+  сохранил native EXPIRED и exact cash flow 150.57525000. Локальный финальный профиль: 166 passed, 2.13s.
+  Это closure конкретной границы, не полная приёмка M4/M5; production cutover не выполнялся.

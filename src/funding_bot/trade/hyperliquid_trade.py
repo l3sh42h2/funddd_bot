@@ -1111,6 +1111,39 @@ class HyperliquidTrade:
                               expires=row["expires_after"], text="unknownOid (одно наблюдение)")
         return self._from_status(row, st, int((row.get("created") or self._now()) * 1000))
 
+    def submission_absent(self, symbol: str, client_id: str, account_id: str, *, proof_con) -> bool:
+        """Local proof used only by the sole executor after common admission.
+
+        Every POST requires this native journal's committed SIGNED row. No row,
+        or an explicit NOT_SENT row, proves no POST for this client ID. PREPARED
+        and SIGNED remain unresolved; absence of a common signing nonce is not
+        evidence. The caller must own execution and verify its common attempt.
+        """
+        from .runtime import hl_account_id
+        self._check_symbol(symbol)
+        if account_id != hl_account_id(self.network, self.master, self.account, self.dex):
+            raise HlError('common attempt account differs from native account')
+        if self.journal is None or not proof_con.in_transaction:
+            return False
+        # The caller holds BEGIN IMMEDIATE. Native prepare/sign must use this
+        # same database, and on_signed must observe the resulting common state
+        # before POST. A different journal cannot provide this atomic proof.
+        if self.journal.con is not proof_con:
+            from pathlib import Path
+            def main_path(con):
+                return next((r[2] for r in con.execute('PRAGMA database_list') if r[1] == 'main'), '')
+            own, common = main_path(self.journal.con), main_path(proof_con)
+            if not own or not common or Path(own).resolve() != Path(common).resolve():
+                return False
+            if self.journal.con.in_transaction:
+                return False
+        row = proof_con.execute('SELECT * FROM hl_order_attempts WHERE client_id=?', (client_id,)).fetchone()
+        if row is None:
+            return True
+        row = dict(row)
+        saved, why = self._saved_cloid(client_id)
+        return saved is not None and saved['state'] == 'NOT_SENT'
+
     def settle_unknown(self, symbol: str, client_id: str, *, pos_before: Decimal | None, since_ms: int,
                        known_order_ids=frozenset(), wait: bool = True) -> HlPerpFill:
         """Исход заявки без повторной отправки (см. шапку). Ждёт expiresAfter + запас, опрашивая orderStatus;

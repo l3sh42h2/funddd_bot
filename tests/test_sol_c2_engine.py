@@ -517,3 +517,163 @@ def test_exit_hl_buy_rejected_sells_no_more_spot(tmp_path):
     fix = w.desk.propose_fix("rehedge", did, None)       # владелец: откуп reduceOnly на весь остаток шорта
     approve_run(w, fix)
     assert w.venue.pos == 0 and store.get_deal(w.con, did)["state"] == DealState.CLOSED
+
+
+def test_common_admission_native_presend_refusal_does_not_strand_unknown(tmp_path, monkeypatch):
+    from funding_bot.trade.hyperliquid_trade import HlError
+    w = make_world(tmp_path)
+    prop = w.desk.propose_profile_entry(entry_cmd(), chat=None)
+    original = w.perp._gate
+    def fail_send(what, hedge=False):
+        if what == 'send' and hedge:
+            raise HlError('fixture pre-send gate')
+        return original(what, hedge)
+    monkeypatch.setattr(w.perp, '_gate', fail_send)
+    approve_run(w, prop)
+    assert not w.venue.calls
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['NOT_PLACED']
+    assert not w.con.execute("SELECT 1 FROM hl_order_attempts WHERE kind='order'").fetchone()
+    monkeypatch.setattr(w.perp, '_gate', original)
+    for _ in range(2):
+        w.engine.recover_sol(deal_of(w, prop))
+    fix = w.desk.propose_fix('rehedge', prop.deal_id, None)
+    approve_run(w, fix)
+    assert len(w.venue.calls) == 1 and w.venue.pos == D(-903)
+
+
+def test_crash_between_common_claim_and_native_prepare_recovers_without_send(tmp_path, monkeypatch):
+    w = make_world(tmp_path)
+    prop = w.desk.propose_profile_entry(entry_cmd(), chat=None)
+    original = w.perp.ioc
+    def crash(*args, **kw):
+        raise Crash()
+    monkeypatch.setattr(w.perp, 'ioc', crash)
+    with pytest.raises(Crash):
+        approve_run(w, prop)
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['SENT']
+    assert not w.venue.calls
+    assert not w.con.execute("SELECT 1 FROM hl_order_attempts WHERE kind='order'").fetchone()
+    monkeypatch.setattr(w.perp, 'ioc', original)
+    restart(w)
+    reconcile.startup(w.con, w.reg, now=w.clock())
+    for _ in range(2):
+        w.engine.recover_sol(deal_of(w, prop))
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['NOT_PLACED']
+    assert not w.venue.calls
+    fix = w.desk.propose_fix('rehedge', prop.deal_id, None)
+    approve_run(w, fix)
+    assert len(w.venue.calls) == 1 and w.venue.pos == D(-903)
+
+
+def test_no_submit_proof_fences_racing_native_prepare(tmp_path, monkeypatch):
+    import threading
+    from funding_bot.trade.adapters.execution import recover_not_submitted
+    w = make_world(tmp_path)
+    prop = w.desk.propose_profile_entry(entry_cmd(), chat=None)
+    claimed, resume = threading.Event(), threading.Event()
+    original = w.perp.ioc
+    def hold_ioc(*a, **kw):
+        claimed.set()
+        assert resume.wait(5)
+        return original(*a, **kw)
+    monkeypatch.setattr(w.perp, 'ioc', hold_ioc)
+    errors = []
+    def run():
+        try:
+            approve_run(w, prop)
+        except BaseException as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert claimed.wait(5)
+    con = store.connect(w.db)
+    order, = store.perp_orders_unresolved(con)
+    original_proof = w.perp.submission_absent
+    def release_submit_inside_proof(*a, **kw):
+        # Recovery already owns SQLite's write fence. A resumed native prepare
+        # cannot commit ahead of NOT_PLACED, and on_signed must then refuse POST.
+        assert kw['proof_con'].in_transaction
+        answer = original_proof(*a, **kw)
+        assert answer is True
+        resume.set()
+        return answer
+    monkeypatch.setattr(w.perp, 'submission_absent', release_submit_inside_proof)
+    assert recover_not_submitted(con, deal=store.get_deal(con, prop.deal_id), clip_id=order['clip_id'],
+                                 native=w.perp, account=w.reg.for_deal(store.get_deal(con, prop.deal_id)).account_id,
+                                 client_id=order['client_id'])
+    worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert not w.venue.calls and w.venue.pos == 0
+    assert store.get_perp_order(con, order['client_id'])['state'] == 'NOT_PLACED'
+    assert w.perp.journal.get(order['client_id'])['state'] == 'NOT_SENT'
+    con.close()
+
+
+def test_malformed_saved_final_never_causes_second_hedge(tmp_path, monkeypatch):
+    from dataclasses import replace
+    w = make_world(tmp_path)
+    original = w.perp.ioc
+    saved = []
+    def corrupt_result(*a, **kw):
+        fill = original(*a, **kw)
+        saved.append(fill)
+        w.perp.journal.result(fill.client_id, 'FILLED', filled=None, avg_px=None, oid=fill.order_id)
+        return replace(fill, qty=D(0), quote=D(0), avg_px=D(0))
+    monkeypatch.setattr(w.perp, 'ioc', corrupt_result)
+    prop = enter(w)
+    assert len(w.venue.calls) == 1 and w.venue.pos == D(-903)
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['UNKNOWN']
+    monkeypatch.setattr(w.perp, 'filters', lambda *_: pytest.fail('recovery must not request new filters'))
+    for _ in range(2):
+        assert w.engine.recover_sol(deal_of(w, prop))
+    assert len(w.venue.calls) == 1
+    # Replace the synthetic broken fixture with the originally observed proof.
+    fill, = saved
+    w.perp.journal.result(fill.client_id, 'FILLED', filled=fill.qty, avg_px=fill.avg_px, oid=fill.order_id)
+    for _ in range(2):
+        assert w.engine.recover_sol(deal_of(w, prop)) == []
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['FILLED']
+    assert len(w.venue.calls) == 1 and deal_book(w.con, prop.deal_id).short == D(903)
+
+
+def test_negative_saved_expired_never_increases_remaining_hedge(tmp_path, monkeypatch):
+    from dataclasses import replace
+    w = make_world(tmp_path)
+    original = w.perp.ioc
+    def corrupt_result(*a, **kw):
+        fill = original(*a, **kw)
+        w.perp.journal.result(fill.client_id, 'EXPIRED', filled=D(-1), avg_px=D(0), oid=fill.order_id)
+        return replace(fill, status='UNKNOWN', qty=D(0), quote=D(0), avg_px=D(0))
+    monkeypatch.setattr(w.perp, 'ioc', corrupt_result)
+    prop = enter(w)
+    assert len(w.venue.calls) == 1 and w.venue.pos == D(-903)
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['UNKNOWN']
+    assert w.engine.recover_sol(deal_of(w, prop))
+    assert len(w.venue.calls) == 1
+
+
+@pytest.mark.parametrize('status', ['EXPIRED', 'CANCELED', 'CANCELLED'])
+def test_positive_cancelled_fill_keeps_position_cash_flows_and_fees(tmp_path, monkeypatch, status):
+    from dataclasses import replace
+    from funding_bot.trade.ledger_flows import perp_quote_flows
+    from funding_bot.trade.sol_ledger import ledger
+    w = make_world(tmp_path)
+    w.venue.script = [('partial', D(400))]
+    original = w.perp.ioc
+    observed = []
+    def cancelled_partial(*a, **kw):
+        fill = original(*a, **kw)
+        observed.append(fill)
+        return replace(fill, status=status) if len(observed) == 1 else fill
+    monkeypatch.setattr(w.perp, 'ioc', cancelled_partial)
+    prop = enter(w)
+    deal = deal_of(w, prop)
+    assert deal['state'] == DealState.OPEN
+    assert w.venue.pos == -D(903) and deal_book(w.con, prop.deal_id).short == D(903)
+    assert [o['state'] for o in orders(w, prop.deal_id)] == ['PARTIALLY_FILLED', 'FILLED']
+    expected = sum((fill.quote for fill in observed), D(0))
+    flows = perp_quote_flows(w.con, prop.deal_id)
+    assert not flows.missing and flows.credit == expected
+    projection = ledger(w.con, deal, fee_rate=D('.0005'))
+    assert projection.perp_sell == expected
+    assert projection.perp_fee == sum(((fill.quote * W.FEE).quantize(D('0.000001')) for fill in observed), D(0))

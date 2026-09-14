@@ -264,3 +264,22 @@ def test_native_adapter_normalization_failure_returns_identity_stamped_unknown_a
     assert result.native_ref == NativeRef('attempt', 'attempt-1')
     assert (result.leg_id, result.spec_hash, result.scope) == (spec.leg_id, spec.fingerprint, spec.scope)
     assert result.executed_quantity is None and not result.terminal
+
+
+@pytest.mark.parametrize('status', ['EXPIRED', 'CANCELED', 'CANCELLED', 'REJECTED', 'FILLED', 'PARTIALLY_FILLED'])
+@pytest.mark.parametrize('qty', [D(-1), None, D('NaN'), float('inf')])
+def test_invalid_quantity_never_becomes_terminal_zero(status, qty):
+    spec = perp_spec()
+    fill = PerpFill('cid', 1, status, qty, D(0), D(0), 1)
+    result = outcomes.perpetual(fill, spec.scope, spec=spec, side='SELL', partial_terminal=True)
+    assert result.status == Status.UNKNOWN and not result.terminal
+    assert result.executed_quantity is None
+
+
+@pytest.mark.parametrize('status', ['EXPIRED', 'REJECTED'])
+@pytest.mark.parametrize('field,value', [('quote', None), ('quote', D(1)), ('avg_px', None), ('avg_px', D(1))])
+def test_terminal_zero_requires_consistent_exact_zero_amounts(status, field, value):
+    spec = perp_spec()
+    fill = replace(PerpFill('cid', 1, status, D(0), D(0), D(0), 1), **{field:value})
+    result = outcomes.perpetual(fill, spec.scope, spec=spec, side='SELL')
+    assert result.status == Status.UNKNOWN and not result.terminal

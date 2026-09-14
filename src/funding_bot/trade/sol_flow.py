@@ -263,6 +263,10 @@ def recover_deal(con, deal: Mapping, legs: SolLegs) -> list[str]:
             continue
         cid = o["client_id"]
         row = journal.get(cid) if journal is not None else None
+        from .adapters.execution import recover_not_submitted
+        if recover_not_submitted(con, deal=deal, clip_id=o['clip_id'], native=perp,
+                                 account=legs.account_id, client_id=cid):
+            continue
         if o["state"] == PerpOrderState.INTENT and (row is None or row.get("state") == "NOT_SENT"):
             store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err="не подписана — не отправлялась")
             continue
@@ -285,8 +289,10 @@ def recover_deal(con, deal: Mapping, legs: SolLegs) -> list[str]:
         # окно fills — от записи попытки в журнале адаптера (его часы), иначе от отметки отправки движка
         t0 = (row or {}).get("created") or o["sent_ts"] or 0
         try:
-            f = perp.settle_unknown(deal["symbol"], cid, pos_before=-short_known if len(sent) == 1 else None,
-                                    since_ms=int(float(t0) * 1000), known_order_ids=frozenset(known_ids), wait=True)
+            from .adapters.execution import settle_ioc
+            f = settle_ioc(con, deal=deal, native=perp, account=legs.account_id, client_id=cid,
+                           pos_before=-short_known if len(sent) == 1 else None,
+                           since_ms=int(float(t0) * 1000), known_order_ids=frozenset(known_ids), wait=True)
         except Exception as e:          # noqa
             left.append(f"заявка {cid}: {type(e).__name__}")
             continue
@@ -1347,25 +1353,30 @@ class SolEngine:
                                                              "увеличиваю")
             child += 1
             cid = store.client_order_id(run.did, run.letter, clip_id, child, 1)
-            store.perp_order_intent(con, clip_id=clip_id, client_id=cid, venue=run.legs.fill_venue, symbol=run.symbol,
-                                    side=side, reduce_only=reduce_only, tif="IOC", price=cap, qty=q)
             since_ms = int(self.e.clock() * 1000)
             pos_before = -(short0 + (filled if side == "SELL" else -filled))
             try:
-                fill = perp.ioc(run.symbol, side, q, cap, cid, reduce_only, hedge=True,
-                                on_signed=lambda n, c=cid: store.perp_order_sent(con, c, sign_nonce=n),
-                                links={"deal_id": run.did, "intent_id": run.iid, "clip_id": clip_id})
+                from .adapters.execution import submit_ioc
+                fill = submit_ioc(con, deal=run.deal, clip_id=clip_id, native=perp,
+                                  account=run.legs.account_id, fill_venue=run.legs.fill_venue,
+                                  client_id=cid, side=side, quantity=q, price=cap,
+                                  reduce_only=reduce_only, clock=self.e.clock,
+                                  authorize=lambda leg, action: self._agent_gate(run, "hedge"),
+                                  registry=getattr(self.e.legs, 'adapters', None))
             except Exception as e:    # noqa — до отправки (ворота, параметры, незакрытая заявка) — или после подписи
                 row = store.get_perp_order(con, cid)
-                if row is not None and row["state"] == PerpOrderState.INTENT:
-                    store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=f"{type(e).__name__}: {e}"[:200])
+                if row is None or row["state"] in (PerpOrderState.INTENT, PerpOrderState.NOT_PLACED):
+                    if row is not None and row["state"] == PerpOrderState.INTENT:
+                        store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=f"{type(e).__name__}: {e}"[:200])
                     return HedgeResult(filled, quote, "deficit", f"заявка не отправлена: {redact(e)}")
                 fill = None
             if fill is None or fill.status == "UNKNOWN":
                 store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=getattr(fill, "err_text", None))
                 store.event(con, "perp_unknown", deal_id=run.did, intent_id=run.iid, clip_id=clip_id, cid=cid)
-                s = perp.settle_unknown(run.symbol, cid, pos_before=pos_before, since_ms=since_ms,
-                                        known_order_ids=frozenset(known))
+                from .adapters.execution import settle_ioc
+                s = settle_ioc(con, deal=run.deal, native=perp, account=run.legs.account_id,
+                               client_id=cid, pos_before=pos_before, since_ms=since_ms,
+                               known_order_ids=frozenset(known))
                 if s.status == "NOT_FOUND":
                     store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=getattr(s, "err_text", None) or
                                             "не выставлена")

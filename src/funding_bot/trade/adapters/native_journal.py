@@ -42,7 +42,8 @@ class PerpJournal:
             if json.loads(intent['spec_json']).get('inst_hash') != self.spec.legacy_hash:
                 raise AdapterError(ErrorKind.IDENTITY, 'native intent instrument differs from frozen leg')
         return dict(attempt_id=prepared.attempt_id, spec_hash=prepared.spec_hash,
-                    quote_hash=prepared.quote.fingerprint)
+                    quote_hash=prepared.quote.fingerprint, account=self.spec.account,
+                    instrument=self.spec.instrument)
 
     def prepare(self, prepared):
         self._require_autocommit()

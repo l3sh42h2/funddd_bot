@@ -113,3 +113,26 @@ Checkpoint общего lifecycle и корневых операций (2026-09-
   AST трёх report dataclass идентичен прежнему; 28 differential stop/resume/positions сценариев сохранили
   сообщения, durable pause/event state и параметры reconciliation. Reviewer profile: 175 passed, 2.88s.
   Проверенный code checkpoint: 6e0c50f; это публикация ветки, не выкат и не завершение M4/M5.
+
+### Production SOL futures submit port (in_progress, review)
+
+Codex подключил `sol_flow._hl_hedge` к production adapter registry/PerpJournal/Result v2. Введены проверки
+clip/intent/deal/client_id/frozen instrument и namespace до quote/отправки. Исторические inst_json/hash не меняются.
+Astra xhigh нашёл pre-send UNKNOWN dead end и race no-submit recovery с отправкой. Исправления: доказательство
+из native HL journal на той же DB под BEGIN IMMEDIATE и существующий on_signed fence до POST. Native PREPARED/SIGNED
+не разрешают повторную отправку. Проверки включают manual rehedge после отказа и crash/startup, двухпоточный race;
+основной профиль 94 passed, дополнительный race 1 passed. Финальная closure этого diff ожидается.
+Production/VPS не менялись; M4/M5 и полный переход на generic execution/scoped accounting пока не завершены.
+
+Astra закрыл recovery/submit race дополнительной матрицей и обратным порядком SIGNED/recovery.
+Добавлен общий metadata-free settle wrapper для immediate/startup SOL recovery: повреждённый FINAL не превращается
+в нулевое исполнение и второй хедж. Legacy recovery не требует новых filters/quote/claim и не переписывает inst_json.
+Два целевых теста этого расширения прошли, финальное review pending. Полная миграция остаётся незавершённой.
+
+Дополнена terminal matrix по итогам Astra: некорректный qty отмены/отказа → UNKNOWN; positive REJECTED → UNKNOWN.
+Positive cancellation → compatibility PARTIALLY_FILLED, zero cancellation → EXPIRED, исходный native journal
+не меняется. Actual SOL tests проверяют exact позицию, денежные потоки и комиссии partial400+503; 3 passed.
+
+Final bounded review Astra xhigh: все замечания этого SOL futures submit/settle пакета закрыты,
+новых blocking findings не подтверждено. Reviewer161passed2.25s; root166passed2.13s; diff --check чистый.
+Это публикация промежуточного исходного кода. M4/M5 не завершены, действующий бот не выкатывался.
