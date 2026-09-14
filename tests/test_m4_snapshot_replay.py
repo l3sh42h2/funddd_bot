@@ -153,6 +153,22 @@ def test_solana_explicit_zero_receipt_fee_is_known_evidence(tmp_path: Path) -> N
     assert result["target"]["accounting"]["gas_native_raw"] == 0
 
 
+@pytest.mark.parametrize("substitute_kind", ["tip", "rent_nonrefundable"])
+def test_solana_nonreceipt_native_cost_cannot_replace_receipt_fee(
+        tmp_path: Path, substitute_kind: str) -> None:
+    doc = _snapshot("m4_solana_known.json")
+    for event in doc["tables"]["fee_events"]:
+        if event["kind"] == "network_total":
+            event["kind"] = substitute_kind
+
+    result = rs.replay(_write(tmp_path, doc), target_root=ROOT, repo_root=ROOT)
+
+    assert result["verified_equivalent"] is False
+    assert result["classification"] == "unsafe_shared_fallback"
+    assert "clip:11:network_fee_evidence" in result["strict_evidence"]["missing_monetary_evidence"]
+    assert "clip:12:network_fee_evidence" in result["strict_evidence"]["missing_monetary_evidence"]
+
+
 def test_snapshot_rejects_rows_later_than_accounting_cut(tmp_path: Path) -> None:
     doc = _snapshot("m4_solana_known.json")
     doc["tables"]["deals"][0]["state"] = "OPEN"

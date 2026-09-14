@@ -61,7 +61,6 @@ FILLED_STATES = {"FILLED", "PARTIALLY_FILLED"}
 OPEN_DEX_STATES = {"DEX_SENT", "DEX_UNKNOWN"}
 OPEN_PERP_STATES = {"INTENT", "SENT", "UNKNOWN"}
 STABLES = {"USD", "USDC", "USDT", "USD1"}
-SOL_NETWORK_FEE_KINDS = {"network_total", "network_base", "network_priority", "tip", "rent_nonrefundable"}
 MILLISECOND_TIME_COLUMNS = {"perp_fills": "ts", "funding_income": "ts", "hl_fills": "time",
                             "hl_funding": "time"}
 
@@ -416,7 +415,7 @@ def _strict_evidence(doc: dict[str, Any]) -> dict[str, Any]:
                 exact_fee = any(
                     row.get("clip_id") == clip.get("id") and not row.get("included") and
                     not row.get("superseded") and not row.get("estimated") and
-                    row.get("asset") == "native:solana" and row.get("kind") in SOL_NETWORK_FEE_KINDS and
+                    row.get("asset") == "native:solana" and row.get("kind") == "network_total" and
                     _raw(row.get("amount_raw")) is not None
                     for row in fee_events
                 )
