@@ -5,7 +5,7 @@ caller. Missing historical amounts are reported separately; legacy zero fallback
 is exposed as such, not presented as a proven zero in a new ledger.
 """
 from dataclasses import dataclass
-from decimal import Decimal as D
+from decimal import Decimal as D, InvalidOperation
 
 FLOW_STATES = ('DEX_OK', 'PERP_SENT', 'BALANCED', 'HEDGE_DEFICIT')
 
@@ -35,9 +35,14 @@ def spot_quote_flows(con, deal_id, quote_decimals, *, exit_kinds=('exit', 'undo'
         if not incoming and r[3] not in exit_kinds:
             continue
         amount = r[1] if incoming else r[2]
-        if amount is None:
+        try:
+            raw = D(str(amount))
+            if not raw.is_finite() or raw < 0 or raw != raw.to_integral_value():
+                raise ValueError('invalid raw amount')
+            value = raw / D(10) ** quote_decimals
+        except (InvalidOperation, TypeError, ValueError):
             missing.append(f'clip:{r[0]}:quote')
-        value = D(int(amount or 0)) / D(10) ** quote_decimals
+            value = D(0)
         if incoming:
             debit += value
         else:
@@ -57,9 +62,13 @@ def perp_quote_flows(con, deal_id):
     debit = credit = D(0)
     missing = []
     for row in filled_orders(con, deal_id):
-        if row['cum_quote'] is None:
+        try:
+            value = D(str(row['cum_quote']))
+            if not value.is_finite() or value < 0 or row['side'] not in ('SELL', 'BUY'):
+                raise ValueError('invalid quote flow')
+        except (InvalidOperation, TypeError, ValueError):
             missing.append(f"order:{row['client_id']}:quote")
-        value = D(row['cum_quote'] or '0')
+            value = D(0)
         if row['side'] == 'SELL':
             credit += value
         else:

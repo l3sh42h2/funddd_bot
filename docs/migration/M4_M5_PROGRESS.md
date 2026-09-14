@@ -61,3 +61,12 @@ Linux checkpoint выполнен после последних code-право�
 отдельная DAC-проверка — 1 passed за 0.05 s. Лог и fingerprint архива:
 `M4_CHECKPOINT_LINUX_TESTS.txt`. Временная папка удалена скриптом; production не менялся.
 Это профильная Linux-проверка, не полный Linux acceptance M5.
+
+### Continuation: common clip lifecycle and durable drain (in progress)
+
+- EVM and Solana entry/exit now share `OperationController.run_clips`; native signing/recovery ports remain.
+- Strict cash-flow projections propagate missing amounts into unknown PnL; legacy numeric fallback is not evidence.
+- Core has a durable deploy epoch, independent execution fence, verified release identity and asynchronous native recovery gate. First transition can start fenced before executor/IPC startup.
+- Targeted monetary/ledger/drain tests: 124 passed; local IPC/process tests: 17 passed (Unix sockets require sandbox exemption).
+- Helpers: GPT-5.6 Sol high for replay and deploy, isolated worktrees. Independent reviewer GPT-6 Astra xhigh is reviewing this checkpoint.
+- This is an integration checkpoint, NOT M4/M5 acceptance: replay, generic adapter wiring, presenter boundary, integrated deploy/health verification and VPS switch remain outstanding.

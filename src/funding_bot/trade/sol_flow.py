@@ -28,7 +28,7 @@ from . import hl_rules as R, instruments as I, planner, store, tconfig
 from .engine import (HedgeResult, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book, deal_instrument,
                      dget)
 from .exposure import Exposure
-from .operations import OperationController, SpotSettlement
+from .operations import OperationController, SpotSettlement, ClipLifecycle
 from .fees import NATIVE_SOL, native_cash_needed
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing, OwnerUnsupported, SOL_HL
@@ -1118,6 +1118,8 @@ class SolEngine:
         con = self.con
         if store.is_paused(con) or self.e.pause_evt.is_set():
             raise Pause("stop", "стоп владельца: новое не начинаю")
+        if self.e.drain_evt.is_set():
+            raise Pause("drain", "переключение версии: новое не начинаю")
         if self.e.term.is_set():
             raise Pause("terminate", "служба останавливается: новое не начинаю")
         try:
@@ -1417,14 +1419,36 @@ class SolEngine:
         self._op_start(run)
         self._hl_preflight(run)
         amount = int(run.spec["amount_raw"])
-        dec, req = self._requote(run, amount)
-        run.seq = 1
-        self.e.current = (run.iid, 1, 1)
-        clip_id = store.create_clip(con, run.iid, 1, amount)
-        self.guard(run, entry=True)
-        run.t_swap = self.e.clock()
-        self._progress(run, "swap", path=dec.winner.path)
-        self._swap(run, clip_id, dec, req)
+        self._run_spot_clips(run, amount, self._entry_hedge)
+
+    def _run_spot_clips(self, run: SolRun, amount: int, hedge) -> None:
+        entry = run.kind == "entry"
+
+        def progress(seq, total):
+            run.seq = seq
+            self.e.current = (run.iid, seq, total)
+
+        def spot(cid, amount, ticket):
+            decision, request = ticket
+            self.guard(run, entry=entry)
+            run.t_swap = self.e.clock()
+            self._progress(run, "swap", path=decision.winner.path)
+            self._swap(run, cid, decision, request)
+
+        def settle(cid, ticket):
+            if entry:
+                self._basis(run, cid)
+            self._invariant(run)
+
+        OperationController(self.con).run_clips(ClipLifecycle(
+            intent_id=run.iid, amounts=[amount], progress=progress,
+            guard=lambda: self.guard(run, entry=entry), select_amount=lambda u, last: u,
+            prepare=lambda u, last: self._requote(run, u), spot=spot,
+            hedge=lambda cid, last, ticket: hedge(run, cid), settle=settle,
+            next_amounts=lambda cid, done, remaining, ticket: remaining, finish=lambda: self._finish(run)))
+
+    def _entry_hedge(self, run: SolRun, clip_id: int) -> None:
+        con = self.con
         # хедж по факту прихода (чек): «стоп» теперь не мешает — нога уже исполнена (hedge=True)
         bk = deal_book(con, run.did)
         if not bk.known:
@@ -1443,9 +1467,6 @@ class SolEngine:
         if decision.surplus:          # G09: получено больше одобренной ёмкости — продажа излишка в пилоте выключена
             raise Pause("surplus", f"пришло больше одобренного: шорт {cap} из нужных {target} — излишек без хеджа, "
                                    "продажа излишка в пилоте выключена")
-        self._basis(run, clip_id)
-        self._invariant(run)
-        self._finish(run)
 
     # --- выход ---
     def _exit(self, run: SolRun) -> None:
@@ -1465,14 +1486,10 @@ class SolEngine:
         self._op_start(run)
         op = store.get_operation(con, run.op_id) if run.op_id else None
         amount = min(T0, store.operation_remaining(op)) if op else T0
-        dec, req = self._requote(run, amount)
-        run.seq = 1
-        self.e.current = (run.iid, 1, 1)
-        clip_id = store.create_clip(con, run.iid, 1, amount)
-        self.guard(run)
-        run.t_swap = self.e.clock()
-        self._progress(run, "swap", path=dec.winner.path)
-        self._swap(run, clip_id, dec, req)
+        self._run_spot_clips(run, amount, self._exit_hedge)
+
+    def _exit_hedge(self, run: SolRun, clip_id: int) -> None:
+        con = self.con
         bk = deal_book(con, run.did)
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
@@ -1489,8 +1506,6 @@ class SolEngine:
             raise Pause("hedge_deficit", f"после продажи шорт {bk.short} меньше нужного {target} — заявку не шлю")
         else:
             store.set_clip_state(con, clip_id, ClipState.BALANCED, perp_qty=ZERO, perp_quote=ZERO)
-        self._invariant(run)
-        self._finish(run)
 
     # --- дохедж ---
     def _rehedge(self, run: SolRun) -> None:

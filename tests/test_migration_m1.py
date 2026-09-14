@@ -180,7 +180,7 @@ def test_drain_and_separate_deploy_authority(conns):
     s=service(conns);s.ready=True
     with pytest.raises(RpcError,match='unauthorized_method'):
         s.dispatch('begin_drain',{},None,os.getuid())
-    s.dispatch('begin_drain',{},None,0)
+    s.dispatch('begin_drain',{'release_id':'fixture','expected_state_revision':0},None,0)
     with pytest.raises(RpcError,match='draining'):
         s.dispatch('submit_user_command',{'update':update(1,'продолжить')},'tg:1',os.getuid())
     assert s.dispatch('submit_user_command',{'update':update(2)},'tg:2',os.getuid())['state']=='queued'

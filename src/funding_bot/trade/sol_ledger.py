@@ -26,7 +26,7 @@ import json, logging, time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping
-from .ledger_flows import spot_quote_flows, filled_orders
+from .ledger_flows import spot_quote_flows, perp_quote_flows, filled_orders
 from . import store
 from .keys import redact
 
@@ -153,6 +153,7 @@ class Ledger:
     foreign_fills: tuple = ()            # fills на fullcoin сделки в её окне не нашими заявками (ручные/чужие)
     routes: tuple = ()                   # фактический маршрут каждого клипа (путь провайдера)
     sim: bool = False
+    missing_flows: tuple = ()
 
     @property
     def spot_flow(self) -> D:
@@ -172,13 +173,15 @@ class Ledger:
     def base(self, sol_px: D | None) -> D | None:
         """Реализованная часть: потоки − комиссии HL − сеть + фандинг. Неизвестная статья — None (не 0)."""
         net = self.network_usdc(sol_px)
-        if net is None or self.perp_fee is None or self.other_unknown:
+        if net is None or self.perp_fee is None or self.other_unknown or self.missing_flows:
             return None
         return self.spot_flow + self.perp_flow - self.perp_fee - net - self.spot_ext_usdc + (self.funding or ZERO)
 
     @property
     def complete(self) -> bool:
         """Учёт окончателен: fills и фандинг добраны полностью, оценок нет (симуляция — по своему журналу)."""
+        if self.missing_flows:
+            return False
         if self.sim:
             return self.perp_fee is not None
         return bool(self.fills_complete) and bool(self.funding_complete) and not self.fees_est
@@ -194,6 +197,7 @@ def ledger(con, deal: Mapping, *, fee_rate: D | None) -> Ledger:
     L = Ledger(quote_dec=qdec, sim=bool(d.get("sim")))
     flows = spot_quote_flows(con, did, qdec, exit_kinds=("exit",))
     L.spot_in, L.spot_out = flows.debit, flows.credit
+    L.missing_flows = flows.missing + perp_quote_flows(con, did).missing
     try:
         L.routes = tuple(p for (p,) in con.execute(
             "SELECT a.path FROM sol_tx_attempts a JOIN clips c ON a.clip_ref = CAST(c.id AS TEXT) JOIN intents i ON "

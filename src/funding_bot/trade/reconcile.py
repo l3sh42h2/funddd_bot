@@ -780,7 +780,8 @@ def _upnl(con, deal_id: str, short: D | None, mark: D | None) -> D | None:
     """PnL шорта по журналу заявок: продано − откуплено − шорт × марк (без комиссий и фандинга)."""
     if short is None or mark is None:
         return None
-    return perp_quote_flows(con, deal_id).legacy_net - short * mark
+    net = perp_quote_flows(con, deal_id).net
+    return None if net is None else net - short * mark
 
 
 

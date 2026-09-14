@@ -6,6 +6,7 @@ All clip + budget mutations occur in the caller's receipt transaction or one
 short IMMEDIATE transaction. No network calls belong in these transactions.
 """
 from dataclasses import dataclass
+from typing import Callable, Any
 from . import store
 from .store import ClipState as C
 
@@ -26,9 +27,66 @@ class SpotSettlement:
             raise ValueError('non-execution cannot carry token flows')
 
 
+@dataclass
+class ClipLifecycle:
+    """Ports for the common ordered lifecycle, never an entire venue flow.
+
+    Venue preparation/settlement stays behind individual ports. In particular,
+    hedge follows the proven spot effect even if owner pause arrived meanwhile.
+    Guard applies before a NEW clip; the hedge port owns completion of its pair.
+    """
+    intent_id: str
+    amounts: list[int]
+    progress: Callable[[int, int], None]
+    guard: Callable[[], None]
+    select_amount: Callable[[int, bool], int]
+    prepare: Callable[[int, bool], Any]
+    spot: Callable[[int, int, Any], None]
+    hedge: Callable[[int, bool, Any], None]
+    settle: Callable[[int, Any], None]
+    next_amounts: Callable[[int, int, list[int], Any], list[int]]
+    finish: Callable[[], None]
+
+
 class OperationController:
     def __init__(self, connection):
         self.con = connection
+
+    def run_clips(self, program: ClipLifecycle):
+        """One execution order for EVM/SOL and adapter-backed clip programs.
+
+        No SQLite transaction may surround a network phase. Remaining schedule
+        is bounded by the approved input quantity, not recomputed from prices.
+        Native full-exit selection is an explicit snapshot policy in select_amount.
+        """
+        queue = list(program.amounts)
+        seq = done = 0
+        while queue:
+            if self.con.in_transaction:
+                raise store.StoreError('execution cannot run inside a database transaction')
+            planned, queue = queue[0], queue[1:]
+            if type(planned) is not int or planned <= 0:
+                raise store.StoreError('invalid clip input quantity')
+            seq += 1
+            last = not queue
+            program.progress(seq, seq + len(queue))
+            program.guard()
+            amount = program.select_amount(planned, last)
+            if type(amount) is not int or amount < 0:
+                raise store.StoreError('invalid selected clip quantity')
+            if amount == 0:
+                break
+            ticket = program.prepare(amount, last)
+            clip_id = store.create_clip(self.con, program.intent_id, seq, amount)
+            program.spot(clip_id, amount, ticket)
+            program.hedge(clip_id, last, ticket)
+            program.settle(clip_id, ticket)
+            done += amount
+            revised = program.next_amounts(clip_id, done, list(queue), ticket)
+            if any(type(v) is not int or v <= 0 for v in revised) or sum(revised) > sum(queue):
+                raise store.StoreError('replanned clips exceed the remaining input budget')
+            queue = list(revised)
+        program.finish()
 
     def _clip(self, clip_id, operation_id):
         clip = store.get_clip(self.con, clip_id)

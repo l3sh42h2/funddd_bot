@@ -1,7 +1,7 @@
 # M4/M5 — общие операции и переключение трёх процессов
 
 Исполнитель: Codex, назначен владельцем. Ветка codex/migration-m4-m5; база 95354c4.
-Статус in_progress. Обновлено 2026-09-14. Независимый ревьюер: назначение запрошено у владельца.
+Статус in_progress. Обновлено 2026-09-14. Независимый ревьюер: GPT-6 Astra xhigh, назначен владельцем; запускается на подготовленный результат.
 Scope: OperationController, Ledger/recovery/replay, архитектурные границы, verified artifact/deploy/drain,
 миграция runtime и service accounts, итоговая проверка VPS по AC-01..29.
 Ресайз, SL и новые live-стратегии не включены. Исторические inst_json/hash и исполненные деньги сохраняются.
@@ -26,3 +26,5 @@ Scope: OperationController, Ledger/recovery/replay, архитектурные �
 - Подробный статус и оставшиеся обязательные работы: docs/migration/M4_M5_PROGRESS.md.
 - M4/M5 НЕ завершены, production НЕ изменён. Полный lifecycle, replay, независимое ревью и переключение впереди.
 - Linux checkpoint: 158 passed / 82.12s, DAC 1 passed / 0.05s, без live-данных и нагрузочного теста.
+
+Владелец разрешил двух помощников: m4_replay — GPT-5.6 Sol high (replay/учёт), m5_deploy — GPT-5.6 Sol high (deploy). Каждый работает в отдельном worktree; интеграция и выкат остаются у основного Codex.

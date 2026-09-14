@@ -24,8 +24,8 @@ def run_core(environ=None):
         log.error('trade DB missing; initialize explicitly before starting core')
         return 78
     try:
-        with ExecutionLock(execution_lock()):
-            return _run(env)
+        with ExecutionLock(execution_lock()) as lock:
+            return _run(env, lock)
     except BlockingIOError:
         log.error('another trader/core owns execution lock')
         return 78
@@ -34,7 +34,9 @@ def run_core(environ=None):
         return 78
 
 
-def _run(env):
+def _run(env, execution_owner=None):
+    from .release import load_release
+    release = load_release(env.get("FUNDING_RELEASE_MANIFEST"))
     cfg = owner.load()
     conns, holder = Conns(), CfgHolder()
     rt, legs, keys_mode, mode, legacy_on = build_trader_legs(cfg, conns, holder, env)
@@ -47,7 +49,10 @@ def _run(env):
     from ..market_snapshot import load_market_table
     service = CoreService(conns, desk, engine, legs, rt=rt, mode=mode, table_loader=load_market_table,
                           owner_loader=owner.load, ui_uid=int(env.get('FUNDING_INTERFACE_UID', os.getuid())),
-                          deploy_uid=int(env.get('FUNDING_DEPLOY_UID', 0)), snapshotter=snapshot)
+                          deploy_uid=int(env.get('FUNDING_DEPLOY_UID', 0)), snapshotter=snapshot,
+                          execution_owner=execution_owner, release=release,
+                          start_drained=env.get('FUNDING_START_DRAINED') == '1',
+                          drain_release_id=env.get('FUNDING_DRAIN_RELEASE_ID'))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())

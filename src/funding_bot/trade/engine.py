@@ -33,7 +33,7 @@ from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
 from .ledger_flows import spot_quote_flows, perp_quote_flows
 from .exposure import Exposure
-from .operations import OperationController, SpotSettlement
+from .operations import OperationController, SpotSettlement, ClipLifecycle
 from .planner import PlanRefused
 from .runtime import is_sol_deal
 from .store import ClipState, DealState, IntentStatus, PerpOrderState
@@ -1686,6 +1686,7 @@ class Engine:
         self.clip_gap_s = float(clip_gap_s)
         self.q: "queue.Queue[str]" = queue.Queue()
         self._running = threading.Event()
+        self.drain_evt = threading.Event()    # deployment fence; independent of owner pause
         self.pause_evt = threading.Event()    # «стоп» в памяти (флаг в БД ставит бот)
         self.term = threading.Event()         # SIGTERM: новое не начинать, текущую пару ног довести
         self._stop = threading.Event()
@@ -1783,7 +1784,7 @@ class Engine:
         if it is None or it["status"] != IntentStatus.APPROVED:
             log.info("исполнитель: %s не в approved (%s) — пропуск", iid, it and it["status"])
             return
-        if self.term.is_set():
+        if self.term.is_set() or self.drain_evt.is_set():
             return self._fail(iid, "служба останавливается — план не начат, пришлите команду после рестарта")
         deal = store.get_deal(con, it["deal_id"])
         spec = json.loads(it["spec_json"])
@@ -1916,6 +1917,8 @@ class Engine:
         con = self.conns.get()
         if store.is_paused(con) or self.pause_evt.is_set():
             raise Pause("stop", "стоп владельца: новое не начинаю")
+        if self.drain_evt.is_set():
+            raise Pause("drain", "переключение версии: новое не начинаю")
         if self.term.is_set():
             raise Pause("terminate", "служба останавливается: новое не начинаю")
         try:
@@ -2101,6 +2104,8 @@ class Engine:
 
     def _check_unwinds(self) -> None:
         """Авто-откат голой ноги — только если владелец задал auto_unwind_naked_after_s (пусто = никогда)."""
+        if self.drain_evt.is_set() or self.term.is_set():
+            return
         now = self.clock()
         for did, due in list(self._unwind_due.items()):
             if now < due:
@@ -2321,7 +2326,7 @@ class Engine:
 
     # --- общие куски потоков ---
     def _stopping(self) -> bool:
-        return store.is_paused(self.conns.get()) or self.pause_evt.is_set() or self.term.is_set()
+        return store.is_paused(self.conns.get()) or self.pause_evt.is_set() or self.term.is_set() or self.drain_evt.is_set()
 
     def _deal_to(self, run: Run, new: str) -> None:
         con = self.conns.get()
@@ -2523,25 +2528,38 @@ class Engine:
         run.n_total = len(queue_)
         self._setup(run)
         self._approve(run, run.stable, sum(queue_))
+        self._run_spot_clips(run, queue_, entry=True)
+
+    def _run_spot_clips(self, run: Run, amounts: list[int], *, entry: bool, full: bool = False) -> None:
         r = dget(run.plan.inputs.get("r")) or ZERO
-        done = 0
-        while queue_:
-            u = queue_.pop(0)
-            run.seq += 1
-            run.n_total = run.seq + len(queue_)
-            self.current = (run.iid, run.seq, run.n_total)
-            self.guard(run)
-            clip_id = store.create_clip(con, run.iid, run.seq, u)
-            px0, m0 = (self._pool(run), self._mark(run)) if queue_ else (None, None)
-            carry_in = deal_book(con, run.did).delta(run.dec)
-            self._dex(run, clip_id, run.stable, run.token, u)
-            self._hedge_clip(run, clip_id, carry_in)
-            self._basis(run, clip_id)
+
+        def progress(seq, total):
+            run.seq, run.n_total = seq, total
+            self.current = (run.iid, seq, total)
+
+        def prepare(amount, last):
+            px, mark = (self._pool(run), self._mark(run)) if not last else (None, None)
+            return (px, mark, deal_book(self.conns.get(), run.did).delta(run.dec))
+
+        def settle(cid, ticket):
+            if entry:
+                self._basis(run, cid)
             self._invariant(run)
             self._progress(run)
-            done += u
-            queue_, r = self._after_clip(run, clip_id, queue_, px0, m0, r, done)
-        self._finish_main(run)
+
+        def next_amounts(cid, done, remaining, ticket):
+            nonlocal r
+            remaining, r = self._after_clip(run, cid, remaining, ticket[0], ticket[1], r, done)
+            return remaining
+
+        OperationController(self.conns.get()).run_clips(ClipLifecycle(
+            intent_id=run.iid, amounts=amounts, progress=progress, guard=lambda: self.guard(run),
+            select_amount=lambda u, last: self._all_units(run) if full and last else u,
+            prepare=prepare,
+            spot=lambda cid, u, ticket: self._dex(run, cid, run.stable if entry else run.token,
+                                                 run.token if entry else run.stable, u),
+            hedge=lambda cid, last, ticket: self._hedge_clip(run, cid, ticket[2], last_full=full and last),
+            settle=settle, next_amounts=next_amounts, finish=lambda: self._finish_main(run)))
 
     # --- выход ---
     def _all_units(self, run: Run) -> int:
@@ -2579,29 +2597,7 @@ class Engine:
         self._deal_to(run, DealState.EXITING)
         run.n_total = len(queue_)
         self._approve(run, run.token, self._all_units(run) if full else sum(queue_))
-        r = dget(run.plan.inputs.get("r")) or ZERO
-        done = 0
-        while queue_:
-            u = queue_.pop(0)
-            run.seq += 1
-            run.n_total = run.seq + len(queue_)
-            last = not queue_
-            self.current = (run.iid, run.seq, run.n_total)
-            self.guard(run)
-            if last and full:
-                u = self._all_units(run)
-            if u <= 0:
-                break
-            clip_id = store.create_clip(con, run.iid, run.seq, u)
-            px0, m0 = (self._pool(run), self._mark(run)) if queue_ else (None, None)
-            carry_in = deal_book(con, run.did).delta(run.dec)
-            self._dex(run, clip_id, run.token, run.stable, u)
-            self._hedge_clip(run, clip_id, carry_in, last_full=last and full)
-            self._invariant(run)
-            self._progress(run)
-            done += u
-            queue_, r = self._after_clip(run, clip_id, queue_, px0, m0, r, done)
-        self._finish_main(run)
+        self._run_spot_clips(run, queue_, entry=False, full=full)
 
     def _exit_blind(self, run: Run) -> None:
         """Полный выход сделки с неизвестным m (ревью 13.09, M3; план — Desk._plan_blind_exit). Дельту ног в токенах не
@@ -2804,11 +2800,12 @@ class Engine:
         """Итог закрытой сделки: спот (выручка выходов − стоимость входов), перп (продано − откуплено − комиссии),
         фандинг (income с открытия; в симуляции не начисляется — «—»)."""
         con = self.conns.get()
-        spot = spot_quote_flows(con, run.did, run.sdec).legacy_net
+        spot = spot_quote_flows(con, run.did, run.sdec).net
         perps = perp_quote_flows(con, run.did)
         sell, buy = perps.credit, perps.debit
         fills = deal_fills(con, run.did)
-        perp = (sell - buy - sum((abs(dget(f["commission_abs"]) or ZERO) for f in fills), ZERO)) if fills else None
+        fees = [dget(f["commission_abs"]) for f in fills]
+        perp = (sell - buy - sum((abs(f) for f in fees), ZERO)) if fills and None not in fees and not perps.missing else None
         fund = None
         if not run.legs.sim:
             try:
@@ -2825,7 +2822,7 @@ class Engine:
             txs = [t for (iid,) in con.execute("SELECT id FROM intents WHERE deal_id=?", (run.did,))
                    for t in intent_txs(con, iid)]
             gas = report.gas_totals(txs, run.legs.native_px())["usd"] if txs else ZERO
-        total = spot + perp + fund - gas if (perp is not None and fund is not None and gas is not None) else None
+        total = spot + perp + fund - gas if (spot is not None and perp is not None and fund is not None and gas is not None) else None
         return spot, perp, fund, total
 
     def _final(self, run: Run, finished: float, closed: bool) -> tuple[str, D | None]:
