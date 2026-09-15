@@ -168,6 +168,40 @@ def _generic_scope(value: Any) -> tuple | None:
     return _scope_tuple(tuple(value[key] for key in keys))
 
 
+def _recovered_open_intents(con, *, deal_id: str, root: Mapping) -> frozenset[str]:
+    """Return interrupted/partial intents durably proved to have recovered OPEN.
+
+    An ACK loss or a process crash must preserve the old intent status.  It is
+    therefore not sufficient to use ``done`` as the sole proof that an OPEN
+    root owns its scopes.  The terminal controller event is the durable link
+    between that retained intent and the settled root.  A status by itself is
+    never sufficient.
+    """
+    if (root.get("state") != store.OpState.OPEN or root.get("reserved_raw") != "0" or
+            root.get("confirmed_raw") != root.get("target_raw")):
+        raise store.StoreError("open peer generic scope root is not fully settled")
+    proven: set[str] = set()
+    for event in con.execute(
+            "SELECT intent_id, json FROM exec_events WHERE deal_id=? AND kind='operation_end' ORDER BY ts, rowid",
+            (deal_id,)).fetchall():
+        intent_id, raw = event
+        if not isinstance(intent_id, str) or not isinstance(raw, str):
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        if (payload.get("operation_id") != root.get("id") or payload.get("deal_state") != store.DealState.OPEN or
+                payload.get("intent_state") not in (store.IntentStatus.PARTIAL, store.IntentStatus.INTERRUPTED)):
+            continue
+        row = con.execute("SELECT status FROM intents WHERE id=? AND deal_id=?", (intent_id, deal_id)).fetchone()
+        if row is not None and row[0] == payload["intent_state"]:
+            proven.add(intent_id)
+    return frozenset(proven)
+
+
 def _active_generic_peer_scopes(con, deal_id: str, peer_state: str, frozen: Mapping) -> tuple[tuple, tuple]:
     """Return only scopes proven by both immutable parent and a linked plan.
 
@@ -197,18 +231,22 @@ def _active_generic_peer_scopes(con, deal_id: str, peer_state: str, frozen: Mapp
     frozen_hash = store._json_hash(legs)
     proven_scopes = None
     for root_id in root_ids:
-        query = ("SELECT i.plan_json FROM intents i JOIN operation_intents oi ON oi.intent_id=i.id "
+        root = store.get_operation(con, root_id)
+        if root is None:
+            raise store.StoreError("active peer generic scope root is missing")
+        recovered = (_recovered_open_intents(con, deal_id=deal_id, root=root)
+                     if completed else frozenset())
+        query = ("SELECT i.id, i.status, i.plan_json FROM intents i JOIN operation_intents oi ON oi.intent_id=i.id "
                  "WHERE oi.operation_id=?")
-        args = [root_id]
-        # A completed position may use only proof accepted by its terminal
-        # operation; a proposed intent is not ownership evidence.
+        rows = con.execute(query + " ORDER BY oi.seq", (root_id,)).fetchall()
+        # A completed position may use only an ordinary completed intent, or
+        # the exact retained intent named by its durable recovery terminal
+        # event.  PROPOSED/PARTIAL/INTERRUPTED alone are not ownership proof.
         if completed:
-            query += " AND i.status=?"
-            args.append(store.IntentStatus.DONE)
-        rows = con.execute(query + " ORDER BY oi.seq", tuple(args)).fetchall()
+            rows = [row for row in rows if row[1] == store.IntentStatus.DONE or row[0] in recovered]
         if not rows:
             raise store.StoreError("active peer generic scope plan is missing")
-        for (raw_plan,) in rows:
+        for _intent_id, _status, raw_plan in rows:
             plan = _generic_plan(raw_plan)
             if plan.operation_id != root_id or store._json_hash(plan.to_dict()["legs"]) != frozen_hash:
                 raise store.StoreError("active peer generic frozen identity differs from linked plan")

@@ -815,6 +815,63 @@ def test_completed_open_peer_allows_disjoint_scope_after_reopen(tmp_path, spot_a
             deal=store.get_deal(con, overlap_did), plan=overlapping, profile_id="fixture")
 
 
+@pytest.mark.parametrize("spot_adapter", ("fixture_cex_spot", "fixture_evm_spot", "fixture_sol_spot"))
+@pytest.mark.parametrize("recovery_status", (store.IntentStatus.PARTIAL, store.IntentStatus.INTERRUPTED))
+def test_recovered_open_peer_allows_disjoint_scope_after_reopen(tmp_path, monkeypatch, spot_adapter, recovery_status):
+    """A terminal recovery retains partial/interrupted but still proves its OPEN scope.
+
+    The recovery event must authorize only the original root/intent link.  A
+    different parent with disjoint accounts is admissible; an overlap remains
+    blocked after a second SQLite reopen.
+    """
+    path = tmp_path / "trade.db"
+    con = store.connect(path)
+    spot = spec(spot_adapter, "lead", "long")
+    perp = spec("fixture_cex_perp", "hedge", "short")
+    first = plan(spot, perp, operation_id=f"recovered-open-{spot_adapter}-{recovery_status}")
+    first_did = deal(con, first, f"DRECOVER{spot_adapter[-3:].upper()}{recovery_status[0].upper()}")
+    transports = (Transport(), Transport())
+    for transport in transports:
+        transport.clock = time.time()
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    first_iid, nonce = coordinator.propose(deal=store.get_deal(con, first_did), plan=first, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=first_did, intent_id=first_iid, operation_id=first.operation_id,
+                                    leg_id=leg.leg_id) for leg in first.legs]
+    coordinator.context = context(first.legs, transports, journals)
+    assert coordinator.approve(first_iid, nonce)
+    if recovery_status == store.IntentStatus.PARTIAL:
+        transports[1].fail_after_send = True
+        assert coordinator.execute(first_iid).state == store.OpState.PAUSED_UNKNOWN
+        transports[1].fail_after_send = False
+    else:
+        monkeypatch.setattr(coordinator, "_apply_resolved",
+                            lambda *args: (_ for _ in ()).throw(KeyboardInterrupt("crash before terminal commit")))
+        with pytest.raises(KeyboardInterrupt):
+            coordinator.execute(first_iid)
+
+    con, recovered = reopen_generic(tmp_path, con, first_did, first, first_iid, transports)
+    assert recovered.resume(first_iid).state == store.OpState.OPEN
+    root = store.get_operation(con, first.operation_id)
+    assert (root["state"], root["confirmed_raw"], root["reserved_raw"]) == (store.OpState.OPEN, "2000", "0")
+    assert store.get_intent(con, first_iid)["status"] == recovery_status
+    con.close()
+
+    con = store.connect(path)
+    candidate = plan(replace(spot, account="account:other-spot"),
+                     replace(perp, account="account:other-hedge"),
+                     operation_id=f"recovered-disjoint-{spot_adapter}-{recovery_status}")
+    candidate_did = deal(con, candidate, f"DRECNEW{spot_adapter[-3:].upper()}{recovery_status[0].upper()}")
+    iid, _ = GenericOperationCoordinator(con, registry(), None).propose(
+        deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture")
+    assert store.get_intent(con, iid) is not None
+
+    overlapping = plan(spot, perp, operation_id=f"recovered-overlap-{spot_adapter}-{recovery_status}")
+    overlap_did = deal(con, overlapping, f"DRECOVER{spot_adapter[-3:].upper()}{recovery_status[0].upper()}X")
+    with pytest.raises(store.StoreError, match="scope"):
+        GenericOperationCoordinator(con, registry(), None).propose(
+            deal=store.get_deal(con, overlap_did), plan=overlapping, profile_id="fixture")
+
+
 @pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
 def test_active_cex_peer_scope_accepts_nullable_optional_identifiers_without_normalizing(tmp_path, peer_kind):
     con = store.connect(tmp_path / "trade.db")
