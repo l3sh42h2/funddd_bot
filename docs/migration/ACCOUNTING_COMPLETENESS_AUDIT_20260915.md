@@ -20,7 +20,11 @@
 
 На рабочем кандидате выполнены:
 
-- `tests/test_generic_operations.py`: 93 passed. Включает обычный и recovered OPEN scope, а также восемь повреждений terminal proof: нет события, чужой root/intent, другой retained status, невалидный JSON, ненулевой reserve, неполный target и изменённый frozen parent.
+- `tests/test_generic_operations.py`: актуальное число — см. `PATCHNOTES/m4-accounting-audit-20260915.md`
+  (единственный источник счёта после 16.09; здесь число не дублируется, чтобы не расходиться при новых
+  кейсах). Включает обычный и recovered OPEN scope, а также восемь повреждений terminal proof: нет события,
+  чужой root/intent, другой retained status, невалидный/неполный JSON, ненулевой reserve, неполный target и
+  изменённый frozen parent.
 - `tests/test_m4_leg_accounting.py`, `tests/test_generic_leg_cash.py`, `tests/test_m4_execution_scope.py`: 55 passed. Включает reopen/rebuild, base fee, multiplier, rent/refund/sponsor, unknown fee, native ID conflict, funding currency/scope, reader floor и DTO boundary.
 
 Негативная proof-матрица намеренно создаёт повреждённую историю только в
