@@ -23,8 +23,8 @@ from .operation_plan import LegBound, OperationPlan
 from .operation_roots import _generic_identity, generic_propose, validate_generic_parent
 from .operations import EndDecision, OperationController
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
-from .quantity_units import (base_to_native_floor, copy_abs, exact_leg_rebuild, exact_sum,
-                             native_to_base, reconcile_owned_inventory)
+from .quantity_units import (base_to_native_floor, copy_abs, copy_negate, exact_leg_rebuild, exact_sum,
+                             native_to_base, native_to_raw, reconcile_owned_inventory)
 
 
 READER = 5
@@ -48,10 +48,10 @@ def _plan(raw: str) -> OperationPlan:
 def _raw(quantity: Decimal, decimals: int) -> int:
     if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity < 0:
         raise store.StoreError("generic quantity must be a finite non-negative Decimal")
-    value = quantity * (10 ** decimals)
-    if value != value.to_integral_value():
+    try:
+        return native_to_raw(quantity, decimals)
+    except ValueError:
         raise store.StoreError("generic quantity cannot be represented by its frozen root scale")
-    return int(value)
 
 
 def _canonical(value: Any) -> str:
@@ -293,12 +293,11 @@ class GenericOperationCoordinator:
         """Exit only quantities proven for this parent deal, across all roots."""
         if plan.kind != "exit":
             return
-        from .leg_accounting import rebuild
         book = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
-                for row in rebuild(self.con, deal_id=run.did)["legs"]}
+                for row in exact_leg_rebuild(self.con, deal_id=run.did)["legs"]}
         for leg in plan.legs:
             quantity = book.get((leg.leg_id, leg.fingerprint), Decimal(0))
-            owned = quantity if leg.direction == "long" else -quantity
+            owned = quantity if leg.direction == "long" else copy_negate(quantity)
             requested = native_to_base(plan.bounds[leg.leg_id].max_qty, leg.multiplier)
             if owned < requested:
                 raise store.StoreError("generic exit exceeds proven parent-deal position")

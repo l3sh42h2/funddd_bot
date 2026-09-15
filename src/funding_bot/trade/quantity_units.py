@@ -27,6 +27,25 @@ def copy_abs(value: Decimal, name: str = "quantity") -> Decimal:
     return _finite(value, name).copy_abs()
 
 
+def copy_negate(value: Decimal, name: str = "quantity") -> Decimal:
+    """Invert a Decimal sign without applying the active arithmetic context."""
+    return _finite(value, name).copy_negate()
+
+
+def native_to_raw(quantity: Decimal, decimals: int) -> int:
+    """Convert an exactly representable native quantity to its integer root units."""
+    value = _finite(quantity, "quantity")
+    if value < 0:
+        raise ValueError("quantity must be non-negative")
+    if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 255:
+        raise ValueError("decimals must be an integer from 0 through 255")
+    numerator, denominator = value.as_integer_ratio()
+    raw, remainder = divmod(numerator * 10 ** decimals, denominator)
+    if remainder:
+        raise ValueError("quantity is not exactly representable at the requested scale")
+    return raw
+
+
 def exact_sum(values) -> Decimal:
     """Add finite Decimals by aligned integer coefficients, independent of context."""
     items = tuple(_finite(value, "sum item") for value in values)

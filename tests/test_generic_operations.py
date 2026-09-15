@@ -3,10 +3,11 @@ from dataclasses import replace
 from decimal import Decimal as D, localcontext
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from funding_bot.trade import leg_accounting, reconcile, store
+from funding_bot.trade import generic_operations, leg_accounting, operation_roots, quantity_units, reconcile, store
 from funding_bot.trade.generic_operations import (
     EVENT_DISPATCH,
     EVENT_PREPARED,
@@ -654,6 +655,311 @@ def test_unknown_active_peer_with_unreadable_or_incomplete_identity_blocks_new_p
     root_after = store.get_operation(con, original.operation_id)
     assert (root_after["state"], root_after["reserved_raw"]) == (
         root_before["state"], root_before["reserved_raw"])
+
+
+def _pause_unknown_peer(con, deal_id, operation_id):
+    store.set_deal_state(con, deal_id, store.DealState.ENTERING, expect=store.DealState.DRAFT)
+    store.set_deal_state(con, deal_id, store.DealState.PAUSED, expect=store.DealState.ENTERING)
+    root_id = store.create_operation(
+        con, deal_id=deal_id, profile_id="fixture", inst_hash="peer:scope", mode="dry", side="entry",
+        target_kind="generic_leading_quantity", target_asset="leg:hedge", target_decimals=0,
+        target_raw=1, op_id=operation_id,
+    )
+    store.set_operation_state(con, root_id, store.OpState.APPROVED, expect=store.OpState.PROPOSED)
+    store.set_operation_state(con, root_id, store.OpState.RUNNING, expect=store.OpState.APPROVED)
+    store.operation_reserve(con, root_id, 1)
+    store.set_operation_state(con, root_id, store.OpState.PAUSED_UNKNOWN, expect=store.OpState.RUNNING)
+    return store.get_operation(con, root_id)
+
+
+@pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
+@pytest.mark.parametrize("mandatory_index,mandatory_key", ((0, "venue"), (2, "account"), (4, "instrument")))
+@pytest.mark.parametrize("invalid", (None, "", " "))
+def test_unknown_peer_mandatory_scope_identifier_is_nonblank_before_proposal(
+        tmp_path, peer_kind, mandatory_index, mandatory_key, invalid):
+    con = store.connect(tmp_path / "trade.db")
+    old_spot = spec("fixture_cex_spot", "lead", "long")
+    old_perp = spec("fixture_cex_perp", "hedge", "short")
+    old_plan = plan(old_spot, old_perp, operation_id="invalid-scope-old")
+    if peer_kind == "generic":
+        old_did = deal(con, old_plan, "DINVALIDSCOPEOLD")
+        frozen = json.loads(store.get_deal(con, old_did)["inst_json"])
+        frozen["legs"][1][mandatory_key] = invalid
+    else:
+        old_did = store.create_deal(
+            con, coin="BASE", chain="bsc", token="0x" + "ab" * 20, token_dec=18,
+            perp_venue="fixture", symbol="BASEUSDC", leg_usd=D(1), owner_json="{}",
+            sim=True, deal_id="DINVALIDSCOPEOLD",
+        )
+        legacy_scope = list(old_perp.scope)
+        legacy_scope[mandatory_index] = invalid
+        frozen = {"perp_scope": legacy_scope}
+    con.execute("UPDATE deals SET inst_json=? WHERE id=?", (
+        json.dumps(frozen, ensure_ascii=False, separators=(",", ":")), old_did,
+    ))
+    old_root = _pause_unknown_peer(con, old_did, "OINVALIDSCOPEOLD")
+
+    # The spot wallet differs.  The intended conflict is the old perpetual
+    # scope whose one mandatory identifier was corrupted above.
+    new_spot = replace(old_spot, account="account:new-spot-wallet")
+    candidate = plan(new_spot, old_perp, operation_id="invalid-scope-new")
+    candidate_did = deal(con, candidate, "DINVALIDSCOPENEW")
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    with pytest.raises(store.StoreError, match="active peer"):
+        coordinator.propose(deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture")
+
+    assert store.get_operation(con, candidate.operation_id) is None
+    assert not con.execute("SELECT 1 FROM intents WHERE deal_id=?", (candidate_did,)).fetchone()
+    assert not con.execute("SELECT 1 FROM exec_events WHERE deal_id=? AND kind=?",
+                           (candidate_did, EVENT_DISPATCH)).fetchone()
+    assert (store.get_operation(con, old_root["id"])["state"],
+            store.get_operation(con, old_root["id"])["reserved_raw"]) == (
+                store.OpState.PAUSED_UNKNOWN, old_root["reserved_raw"])
+
+
+@pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
+def test_active_cex_peer_scope_accepts_nullable_optional_identifiers_without_normalizing(tmp_path, peer_kind):
+    con = store.connect(tmp_path / "trade.db")
+    spot = spec("fixture_cex_spot", "lead", "long")
+    perp = spec("fixture_cex_perp", "hedge", "short")
+    old_plan = plan(spot, perp, operation_id="nullable-scope-old")
+    if peer_kind == "generic":
+        old_did = deal(con, old_plan, "DNULLABLESCOPEOLD")
+    else:
+        old_did = store.create_deal(
+            con, coin="BASE", chain="bsc", token="0x" + "cd" * 20, token_dec=18,
+            perp_venue="fixture", symbol="BASEUSDC", leg_usd=D(1), owner_json="{}",
+            sim=True, deal_id="DNULLABLESCOPEOLD",
+        )
+        con.execute("UPDATE deals SET inst_json=? WHERE id=?", (
+            json.dumps({"perp_scope": list(perp.scope)}, separators=(",", ":")), old_did,
+        ))
+    _pause_unknown_peer(con, old_did, "ONULLABLESCOPEOLD")
+    candidate = plan(replace(spot, account="account:new-spot-wallet"), perp,
+                     operation_id="nullable-scope-new")
+    candidate_did = deal(con, candidate, "DNULLABLESCOPENEW")
+
+    assert perp.network is None and perp.subaccount is None
+    with pytest.raises(store.StoreError, match="scope"):
+        GenericOperationCoordinator(con, registry(), None).propose(
+            deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture",
+        )
+    raw_scope = {"venue": " fixture_cex_perp ", "network": None, "account": "account:hedge",
+                 "subaccount": None, "instrument": "BASE"}
+    assert operation_roots._generic_scope(raw_scope)[0] == " fixture_cex_perp "
+
+
+@pytest.mark.parametrize("phase", ("approval", "admission"))
+def test_corrupt_peer_scope_fails_closed_if_it_appears_after_proposal(tmp_path, phase):
+    con = store.connect(tmp_path / "trade.db")
+    spot = spec("fixture_cex_spot", "lead", "long")
+    perp = spec("fixture_cex_perp", "hedge", "short")
+    candidate = plan(replace(spot, account="account:new-spot-wallet"), perp,
+                     operation_id="phase-scope-new")
+    candidate_did = deal(con, candidate, "DPHASESCOPENEW")
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    iid, nonce = coordinator.propose(
+        deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture",
+    )
+    if phase == "admission":
+        assert coordinator.approve(iid, nonce)
+        transports = (Transport(), Transport())
+        for transport in transports:
+            transport.clock = time.time()
+        journals = [EventAttemptJournal(con, deal_id=candidate_did, intent_id=iid,
+                                        operation_id=candidate.operation_id, leg_id=leg.leg_id)
+                    for leg in candidate.legs]
+        coordinator.context = context(candidate.legs, transports, journals)
+
+    old_plan = plan(spot, perp, operation_id="phase-scope-old")
+    old_did = deal(con, old_plan, "DPHASESCOPEOLD")
+    frozen = json.loads(store.get_deal(con, old_did)["inst_json"])
+    frozen["legs"][1]["venue"] = None
+    con.execute("UPDATE deals SET inst_json=? WHERE id=?", (
+        json.dumps(frozen, ensure_ascii=False, separators=(",", ":")), old_did,
+    ))
+    old_root = _pause_unknown_peer(con, old_did, "OPHASESCOPEOLD")
+
+    before_dispatch = con.execute("SELECT count(*) FROM exec_events WHERE kind=?", (EVENT_DISPATCH,)).fetchone()[0]
+    with pytest.raises(store.StoreError, match="active peer"):
+        if phase == "approval":
+            coordinator.approve(iid, nonce)
+        else:
+            coordinator.execute(iid)
+    candidate_intent = store.get_intent(con, iid)
+    candidate_root = store.get_operation(con, candidate.operation_id)
+    expected = store.IntentStatus.PROPOSED if phase == "approval" else store.IntentStatus.APPROVED
+    assert candidate_intent["status"] == expected
+    assert candidate_root["state"] == (store.OpState.PROPOSED if phase == "approval" else store.OpState.APPROVED)
+    assert con.execute("SELECT count(*) FROM exec_events WHERE kind=?", (EVENT_DISPATCH,)).fetchone()[0] == before_dispatch
+    assert (store.get_operation(con, old_root["id"])["state"],
+            store.get_operation(con, old_root["id"])["reserved_raw"]) == (
+                store.OpState.PAUSED_UNKNOWN, old_root["reserved_raw"])
+
+
+def _exact_exit_fixture(tmp_path):
+    quantity = D("1.0000000000000000000000000001")
+    step = D("0.0000000000000000000000000001")
+    spot = replace(spec("fixture_cex_spot", "lead", "long"), step=step)
+    perp = replace(spec("fixture_cex_perp", "hedge", "short"), step=step)
+    bounds = {
+        spot.leg_id: LegBound("SELL", D(0), quantity, spot.quote_currency, D(20),
+                              min_receive=D(0), min_receive_currency=spot.quote_currency),
+        perp.leg_id: LegBound("BUY", D(0), quantity, perp.quote_currency, D(20), reduce_only=True,
+                              min_receive=D(0), min_receive_currency=perp.quote_currency),
+    }
+    exit_plan = OperationPlan("exact-exit", "exit", (spot, perp), spot.leg_id, quantity, quantity,
+                              time.time() + 600, "floor", bounds,
+                              {"owner": "fixture", "mode": "dry"})
+    con = store.connect(tmp_path / "trade.db")
+    did = deal(con, exit_plan, "DGEXACTEXIT")
+    for leg, side in ((spot, "BUY"), (perp, "SELL")):
+        leg_accounting.record_fact(con, leg_accounting.ExecutionFact(
+            "owned-entry", leg.leg_id, leg.fingerprint,
+            json.dumps(leg.scope, ensure_ascii=False, separators=(",", ":")),
+            "order:owned-" + leg.leg_id, side, quantity, leg.multiplier, "final",
+            market_kind=leg.capabilities.market_kind, base_currency=leg.asset_id,
+            settlement_currency=leg.settlement_currency, fees_complete=True,
+        ), deal_id=did)
+    return con, did, exit_plan, quantity, step
+
+
+def test_exit_ownership_exact_long_and_short_survive_decimal_context(tmp_path):
+    con, did, exit_plan, _quantity, _step = _exact_exit_fixture(tmp_path)
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        coordinator._require_exit_ownership(SimpleNamespace(did=did), exit_plan)
+
+
+@pytest.mark.parametrize("excess_leg", ("lead", "hedge"))
+def test_exit_ownership_refuses_one_minimal_unit_excess_and_spot_surplus_cannot_extend_it(
+        tmp_path, excess_leg):
+    con, did, exit_plan, _quantity, step = _exact_exit_fixture(tmp_path)
+    excess = D("1.0000000000000000000000000002")
+    bounds = dict(exit_plan.bounds)
+    bounds[excess_leg] = replace(bounds[excess_leg], max_qty=excess)
+    oversized = replace(exit_plan, operation_id="exact-exit-excess-" + excess_leg,
+                        target_exposure=excess, max_unhedged_exposure=excess, bounds=bounds)
+    assert excess - D("1.0000000000000000000000000001") == step
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        with pytest.raises(store.StoreError, match="exceeds proven"):
+            GenericOperationCoordinator(con, registry(), None)._require_exit_ownership(
+                SimpleNamespace(did=did), oversized,
+            )
+
+
+def test_spot_wallet_surplus_does_not_authorize_exit_beyond_journal_owned_quantity(tmp_path):
+    con, did, entry, iid, coordinator, transports, _ctx = approved_entry(
+        tmp_path, operation_id="spot-surplus-entry",
+    )
+    assert coordinator.execute(iid).state == store.OpState.OPEN
+    spot, perp = entry.legs
+    transports[0].positions[spot.scope] = D(7)
+    bounds = {
+        spot.leg_id: LegBound("SELL", D(0), D(3), spot.quote_currency, D(20),
+                              min_receive=D(0), min_receive_currency=spot.quote_currency),
+        perp.leg_id: LegBound("BUY", D(0), D(2), perp.quote_currency, D(20), reduce_only=True,
+                              min_receive=D(0), min_receive_currency=perp.quote_currency),
+    }
+    exit_plan = OperationPlan("spot-surplus-exit", "exit", entry.legs, spot.leg_id, D(3), D(3),
+                              time.time() + 600, "floor", bounds,
+                              {"owner": "fixture", "mode": "dry"})
+    exit_iid, nonce = coordinator.propose(
+        deal=store.get_deal(con, did), plan=exit_plan, profile_id="fixture",
+    )
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=exit_iid,
+                                    operation_id=exit_plan.operation_id, leg_id=leg.leg_id)
+                for leg in exit_plan.legs]
+    coordinator.context = context(exit_plan.legs, transports, journals)
+    assert coordinator.approve(exit_iid, nonce)
+    before = [len(transport.sent) for transport in transports]
+
+    with pytest.raises(store.StoreError, match="exceeds proven"):
+        coordinator.execute(exit_iid)
+    assert [len(transport.sent) for transport in transports] == before
+    assert store.get_intent(con, exit_iid)["status"] == store.IntentStatus.APPROVED
+    assert store.get_operation(con, exit_plan.operation_id)["state"] == store.OpState.APPROVED
+    assert not [event for event in store.events(con, did)
+                if event["kind"] == EVENT_DISPATCH and event["intent_id"] == exit_iid]
+
+
+@pytest.mark.parametrize(("quantity", "expected_raw"), (
+    (D("1.0000000000000000000000000001"), 10000000000000000000000000001),
+    (D("1.9999999999999999999999999999"), 19999999999999999999999999999),
+))
+def test_generic_target_and_settlement_raw_conversion_are_exact_at_precision_boundary(quantity, expected_raw):
+    step = D("0.0000000000000000000000000001")
+    a = replace(spec("fixture_cex_spot", "lead", "long"), step=step)
+    b = replace(spec("fixture_cex_perp", "hedge", "short"), step=step)
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), quantity, a.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("SELL", D(0), quantity, b.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    exact_plan = OperationPlan("exact-raw-target", "entry", (a, b), a.leg_id, D(2), D(2),
+                               time.time() + 600, "floor", bounds,
+                               {"owner": "fixture", "mode": "dry"})
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        assert operation_roots._generic_target(exact_plan) == ("leg:lead", 28, expected_raw)
+        assert generic_operations._raw(quantity, 28) == expected_raw
+        assert quantity_units.native_to_raw(quantity, 28) == expected_raw
+
+
+def test_native_to_raw_rejects_quantity_not_representable_at_frozen_scale():
+    with pytest.raises(ValueError, match="represent"):
+        quantity_units.native_to_raw(D("0.0000000000000000000000000001"), 27)
+    with pytest.raises(store.StoreError, match="represented"):
+        generic_operations._raw(D("0.0000000000000000000000000001"), 27)
+
+
+def test_partial_pair_crash_reopen_preserves_exact_raw_target_and_settlement(tmp_path, monkeypatch):
+    quantity = D("1.9999999999999999999999999999")
+    expected_target = "19999999999999999999999999999"
+    step = D("0.0000000000000000000000000001")
+    a = replace(spec("fixture_cex_spot", "lead", "long"), step=step)
+    b = replace(spec("fixture_cex_perp", "hedge", "short"), step=step)
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), quantity, a.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("SELL", D(0), quantity, b.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    entry = OperationPlan("exact-raw-reopen", "entry", (a, b), a.leg_id, D(2), D(2),
+                          time.time() + 600, "floor", bounds,
+                          {"owner": "fixture", "mode": "dry"})
+    con = store.connect(tmp_path / "trade.db")
+    did = deal(con, entry, "DGEXACTRAWREOPEN")
+    transports = (Transport(), Transport())
+    for transport in transports:
+        transport.clock = time.time()
+    transports[0].fraction = D("0.5")
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        iid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=entry, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=iid, operation_id=entry.operation_id,
+                                    leg_id=leg.leg_id) for leg in entry.legs]
+    coordinator.context = context(entry.legs, transports, journals)
+    assert coordinator.approve(iid, nonce)
+    monkeypatch.setattr(coordinator, "_apply_resolved",
+                        lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("crash before settlement")))
+    with pytest.raises(KeyboardInterrupt), localcontext() as decimal_context:
+        decimal_context.prec = 28
+        coordinator.execute(iid)
+
+    con, recovered = reopen_generic(tmp_path, con, did, entry, iid, transports)
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        assert recovered.resume(iid).state == store.OpState.PARTIAL
+    root = store.get_operation(con, entry.operation_id)
+    assert (root["target_decimals"], root["target_raw"], root["confirmed_raw"], root["reserved_raw"]) == (
+        28, expected_target, "10000000000000000000000000000", "0",
+    )
+    assert [len(transport.sent) for transport in transports] == [1, 1]
 
 
 @pytest.mark.parametrize("fault", ("readonly_peer", "unhedged_cap"))

@@ -17,6 +17,7 @@ from .. import config
 from . import store, tconfig
 from .store import ClipState, IntentStatus, OpState
 from .operation_plan import OperationPlan
+from .quantity_units import native_to_raw
 
 _RESUMABLE = frozenset({OpState.PARTIAL, OpState.STOPPED, OpState.PAUSED_RISK})
 _PROVEN_SPOT = frozenset({ClipState.DEX_OK, ClipState.PERP_SENT, ClipState.BALANCED, ClipState.HEDGE_DEFICIT})
@@ -129,10 +130,10 @@ def _generic_target(plan: OperationPlan) -> tuple[str, int, int]:
     bound = plan.bounds[leg.leg_id]
     exponent = min(bound.max_qty.as_tuple().exponent, leg.step.as_tuple().exponent)
     decimals = max(0, -exponent)
-    raw_decimal = bound.max_qty * (10 ** decimals)
-    if raw_decimal != raw_decimal.to_integral_value():
+    try:
+        raw = native_to_raw(bound.max_qty, decimals)
+    except ValueError:
         raise store.StoreError("generic leading quantity is not exactly representable")
-    raw = int(raw_decimal)
     if raw <= 0:
         raise store.StoreError("generic leading quantity must be positive")
     return f"leg:{leg.leg_id}", decimals, raw
@@ -144,14 +145,26 @@ def _generic_identity(plan: OperationPlan) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _scope_tuple(value: Any) -> tuple | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        return None
+    scope = tuple(value)
+    for index in (0, 2, 4):
+        item = scope[index]
+        if not isinstance(item, str) or not item.strip():
+            return None
+    if any(item is not None and not isinstance(item, str) for item in (scope[1], scope[3])):
+        return None
+    return scope
+
+
 def _generic_scope(value: Any) -> tuple | None:
     if not isinstance(value, Mapping):
         return None
     keys = ("venue", "network", "account", "subaccount", "instrument")
     if any(key not in value for key in keys):
         return None
-    scope = tuple(value[key] for key in keys)
-    return scope if all(item is None or isinstance(item, str) for item in scope) else None
+    return _scope_tuple(tuple(value[key] for key in keys))
 
 
 def validate_generic_parent(con, deal_id: str, plan: OperationPlan) -> dict:
@@ -201,15 +214,13 @@ def _assert_generic_scopes_available(con, deal_id: str, plan: OperationPlan) -> 
             if wanted & set(scopes):
                 raise store.StoreError("generic leg scope is already owned by an active deal")
             continue
-        # Legacy rows have only one persisted perp scope.  Refuse only when it
-        # is an exact complete scope, never by a guessed account or chain.
-        legacy_scope = frozen.get("perp_scope")
-        if isinstance(legacy_scope, (list, tuple)) and tuple(legacy_scope) in wanted:
+        # Legacy rows have only one persisted perp scope.  An invalid identity
+        # cannot prove availability; a valid scope is compared byte-for-byte.
+        legacy_scope = _scope_tuple(frozen.get("perp_scope"))
+        if legacy_scope is None:
+            raise store.StoreError("active peer legacy scope is incomplete")
+        if legacy_scope in wanted:
             raise store.StoreError("generic leg scope conflicts with active legacy deal")
-        if not isinstance(legacy_scope, (list, tuple)) or len(legacy_scope) != 5:
-            raise store.StoreError("active peer legacy scope is incomplete")
-        if any(item is not None and not isinstance(item, str) for item in legacy_scope):
-            raise store.StoreError("active peer legacy scope is incomplete")
 
 
 def generic_propose(con, *, deal: Mapping, plan: OperationPlan, profile_id: str,

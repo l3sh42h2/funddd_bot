@@ -203,3 +203,23 @@ negative cross-zero refusal, and malformed/empty/non-object/incomplete active
 peer after crash/reopen. External reviewer regression file: 5 passed / 0.18 s;
 generic/root scope profile: 107 passed / 3.36 s. Новый SHA требует secret scan,
 immutable Linux receipt и повторного reviewer verdict; production не менялся.
+
+## R0 rereview findings R02/R03/R04 (15.09.2026)
+
+Reviewer correctly found that present-but-empty mandatory scope fields were not
+covered by the previous malformed-identity guard. Generic and legacy active
+peer scopes now require nonblank `venue`, `account` and `instrument`; optional
+`network`/`subaccount` may remain null. The stored values are only validated,
+never trimmed or normalised. Any invalid active peer blocks proposal before a
+new root, intent, dispatch or native submit.
+
+Exit ownership now reads the exact accounting projection and changes a short
+sign with context-independent `copy_negate`. A single native-to-raw converter
+based on integer ratios serves both root target and execution settlement; it
+rejects a quantity that cannot be represented at the frozen scale rather than
+rounding it. New regressions cover all mandatory-field corruptions in generic
+and legacy rows, nullable optional CEX fields, exact long/short exit, one-unit
+excess refusal, spot surplus, raw round-trip and settlement/reopen no-drift.
+
+This update needs its own exact SHA, secret scan, immutable Linux receipt and
+independent rereview. Production remains unchanged.
