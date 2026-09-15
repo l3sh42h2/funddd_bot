@@ -9,7 +9,7 @@ never submits it again.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 import hashlib
 import math
 import time
@@ -23,6 +23,7 @@ from .operation_plan import LegBound, OperationPlan
 from .operation_roots import _generic_identity, generic_propose, validate_generic_parent
 from .operations import EndDecision, OperationController
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
+from .quantity_units import base_to_native_floor, native_to_base, reconcile_owned_inventory
 
 
 READER = 5
@@ -211,12 +212,19 @@ class GenericOperationCoordinator:
         leading, hedge = (next(leg for leg in plan.legs if leg.leg_id == plan.leading_leg_id),
                           self._hedge_leg(plan))
         lead, hedge_result = results.get(leading.leg_id), results.get(hedge.leg_id)
+        if plan.kind == "rehedge" and set(results) != {leading.leg_id}:
+            raise store.StoreError("generic rehedge recovery result set differs from its single planned action")
         for leg, result in ((leading, lead), (hedge, hedge_result)):
             if result is not None:
                 self._record_result(run, op, leg, plan.bounds[leg.leg_id].side, result)
-        balanced = (lead is not None and hedge_result is not None and self._proven_execution(lead)
-                    and self._proven_execution(hedge_result)
-                    and self._balanced_book(op["id"], leading, hedge))
+        if plan.kind == "rehedge":
+            tolerance_base = native_to_base(leading.step, leading.multiplier)
+            balanced = (lead is not None and self._proven_execution(lead)
+                        and abs(self._parent_delta(run.did, plan)) <= tolerance_base)
+        else:
+            balanced = (lead is not None and hedge_result is not None and self._proven_execution(lead)
+                        and self._proven_execution(hedge_result)
+                        and self._balanced_book(op["id"], leading, hedge))
         def proof(_it, _deal, current):
             if current is None or current["state"] != store.OpState.PAUSED_UNKNOWN:
                 raise store.StoreError("generic recovery root changed")
@@ -290,7 +298,7 @@ class GenericOperationCoordinator:
         for leg in plan.legs:
             quantity = book.get((leg.leg_id, leg.fingerprint), Decimal(0))
             owned = quantity if leg.direction == "long" else -quantity
-            requested = plan.bounds[leg.leg_id].max_qty * leg.multiplier
+            requested = native_to_base(plan.bounds[leg.leg_id].max_qty, leg.multiplier)
             if owned < requested:
                 raise store.StoreError("generic exit exceeds proven parent-deal position")
 
@@ -302,7 +310,7 @@ class GenericOperationCoordinator:
                     hedge.leg_id: pair.first if pair.first.describe().leg_id == hedge.leg_id else pair.second}
         lead_action = self._action(run, leading, plan.bounds[leading.leg_id], sequence=1,
                                    quantity=plan.bounds[leading.leg_id].max_qty)
-        if lead_action.quantity * leading.multiplier > plan.max_unhedged_exposure:
+        if native_to_base(lead_action.quantity, leading.multiplier) > plan.max_unhedged_exposure:
             raise store.StoreError("generic leading clip exceeds frozen transient unhedged exposure cap")
         planned_hedge = self._action(run, hedge, plan.bounds[hedge.leg_id], sequence=2,
                                      quantity=plan.bounds[hedge.leg_id].max_qty)
@@ -390,19 +398,19 @@ class GenericOperationCoordinator:
         def prepare():
             nonlocal action
             delta = self._parent_delta(run.did, plan)
-            tolerance = leg.step * leg.multiplier
+            tolerance = native_to_base(leg.step, leg.multiplier)
             if abs(delta) <= tolerance:
                 self._stop_without_reserve(run, op, "generic rehedge is already within approved residual")
                 raise _GenericHalt()
             side = "SELL" if delta > 0 else "BUY"
             if bound.side != side:
                 raise store.StoreError("generic rehedge leading leg cannot reduce proven parent delta")
-            qty = (abs(delta) / leg.multiplier / leg.step).to_integral_value(rounding=ROUND_DOWN) * leg.step
+            qty = base_to_native_floor(abs(delta), leg.multiplier, leg.step)
             if qty <= 0 or qty < bound.min_qty or qty > bound.max_qty:
                 raise store.StoreError("generic rehedge correction lies outside frozen approved bound")
             existing = self._leg_parent_qty(run.did, leg)
             reduces_existing = (side == "BUY" and existing < 0) or (side == "SELL" and existing > 0)
-            if reduces_existing and qty > abs(existing):
+            if reduces_existing and native_to_base(qty, leg.multiplier) > abs(existing):
                 raise store.StoreError("generic rehedge would cross the proven leg position through zero")
             increases_direction = (side == "BUY" and existing >= 0) or (side == "SELL" and existing <= 0)
             if increases_direction and ((side == "BUY" and leg.direction != "long") or
@@ -430,7 +438,7 @@ class GenericOperationCoordinator:
                 self._pause_unknown(run, "generic rehedge outcome is unknown")
                 raise _GenericHalt()
             self._record_result(run, op, leg, action.side, result)
-            tolerance = leg.step * leg.multiplier
+            tolerance = native_to_base(leg.step, leg.multiplier)
             if not self._proven_execution(result) or abs(self._parent_delta(run.did, plan)) > tolerance:
                 self._pause_risk(run, op, result, None, "generic rehedge remains outside approved exposure")
                 raise _GenericHalt()
@@ -482,8 +490,7 @@ class GenericOperationCoordinator:
         exposure = abs(self._parent_delta(deal_id, plan))
         if exposure == 0:
             raise store.StoreError("leading generic result did not create a hedgeable parent delta")
-        raw = (exposure / hedge.multiplier / hedge.step).to_integral_value(rounding=ROUND_DOWN)
-        quantity = raw * hedge.step
+        quantity = base_to_native_floor(exposure, hedge.multiplier, hedge.step)
         if quantity <= 0:
             raise store.StoreError("proven leading exposure is below hedge precision; automatic under-hedge refused")
         return quantity
@@ -516,12 +523,14 @@ class GenericOperationCoordinator:
             expected = self._leg_parent_qty(deal_id, leg)
             if not expected.is_finite():
                 raise store.StoreError("generic parent inventory is not finite")
-            if leg.capabilities.market_kind == "perpetual":
-                if quantity * leg.multiplier != expected:
+            coverage = reconcile_owned_inventory(
+                market_kind=leg.capabilities.market_kind, observed_qty_native=quantity,
+                owned_exposure_base=expected, multiplier=leg.multiplier,
+            )
+            if not coverage.matched:
+                if leg.capabilities.market_kind == "perpetual":
                     raise store.StoreError("generic perpetual native position differs from parent journal")
-            else:
-                if expected < 0 or quantity * leg.multiplier < expected:
-                    raise store.StoreError("generic spot balance does not cover parent journal inventory")
+                raise store.StoreError("generic spot balance does not cover parent journal inventory")
             observations[leg.leg_id] = observation
         return observations
 
@@ -633,7 +642,7 @@ class GenericOperationCoordinator:
                 raise store.StoreError("generic sell quote spend asset differs from frozen spot asset")
             if quote.max_spend > action.quantity or quote.max_spend > bound.max_qty:
                 raise store.StoreError("generic sell quote exceeds approved base quantity")
-            if owned_quantity / leg.multiplier < quote.max_spend:
+            if native_to_base(quote.max_spend, leg.multiplier) > owned_quantity:
                 raise store.StoreError("generic sell quote exceeds proven parent spot inventory")
         elif quote.spend_currency == bound.quote_currency and quote.max_spend > bound.max_spend:
             raise store.StoreError("generic quote exceeds approved quote budget")

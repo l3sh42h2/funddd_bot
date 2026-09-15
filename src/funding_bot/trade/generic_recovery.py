@@ -7,6 +7,7 @@ import time
 
 from . import store, leg_accounting
 from .operation_plan import OperationPlan
+from .quantity_units import native_to_base, reconcile_owned_inventory
 
 
 def is_generic(deal):
@@ -22,6 +23,7 @@ class Check:
     hedged: bool | None
     delta: D | None
     detail: str
+    personal_surplus_base: tuple[tuple[str, D], ...] = ()
 
 
 def check(con, deal, *, registry=None, context_factory=None, now=None, resolve=False):
@@ -54,7 +56,7 @@ def check(con, deal, *, registry=None, context_factory=None, now=None, resolve=F
     known = all((s.leg_id, s.fingerprint) in book for s in plan.legs)
     delta = sum(book[(s.leg_id, s.fingerprint)] for s in plan.legs) if known else None
     hedge = next(s for s in plan.legs if s.leg_id != plan.leading_leg_id)
-    hedged = abs(delta) < hedge.step * hedge.multiplier if known else None
+    hedged = abs(delta) < native_to_base(hedge.step, hedge.multiplier) if known else None
     op = store.active_operation(con, deal['id'])
     if op is not None and (int(op['reserved_raw']) or op['state'] == store.OpState.PAUSED_UNKNOWN):
         return Check(None, hedged, delta, 'исход исполнения выясняется; повторная отправка запрещена')
@@ -71,8 +73,17 @@ def check(con, deal, *, registry=None, context_factory=None, now=None, resolve=F
                 return Check(None, hedged, delta, 'свежие позиции обеих ног не подтверждены')
         if not known:
             return Check(None, hedged, delta, 'количества обеих ног не восстановлены из фактов')
-        matched = all(obs.quantity * s.multiplier == book[(s.leg_id, s.fingerprint)]
-                      for s, obs in zip(plan.legs, observations))
-        return Check(matched, hedged, delta, 'обе ноги сверены' if matched else 'позиции площадок расходятся с журналом')
+        coverage = tuple((s, reconcile_owned_inventory(
+            market_kind=s.capabilities.market_kind, observed_qty_native=obs.quantity,
+            owned_exposure_base=book[(s.leg_id, s.fingerprint)], multiplier=s.multiplier,
+        )) for s, obs in zip(plan.legs, observations))
+        matched = all(item.matched for _spec, item in coverage)
+        surplus = tuple((spec.leg_id, item.personal_surplus_base) for spec, item in coverage
+                        if item.personal_surplus_base > 0)
+        detail = ('обе ноги сверены' if matched else 'позиции площадок расходятся с журналом')
+        if matched and surplus:
+            detail += '; личный спотовый избыток: ' + ', '.join(
+                f'{leg_id}={format(quantity, "f")} базовых ед.' for leg_id, quantity in surplus)
+        return Check(matched, hedged, delta, detail, surplus)
     except Exception as exc:
         return Check(None, hedged, delta, f'сверка двух ног недоступна: {type(exc).__name__}')

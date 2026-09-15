@@ -293,7 +293,7 @@ def test_r1_failed_sol_build_named_in_restart_and_positions(tmp_path):
         raise RuntimeError("нет RPC")
     down = RuntimeRegistry(env.legs, {SOL_HL: no_rpc})
     got = {r.deal["id"]: r for r in reconcile.startup(w.con, down, now=w.clock()).deals}
-    want = "связка Solana × Hyperliquid не собрана: RuntimeError: нет RPC — не сверена"
+    want = "связка Solana × hyperliquid не собрана: RuntimeError: нет RPC — не сверена"
     assert got[sprop.deal_id].check.detail == want and got[sprop.deal_id].check.matched is None
     assert "не собрана: RuntimeError: нет RPC" in Bot._check_line(got[sprop.deal_id])
     assert got[bprop.deal_id].check.matched is True and got[bprop.deal_id].new == DealState.OPEN   # BSC прежний
@@ -301,4 +301,4 @@ def test_r1_failed_sol_build_named_in_restart_and_positions(tmp_path):
     assert f"{sprop.deal_id}: {want}" in problems
     none = RuntimeRegistry(env.legs, {})                  # связки в процессе нет вовсе — прежний текст
     got = {r.deal["id"]: r for r in reconcile.startup(w.con, none, now=w.clock()).deals}
-    assert got[sprop.deal_id].check.detail == "связка Solana × Hyperliquid не подключена — не сверена"
+    assert got[sprop.deal_id].check.detail == "связка Solana × hyperliquid не подключена — не сверена"

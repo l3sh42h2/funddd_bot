@@ -79,11 +79,11 @@ def _sol_deal(con, spec, did, now=tm.T0):
 
 
 # ==== схема и миграция =================================================================================================
-def test_fresh_db_is_schema_2_and_reconnect_changes_nothing(tmp_path):
+def test_fresh_db_is_current_schema_and_reconnect_changes_nothing(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (4, 2)
+    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (5, 2)
     assert NEW_TABLES | set(LEGACY_TABLES) <= _tables(con)
     assert [r[1] for r in con.execute("PRAGMA table_info(deals)")][-2:] == ["inst_json", "perp_scope"]
     before = _objects(con)
@@ -184,7 +184,8 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     tm.dqa9q(con)
-    con.execute("UPDATE schema_version SET version=5, min_reader=5")
+    future = store.SCHEMA_VERSION + 1
+    con.execute("UPDATE schema_version SET version=?, min_reader=?", (future, future))
     objs, rows = _objects(con), _dump(con)
     with pytest.raises(store.SchemaTooNew, match="не запускаюсь"):
         store.connect(p)
@@ -201,7 +202,7 @@ def test_gate_refuses_db_that_needs_newer_reader(tmp_path):
     con.execute("UPDATE schema_version SET min_reader=2")
     store.connect(p).close()
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (5, 2)
+    assert (info["version"], info["min_reader"]) == (future, store.MIN_READER)
     con.close()
 
 

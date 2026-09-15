@@ -155,3 +155,28 @@ DRAFT. Активация сделки атомарна с admission. TTL про
 prepare перед первым dispatch; resolve и необходимый hedge уже начатой операции
 сохраняются. Профиль: 713 passed / 19.36 s. Offline legacy differential равен
 базе на обоих сценариях; сеть запрещена. Linux receipt и Claude review pending.
+
+## R0 regressions and recovery semantics (15.09.2026)
+
+Кандидат `ee85b15` не является Linux receipt: первый полный immutable profile
+завершился с 7 падениями, поэтому этот пакет будет проверен заново на новом точном
+SHA. Два реальных защитных дефекта в legacy resume исправлены: повреждённый
+`inst_json` больше не приводит к исключению во время проверки обязательств, а
+отказ при неизвестном исходе показывает ID последнего исполнявшегося intent.
+Остальные падения были устаревшими ожиданиями тестов после schema 5, нормализации
+имени venue и нового frozen run context; денежный CAS не ослаблялся.
+
+Закрыты статические P1-находки R0 с воспроизводящими тестами. Одноногий rehedge
+после потери ACK/reopen принимает ровно его единственный planned result, сверяет
+parent book в базовых единицах и завершает reserve один раз. Конвертация native
+contracts ↔ base exposure вынесена в точные Decimal helpers; floor никогда не
+округляет объём вверх. Native perpetual scope по-прежнему требует точного
+равенства с журналом, а spot wallet может иметь показанный отдельно личный
+surplus, если он покрывает owned inventory. Surplus не зачисляется позиции и не
+расширяет продажу/exit.
+
+Проверки до нового immutable Linux profile: generic regressions 77 passed / 3.20 s;
+общий затронутый локальный набор (generic, resume, units, schema gate, SOL recovery
+message) 110 passed / 2.77 s. Нет изменения схемы, sender, реального venue allowlist
+или OperationController. Независимое ревью Claude и повторный Linux receipt остаются
+обязательными до установки.

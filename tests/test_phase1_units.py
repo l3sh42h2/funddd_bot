@@ -410,7 +410,8 @@ def test_halt_naked_leg_m1000_in_tokens_and_dollars_per_token(tmp_path, monkeypa
                              tokens=lambda dec: D(3500), m=D(M))
         run = SimpleNamespace(did=p.deal_id, iid=p.intent_id, kind="entry", dec=18, f=fx.FILT, legs=e.legs_live,
                               symbol=MSYM, token=fx.TOKEN, cfg=cfg, deal=store.get_deal(e.con, p.deal_id), seq=1,
-                              n_total=1)
+                              n_total=1, it=store.get_intent(e.con, p.intent_id),
+                              op_id=store.operation_of_intent(e.con, p.intent_id)["id"])
         with monkeypatch.context() as mp:
             mp.setattr(eng, "deal_book", lambda con, did: bk)
             e.engine._paused(run, eng.Pause("hedge_deficit", "тест"))

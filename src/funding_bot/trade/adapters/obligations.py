@@ -7,6 +7,15 @@ import json
 from .. import store
 
 
+def _instrument(deal):
+    """Read optional native identity without turning corrupt metadata into a crash."""
+    try:
+        inst = json.loads(deal.get('inst_json') or '{}')
+    except (TypeError, ValueError):
+        return {}
+    return inst if isinstance(inst, dict) else {}
+
+
 def unresolved(con, deal):
     did = deal['id']
     reasons = []
@@ -34,7 +43,7 @@ def unresolved(con, deal):
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if 'hl_order_attempts' in tables:
         from ..owner import OwnerCfg
-        inst = json.loads(deal.get('inst_json') or '{}')
+        inst = _instrument(deal)
         cfg = OwnerCfg.from_frozen(deal['owner_json'])
         scope = str(inst.get('perp_account') or '').split(':')
         account = scope[3] if (deal.get('perp_venue') == 'hyperliquid' and len(scope) == 5
@@ -52,7 +61,7 @@ def unresolved(con, deal):
         from ..solana.journal import unresolved as sol_unresolved
         clips = {str(r[0]) for r in con.execute(
             "SELECT c.id FROM clips c JOIN intents i ON i.id=c.intent_id WHERE i.deal_id=?", (did,))}
-        inst = json.loads(deal.get('inst_json') or '{}')
+        inst = _instrument(deal)
         # Native attempts with a clip use the existing durable relation. Wallet
         # prerequisites use the same frozen identity; no peer account is inferred.
         from ..owner import OwnerCfg

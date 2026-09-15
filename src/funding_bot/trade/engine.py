@@ -1444,9 +1444,13 @@ class Desk:
         if is_sol_deal(deal):
             return self.sol().propose_resume(deal, chat)
         con = self.conns.get()
+        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') "
+                           "AND status NOT IN ('proposed','rejected','expired') ORDER BY created DESC "
+                           "LIMIT 1", (deal["id"],)).fetchone()
         from .adapters.obligations import unresolved
         if unresolved(con, deal):
-            raise Refused(v.refused('исход прошлой отправки неизвестен — сначала «позиции»'))
+            intent = f" ({last['id']})" if last is not None else ""
+            raise Refused(v.refused(f'исход прошлой отправки{intent} неизвестен — сначала «позиции»'))
         if deal["state"] == DealState.HALTED_MISMATCH:
             from . import reconcile
             legs = self._deal_legs(deal)
@@ -1455,9 +1459,6 @@ class Desk:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
                 return v.resume_checked(deal["id"], sim=bool(deal["sim"]))
             return v.resume_mismatch(deal["id"], chk.detail, sim=bool(deal["sim"]))
-        last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') "
-                           "AND status NOT IN ('proposed','rejected','expired') ORDER BY created DESC "
-                           "LIMIT 1", (deal["id"],)).fetchone()
         if last is None:
             raise Refused(v.refused("у сделки нет входа — продолжать нечего"))
         spec = json.loads(last["spec_json"])

@@ -16,6 +16,7 @@ from funding_bot.trade.generic_operations import (
     GenericOperationCoordinator,
 )
 from funding_bot.trade.operation_plan import LegBound, OperationPlan
+from funding_bot.trade.quantity_units import base_to_native_floor
 from funding_bot.trade.adapters.contracts import AdapterError, NativeRef
 from common_adapter_fixtures import Transport, context, spec, registry
 
@@ -374,6 +375,92 @@ def test_short_overhedge_rehedge_buys_reduce_only_without_crossing_zero(tmp_path
     assert coordinator.execute(rid).state == store.OpState.OPEN
     action = transports[1].sent[-1][2]
     assert (action.side, action.reduce_only, action.quantity) == ("BUY", True, D(2))
+
+
+def test_single_leg_rehedge_ack_loss_recovers_from_parent_book_once(tmp_path):
+    con, did, entry, iid, coordinator, transports, _ctx = approved_entry(
+        tmp_path, operation_id="generic-rehedge-parent", leading_leg_id="hedge",
+    )
+    transports[1].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    transports[1].fail_after_send = False
+    assert coordinator.resume(iid).state == store.OpState.PAUSED_RISK
+
+    a, b = entry.legs
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), D(2), a.quote_currency, D(20), min_receive=D(0),
+                           min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("BUY", D(0), D(2), b.quote_currency, D(20), reduce_only=True,
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    correction = OperationPlan("generic-rehedge-recover", "rehedge", (a, b), b.leg_id, D(2), D(2),
+                               time.time() + 600, "floor", bounds, {"owner": "fixture", "mode": "dry"})
+    rid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=correction, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=rid, operation_id=correction.operation_id,
+                                    leg_id=leg.leg_id) for leg in correction.legs]
+    coordinator.context = context(correction.legs, transports, journals)
+    assert coordinator.approve(rid, nonce)
+    transports[1].fail_after_send = True
+    assert coordinator.execute(rid).state == store.OpState.PAUSED_UNKNOWN
+    transports[1].fail_after_send = False
+
+    con, recovered = reopen_generic(tmp_path, con, did, correction, rid, transports)
+    assert recovered.resume(rid).state == store.OpState.OPEN
+    root = store.get_operation(con, correction.operation_id)
+    projection = leg_accounting.rebuild(con, deal_id=did)
+    correction_projection = leg_accounting.rebuild(con, operation_id=correction.operation_id)
+    assert (root["confirmed_raw"], root["reserved_raw"]) == (root["target_raw"], "0")
+    assert sum(D(row["qty"]) for row in projection["legs"]) == 0
+    assert [(row["leg_id"], row["executions"]) for row in correction_projection["legs"]] == [(b.leg_id, 1)]
+    assert [len(item.sent) for item in transports] == [0, 2]
+    before = (root, projection)
+    with pytest.raises(store.StoreError, match="paused unknown"):
+        recovered.resume(rid)
+    assert (store.get_operation(con, correction.operation_id), leg_accounting.rebuild(con, deal_id=did)) == before
+
+
+def test_rehedge_multiplier_point_one_uses_native_contracts_without_crossing_owned_base(tmp_path):
+    con = store.connect(tmp_path / "trade.db")
+    a = spec("fixture_cex_spot", "lead", "long")
+    b = spec("fixture_cex_perp", "hedge", "short", multiplier=D("0.1"))
+    entry = replace(plan(a, b, operation_id="generic-m01-parent"), leading_leg_id=b.leg_id)
+    did = deal(con, entry, "DGM01")
+    transports = (Transport(), Transport())
+    for item in transports:
+        item.clock = time.time()
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    iid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=entry, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=iid, operation_id=entry.operation_id,
+                                    leg_id=leg.leg_id) for leg in entry.legs]
+    coordinator.context = context(entry.legs, transports, journals)
+    assert coordinator.approve(iid, nonce)
+    transports[1].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    transports[1].fail_after_send = False
+    assert coordinator.resume(iid).state == store.OpState.PAUSED_RISK
+    assert transports[1].sent[0][2].quantity == D(20)
+
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), D(2), a.quote_currency, D(20), min_receive=D(0),
+                           min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("BUY", D(0), D(20), b.quote_currency, D(20), reduce_only=True,
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    correction = OperationPlan("generic-m01-correction", "rehedge", (a, b), b.leg_id, D(2), D(2),
+                               time.time() + 600, "floor", bounds, {"owner": "fixture", "mode": "dry"})
+    rid, rnonce = coordinator.propose(deal=store.get_deal(con, did), plan=correction, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=rid, operation_id=correction.operation_id,
+                                    leg_id=leg.leg_id) for leg in correction.legs]
+    coordinator.context = context(correction.legs, transports, journals)
+    assert coordinator.approve(rid, rnonce)
+    assert coordinator.execute(rid).state == store.OpState.OPEN
+    assert transports[1].sent[-1][2].quantity == D(20)
+    assert sum(D(row["qty"]) for row in leg_accounting.rebuild(con, deal_id=did)["legs"]) == 0
+
+
+def test_rehedge_native_floor_never_rounds_exposure_up_at_decimal_context_boundary():
+    exposure_base = D("1.9999999999999999999999999999")
+    assert base_to_native_floor(exposure_base, D("0.1"), D(1)) == D(19)
 
 
 @pytest.mark.parametrize("fault", ("readonly_peer", "unhedged_cap"))
