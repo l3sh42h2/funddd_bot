@@ -153,8 +153,9 @@ def _scope_tuple(value: Any) -> tuple | None:
         item = scope[index]
         if not isinstance(item, str) or not item.strip():
             return None
-    if any(item is not None and not isinstance(item, str) for item in (scope[1], scope[3])):
-        return None
+    for item in (scope[1], scope[3]):
+        if item is not None and (not isinstance(item, str) or not item.strip()):
+            return None
     return scope
 
 
@@ -165,6 +166,43 @@ def _generic_scope(value: Any) -> tuple | None:
     if any(key not in value for key in keys):
         return None
     return _scope_tuple(tuple(value[key] for key in keys))
+
+
+def _active_generic_peer_scopes(con, deal_id: str, frozen: Mapping) -> tuple[tuple, tuple]:
+    """Return only scopes proven by both immutable parent and a linked plan.
+
+    ``inst_json`` is the parent identity, while the linked intent plan is the
+    independent durable copy produced before an operation can run.  A damaged
+    peer must never turn a held DEX wallet/network scope into an available one.
+    """
+    legs = frozen.get("legs")
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+        raise store.StoreError("active peer generic identity is incomplete")
+    raw_scopes = tuple(_generic_scope(item) for item in legs)
+    if any(scope is None for scope in raw_scopes):
+        raise store.StoreError("active peer generic identity is incomplete")
+    op = store.active_operation(con, deal_id)
+    if op is None:
+        raise store.StoreError("active peer generic scope root is missing")
+    rows = con.execute(
+        "SELECT i.plan_json FROM intents i JOIN operation_intents oi ON oi.intent_id=i.id "
+        "WHERE oi.operation_id=? ORDER BY oi.seq", (op["id"],)
+    ).fetchall()
+    if not rows:
+        raise store.StoreError("active peer generic scope plan is missing")
+    frozen_hash = store._json_hash(legs)
+    proven_scopes = None
+    for (raw_plan,) in rows:
+        plan = _generic_plan(raw_plan)
+        if plan.operation_id != op["id"] or store._json_hash(plan.to_dict()["legs"]) != frozen_hash:
+            raise store.StoreError("active peer generic frozen identity differs from linked plan")
+        scopes = tuple(_scope_tuple(leg.scope) for leg in plan.legs)
+        if any(scope is None for scope in scopes):
+            raise store.StoreError("active peer generic identity is incomplete")
+        if proven_scopes is not None and scopes != proven_scopes:
+            raise store.StoreError("active peer generic linked plans disagree")
+        proven_scopes = scopes
+    return proven_scopes
 
 
 def validate_generic_parent(con, deal_id: str, plan: OperationPlan) -> dict:
@@ -205,12 +243,7 @@ def _assert_generic_scopes_available(con, deal_id: str, plan: OperationPlan) -> 
         if not isinstance(frozen, Mapping):
             raise store.StoreError("active peer frozen identity is not an object")
         if frozen.get("generic_position_v1") is True:
-            legs = frozen.get("legs")
-            if not isinstance(legs, (list, tuple)) or len(legs) != 2:
-                raise store.StoreError("active peer generic identity is incomplete")
-            scopes = tuple(_generic_scope(item) for item in legs)
-            if any(scope is None for scope in scopes):
-                raise store.StoreError("active peer generic identity is incomplete")
+            scopes = _active_generic_peer_scopes(con, other["id"], frozen)
             if wanted & set(scopes):
                 raise store.StoreError("generic leg scope is already owned by an active deal")
             continue

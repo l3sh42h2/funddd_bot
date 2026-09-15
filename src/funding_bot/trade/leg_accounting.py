@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from . import store
 from .adapters.contracts import LegSpec, Result, Status
 from .fees import FeeComponent
+from .quantity_units import copy_negate, exact_sum, native_to_base
 
 KIND = "leg_execution_fact_v1"
 READER = 4
@@ -272,7 +273,10 @@ def rebuild(con, *, operation_id: str | None = None, deal_id: str | None = None)
         if leg["spec_hash"] != fact.spec_hash:
             raise ValueError("leg specification changed within accounting scope")
         leg["fees_complete"] = leg["fees_complete"] and fact.fees_complete
-        leg["qty"] += fact.actual_qty * fact.multiplier * (1 if fact.side == "BUY" else -1)
+        executed_base = native_to_base(fact.actual_qty, fact.multiplier)
+        if fact.side == "SELL":
+            executed_base = copy_negate(executed_base)
+        leg["qty"] = exact_sum((leg["qty"], executed_base))
         for fee in fact.fees:
             if not fee.known or fee.amount is None:
                 leg["unknown_fees"] += 1
@@ -283,9 +287,9 @@ def rebuild(con, *, operation_id: str | None = None, deal_id: str | None = None)
                 continue
             if component and component.get("payer") != json.loads(fact.scope)[2]:
                 continue
-            leg["fees"][fee.currency] = leg["fees"].get(fee.currency, Decimal(0)) + fee.amount
+            leg["fees"][fee.currency] = exact_sum((leg["fees"].get(fee.currency, Decimal(0)), fee.amount))
             if fact.market_kind == "spot" and fee.inventory_debit and fee.currency == fact.base_currency:
-                leg["qty"] -= fee.amount
+                leg["qty"] = exact_sum((leg["qty"], copy_negate(native_to_base(fee.amount, fact.multiplier))))
         for amount, currency in fact.funding:
             leg["funding"][currency] = leg["funding"].get(currency, Decimal(0)) + amount
         leg["executions"] += 1

@@ -717,6 +717,66 @@ def test_unknown_peer_mandatory_scope_identifier_is_nonblank_before_proposal(
                 store.OpState.PAUSED_UNKNOWN, old_root["reserved_raw"])
 
 
+@pytest.mark.parametrize("spot_adapter", ("fixture_evm_spot", "fixture_sol_spot"))
+@pytest.mark.parametrize("invalid_network", (None, "", " "))
+def test_unknown_peer_required_dex_network_fails_closed_against_linked_plan(
+        tmp_path, spot_adapter, invalid_network):
+    """A damaged DEX network cannot make an UNKNOWN wallet scope available."""
+    con = store.connect(tmp_path / "trade.db")
+    old_spot = spec(spot_adapter, "lead", "long")
+    old_perp = spec("fixture_cex_perp", "hedge", "short")
+    old_plan = plan(old_spot, old_perp, operation_id=f"network-old-{spot_adapter}-{invalid_network!r}")
+    old_did = deal(con, old_plan, f"DNETWORKOLD{spot_adapter[-3:].upper()}{len(str(invalid_network))}")
+    old_coordinator = GenericOperationCoordinator(con, registry(), None)
+    old_iid, _ = old_coordinator.propose(deal=store.get_deal(con, old_did), plan=old_plan, profile_id="fixture")
+    old_root = store.get_operation(con, old_plan.operation_id)
+    store.set_deal_state(con, old_did, store.DealState.ENTERING, expect=store.DealState.DRAFT)
+    store.set_deal_state(con, old_did, store.DealState.PAUSED, expect=store.DealState.ENTERING)
+    store.set_operation_state(con, old_root["id"], store.OpState.APPROVED, expect=store.OpState.PROPOSED)
+    store.set_operation_state(con, old_root["id"], store.OpState.RUNNING, expect=store.OpState.APPROVED)
+    store.operation_reserve(con, old_root["id"], 1)
+    store.set_operation_state(con, old_root["id"], store.OpState.PAUSED_UNKNOWN, expect=store.OpState.RUNNING)
+    frozen = json.loads(store.get_deal(con, old_did)["inst_json"])
+    frozen["legs"][0]["network"] = invalid_network
+    con.execute("UPDATE deals SET inst_json=? WHERE id=?", (json.dumps(frozen, separators=(",", ":")), old_did))
+
+    # The perpetual account differs so only the damaged DEX wallet/network
+    # scope determines whether this candidate is admitted.
+    candidate = plan(old_spot, replace(old_perp, account="account:other-hedge"),
+                     operation_id=f"network-new-{spot_adapter}-{invalid_network!r}")
+    candidate_did = deal(con, candidate, f"DNETWORKNEW{spot_adapter[-3:].upper()}{len(str(invalid_network))}")
+    with pytest.raises(store.StoreError, match="active peer"):
+        GenericOperationCoordinator(con, registry(), None).propose(
+            deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture")
+
+    assert store.get_operation(con, candidate.operation_id) is None
+    assert not con.execute("SELECT 1 FROM intents WHERE deal_id=?", (candidate_did,)).fetchone()
+    held = store.get_operation(con, old_root["id"])
+    assert (held["state"], held["reserved_raw"]) == (store.OpState.PAUSED_UNKNOWN, "1")
+
+
+def test_linked_cex_peer_keeps_nullable_network_and_subaccount_valid(tmp_path):
+    """CEX optional identity stays nullable after DEX peers became stricter."""
+    con = store.connect(tmp_path / "trade.db")
+    spot = spec("fixture_cex_spot", "lead", "long")
+    perp = spec("fixture_cex_perp", "hedge", "short")
+    old_plan = plan(spot, perp, operation_id="cex-nullable-old")
+    old_did = deal(con, old_plan, "DCEXNULLABLEOLD")
+    old_coordinator = GenericOperationCoordinator(con, registry(), None)
+    old_coordinator.propose(deal=store.get_deal(con, old_did), plan=old_plan, profile_id="fixture")
+    old_root = store.get_operation(con, old_plan.operation_id)
+    store.set_deal_state(con, old_did, store.DealState.ENTERING, expect=store.DealState.DRAFT)
+    store.set_operation_state(con, old_root["id"], store.OpState.APPROVED, expect=store.OpState.PROPOSED)
+
+    assert spot.network is None and spot.subaccount is None
+    candidate = plan(replace(spot, account="account:other-spot"),
+                     replace(perp, account="account:other-hedge"), operation_id="cex-nullable-new")
+    candidate_did = deal(con, candidate, "DCEXNULLABLENEW")
+    iid, _ = GenericOperationCoordinator(con, registry(), None).propose(
+        deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture")
+    assert store.get_intent(con, iid) is not None
+
+
 @pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
 def test_active_cex_peer_scope_accepts_nullable_optional_identifiers_without_normalizing(tmp_path, peer_kind):
     con = store.connect(tmp_path / "trade.db")

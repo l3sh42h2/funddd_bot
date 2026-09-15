@@ -5,6 +5,7 @@ import pytest
 from funding_bot.trade import store, leg_accounting, leg_cash
 from funding_bot.trade.adapters.contracts import Result, Status, NativeRef, RawAmount, QuoteAmount
 from funding_bot.trade.fees import FeeComponent
+from funding_bot.trade.quantity_units import native_to_base
 from common_adapter_fixtures import spec
 
 
@@ -34,6 +35,21 @@ def test_spot_cash_and_external_base_fee_rebuild_atomically(tmp_path):
     cash = leg_cash.rebuild(con)['legs'][0]
     assert {k: D(v) for k, v in cash['cash'].items()} == {'USDC': D(-4), s.asset_id: D('1.9')}
     assert con.execute('SELECT min_reader FROM schema_version').fetchone()[0] == 5
+
+
+@pytest.mark.parametrize('adapter', ('fixture_cex_spot', 'fixture_sol_spot'))
+@pytest.mark.parametrize('multiplier', (D('.1'), D(1), D(10)))
+@pytest.mark.parametrize('side, native_owned', (('BUY', D('1.9')), ('SELL', D('-2.1'))))
+def test_external_native_spot_fee_scales_only_inventory_exposure(tmp_path, adapter, multiplier, side, native_owned):
+    """Cash fee stays native; the inventory debit is converted exactly to base."""
+    con = store.connect(tmp_path / 'db')
+    s = spec(adapter, 'spot', 'long', multiplier=multiplier)
+    native_asset = s.instrument if s.capabilities.venue_kind == 'dex' else s.asset_id
+    fee = FeeComponent('platform', native_asset, 6, 100000, s.account, False, False)
+    leg_accounting.record_result(con, receipt(s, side=side, fees=(fee,)), s, operation_id='op', side=side)
+    leg = leg_accounting.rebuild(con)['legs'][0]
+    assert D(leg['qty']) == native_to_base(native_owned, multiplier)
+    assert D(leg['fees'][s.asset_id]) == D('.1')
 
 
 def test_cash_identity_failure_rolls_back_quantity_and_reader_floor(tmp_path):
