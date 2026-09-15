@@ -777,6 +777,44 @@ def test_linked_cex_peer_keeps_nullable_network_and_subaccount_valid(tmp_path):
     assert store.get_intent(con, iid) is not None
 
 
+@pytest.mark.parametrize("spot_adapter", ("fixture_cex_spot", "fixture_evm_spot", "fixture_sol_spot"))
+def test_completed_open_peer_allows_disjoint_scope_after_reopen(tmp_path, spot_adapter):
+    """An OPEN position owns only its scopes, not every future generic proposal."""
+    path = tmp_path / "trade.db"
+    con = store.connect(path)
+    spot = spec(spot_adapter, "lead", "long")
+    perp = spec("fixture_cex_perp", "hedge", "short")
+    first = plan(spot, perp, operation_id=f"open-peer-{spot_adapter}")
+    first_did = deal(con, first, f"DOPEN{spot_adapter[-3:].upper()}")
+    transports = (Transport(), Transport())
+    for transport in transports:
+        transport.clock = time.time()
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    first_iid, nonce = coordinator.propose(deal=store.get_deal(con, first_did), plan=first, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=first_did, intent_id=first_iid, operation_id=first.operation_id,
+                                    leg_id=leg.leg_id) for leg in first.legs]
+    coordinator.context = context(first.legs, transports, journals)
+    assert coordinator.approve(first_iid, nonce)
+    assert coordinator.execute(first_iid).state == store.OpState.OPEN
+    assert store.get_deal(con, first_did)["state"] == store.DealState.OPEN
+    assert store.active_operation(con, first_did) is None
+    con.close()
+
+    con = store.connect(path)
+    candidate = plan(replace(spot, account="account:other-spot"),
+                     replace(perp, account="account:other-hedge"), operation_id=f"open-disjoint-{spot_adapter}")
+    candidate_did = deal(con, candidate, f"DNEW{spot_adapter[-3:].upper()}")
+    iid, _ = GenericOperationCoordinator(con, registry(), None).propose(
+        deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture")
+    assert store.get_intent(con, iid) is not None
+
+    overlapping = plan(spot, perp, operation_id=f"open-overlap-{spot_adapter}")
+    overlap_did = deal(con, overlapping, f"DOVER{spot_adapter[-3:].upper()}")
+    with pytest.raises(store.StoreError, match="scope"):
+        GenericOperationCoordinator(con, registry(), None).propose(
+            deal=store.get_deal(con, overlap_did), plan=overlapping, profile_id="fixture")
+
+
 @pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
 def test_active_cex_peer_scope_accepts_nullable_optional_identifiers_without_normalizing(tmp_path, peer_kind):
     con = store.connect(tmp_path / "trade.db")
