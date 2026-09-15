@@ -179,7 +179,10 @@ def test_owner_auth_and_stale_message_in_core(conns):
 def test_drain_and_separate_deploy_authority(conns):
     s=service(conns);s.ready=True
     with pytest.raises(RpcError,match='unauthorized_method'):
-        s.dispatch('begin_drain',{},None,os.getuid())
+        # This is an interface caller, never the privileged deploy UID.  Do
+        # not derive it from os.getuid(): the Linux verification profile runs
+        # as root, whose UID is intentionally allowed to begin a drain.
+        s.dispatch('begin_drain',{},None,999999)
     s.dispatch('begin_drain',{'release_id':'fixture','expected_state_revision':0},None,0)
     with pytest.raises(RpcError,match='draining'):
         s.dispatch('submit_user_command',{'update':update(1,'продолжить')},'tg:1',os.getuid())

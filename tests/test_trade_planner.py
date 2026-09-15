@@ -497,6 +497,7 @@ def test_auto_plan_builds_fast():
     for kind in ("entry", "exit"):
         t = time.perf_counter()
         _plan(kind, calib=_cal(kind), lim=lim, mkt=_mkt(sigma_1s=D("0.000114")))
-        # 1 с — на Маке; ireland (2 vCPU рядом с бэкфиллом коллектора) дал 1.9 с на выкате 12.09 — порог с запасом:
-        # тест ловит взрыв перебора (минуты), а не разницу машин
-        assert time.perf_counter() - t < 6.0, kind
+        # 1 с — на Маке; на Ireland с 2 vCPU отдельный прогон занимает около
+        # 5.5 с, а полный профиль может кратко добавить нагрузку.  Этот тест
+        # ловит взрыв перебора (минуты), а не разницу машин.
+        assert time.perf_counter() - t < 10.0, kind
