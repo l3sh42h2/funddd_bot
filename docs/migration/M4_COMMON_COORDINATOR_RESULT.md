@@ -104,3 +104,17 @@ f64b604 отменён как кандидат на выкат; его Linux bui
 В окончательной приёмке также остаётся AC-07: проверить и устранить оставшуюся
 зависимость core от legacy Telegram formatter, прежде чем объявлять границы
 трёх процессов полностью принятыми.
+
+## R0 verification candidate (15.09.2026)
+
+Кодовый кандидат `b6832d7de2f50bc9f22b4ed7583d839dd5f215dc` заменяет
+непринятый `ee85b15` для независимого review. Он закрывает C01–C03 из R0:
+одноногий rehedge recovery, native/base units и personal spot surplus. Полный
+immutable Linux profile на Git checkout этого SHA: 2,833 passed, 12 skipped,
+1,527.80 s; artifact SHA-256
+`0f15b1168bd8e1b3bf32850dcc35ece75ccb7473103abc3de45e69aec338a1ab`.
+Mac JavaScriptCore: 8 passed / 0.31 s. Exact-value scan against server secrets
+не нашёл совпадений. Подробный handoff: `R0_REVIEW_HANDOFF.md`.
+
+Это доказательство готовности кандидата к независимому review, а не его
+результат: Claude ещё не выносил verdict, а candidate не установлен.
