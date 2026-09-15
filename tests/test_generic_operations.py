@@ -874,7 +874,7 @@ def test_recovered_open_peer_allows_disjoint_scope_after_reopen(tmp_path, monkey
 
 @pytest.mark.parametrize("damage", (
     "missing_terminal", "other_root", "other_intent", "status_mismatch", "malformed_payload",
-    "nonzero_reserve", "incomplete_target", "changed_parent",
+    "incomplete_payload", "nonzero_reserve", "incomplete_target", "changed_parent",
 ))
 @pytest.mark.parametrize("recovery_status", (store.IntentStatus.PARTIAL, store.IntentStatus.INTERRUPTED))
 def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage, recovery_status):
@@ -917,6 +917,12 @@ def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage, re
         con.execute("UPDATE intents SET status=? WHERE id=?", (other, iid))
     elif damage == "malformed_payload":
         con.execute("UPDATE exec_events SET json=? WHERE rowid=?", ("{not-json", end[0]))
+    elif damage == "incomplete_payload":
+        # Syntactically valid JSON that carries none of the expected keys.
+        # ``_recovered_open_intents`` must fail closed through its ``.get()``
+        # guards (silently excluding this event from ``proven``), not raise
+        # a bare KeyError/TypeError while reading a historical row.
+        con.execute("UPDATE exec_events SET json=? WHERE rowid=?", ("{}", end[0]))
     elif damage == "nonzero_reserve":
         con.execute("UPDATE operations SET reserved_raw='1' WHERE id=?", (first.operation_id,))
     elif damage == "incomplete_target":
@@ -937,7 +943,21 @@ def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage, re
                                    (EVENT_DISPATCH,))),
         events=tuple(con.execute("SELECT kind,json FROM exec_events ORDER BY rowid")),
     )
-    with pytest.raises(store.StoreError, match="scope|identity|settled|plan"):
+    # Each damage variant must fail through its own specific durable guard, not
+    # merely *some* scope-shaped error: a broad alternation would keep passing
+    # even if a regression made two variants collapse onto the wrong guard.
+    expected_message = {
+        "missing_terminal": "active peer generic scope plan is missing",
+        "other_root": "active peer generic scope plan is missing",
+        "other_intent": "active peer generic scope plan is missing",
+        "status_mismatch": "active peer generic scope plan is missing",
+        "malformed_payload": "active peer generic scope plan is missing",
+        "incomplete_payload": "active peer generic scope plan is missing",
+        "nonzero_reserve": "open peer generic scope root is not fully settled",
+        "incomplete_target": "open peer generic scope root is not fully settled",
+        "changed_parent": "active peer legacy scope is incomplete",
+    }[damage]
+    with pytest.raises(store.StoreError, match=expected_message):
         GenericOperationCoordinator(con, registry(), None).propose(
             deal=store.get_deal(con, candidate_id), plan=candidate, profile_id="fixture")
     assert tuple(con.execute("SELECT id,state,reserved_raw,confirmed_raw FROM operations ORDER BY id")) == before["roots"]
