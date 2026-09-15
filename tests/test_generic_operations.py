@@ -876,8 +876,9 @@ def test_recovered_open_peer_allows_disjoint_scope_after_reopen(tmp_path, monkey
     "missing_terminal", "other_root", "other_intent", "status_mismatch", "malformed_payload",
     "nonzero_reserve", "incomplete_target", "changed_parent",
 ))
-def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage):
-    """A retained partial intent owns scope only through its exact terminal proof.
+@pytest.mark.parametrize("recovery_status", (store.IntentStatus.PARTIAL, store.IntentStatus.INTERRUPTED))
+def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage, recovery_status):
+    """A retained recovery intent owns scope only through its exact terminal proof.
 
     This is a real SQLite proposal check rather than a reader-only assertion.
     Any damaged proof must fail closed even for otherwise-disjoint accounts.
@@ -895,8 +896,8 @@ def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage):
     con.execute("DROP TRIGGER exec_events_no_update")
     con.execute("DROP TRIGGER exec_events_no_delete")
     payload = json.loads(end[1])
-    payload["intent_state"] = store.IntentStatus.PARTIAL
-    con.execute("UPDATE intents SET status=? WHERE id=?", (store.IntentStatus.PARTIAL, iid))
+    payload["intent_state"] = recovery_status
+    con.execute("UPDATE intents SET status=? WHERE id=?", (recovery_status, iid))
     con.execute("UPDATE exec_events SET json=? WHERE rowid=?", (
         json.dumps(payload, sort_keys=True, separators=(",", ":")), end[0],
     ))
@@ -911,7 +912,9 @@ def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage):
     elif damage == "other_intent":
         con.execute("UPDATE exec_events SET intent_id=? WHERE rowid=?", ("unrelated-intent", end[0]))
     elif damage == "status_mismatch":
-        con.execute("UPDATE intents SET status=? WHERE id=?", (store.IntentStatus.INTERRUPTED, iid))
+        other = (store.IntentStatus.INTERRUPTED if recovery_status == store.IntentStatus.PARTIAL
+                 else store.IntentStatus.PARTIAL)
+        con.execute("UPDATE intents SET status=? WHERE id=?", (other, iid))
     elif damage == "malformed_payload":
         con.execute("UPDATE exec_events SET json=? WHERE rowid=?", ("{not-json", end[0]))
     elif damage == "nonzero_reserve":
@@ -927,9 +930,21 @@ def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage):
         operation_id="generic-terminal-proof-candidate-" + damage,
     )
     candidate_id = deal(con, candidate, "DTERMINAL" + damage.upper())
+    before = dict(
+        roots=tuple(con.execute("SELECT id,state,reserved_raw,confirmed_raw FROM operations ORDER BY id")),
+        intents=tuple(con.execute("SELECT id,deal_id,status FROM intents ORDER BY id")),
+        dispatch=tuple(con.execute("SELECT deal_id,intent_id,json FROM exec_events WHERE kind=? ORDER BY rowid",
+                                   (EVENT_DISPATCH,))),
+        events=tuple(con.execute("SELECT kind,json FROM exec_events ORDER BY rowid")),
+    )
     with pytest.raises(store.StoreError, match="scope|identity|settled|plan"):
         GenericOperationCoordinator(con, registry(), None).propose(
             deal=store.get_deal(con, candidate_id), plan=candidate, profile_id="fixture")
+    assert tuple(con.execute("SELECT id,state,reserved_raw,confirmed_raw FROM operations ORDER BY id")) == before["roots"]
+    assert tuple(con.execute("SELECT id,deal_id,status FROM intents ORDER BY id")) == before["intents"]
+    assert tuple(con.execute("SELECT deal_id,intent_id,json FROM exec_events WHERE kind=? ORDER BY rowid",
+                             (EVENT_DISPATCH,))) == before["dispatch"]
+    assert tuple(con.execute("SELECT kind,json FROM exec_events ORDER BY rowid")) == before["events"]
 
 
 @pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
