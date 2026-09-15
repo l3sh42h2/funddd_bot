@@ -180,3 +180,26 @@ surplus, если он покрывает owned inventory. Surplus не зачи
 message) 110 passed / 2.77 s. Нет изменения схемы, sender, реального venue allowlist
 или OperationController. Независимое ревью Claude и повторный Linux receipt остаются
 обязательными до установки.
+
+## R0 reviewer findings R01/R02 (15.09.2026)
+
+Независимый reviewer заблокировал `b6832d7`: две его integration regressions
+воспроизведены в полном репозитории как 5/5 failures. R01 показал, что точный
+floor получал уже context-rounded parent delta; R02 показал, что malformed или
+пустой `inst_json` другого активного UNKNOWN peer мог снять scope exclusion и
+допустить новые dispatch. Этот commit не разрешён к установке.
+
+Исправление вводит context-independent exact sum/copy-abs и локальный
+high-precision rebuild только для sizing/recovery path, не меняя глобальный
+Decimal context или accounting rules. Cumulative fact quantities, parent delta,
+residual/cross-zero checks и floor теперь читают этот exact path. Active peer с
+missing, malformed, non-object или incomplete frozen identity блокирует generic
+proposal/admission до dispatch; сохранный peer по-прежнему блокируется точным
+scope overlap. UNKNOWN root/reserve не меняются.
+
+Новые acceptance cases: оба reviewer floor examples (.1 и 10 multiplier),
+exact parent sum and rebuild facts at precision 28, positive reduce-only,
+negative cross-zero refusal, and malformed/empty/non-object/incomplete active
+peer after crash/reopen. External reviewer regression file: 5 passed / 0.18 s;
+generic/root scope profile: 107 passed / 3.36 s. Новый SHA требует secret scan,
+immutable Linux receipt и повторного reviewer verdict; production не менялся.

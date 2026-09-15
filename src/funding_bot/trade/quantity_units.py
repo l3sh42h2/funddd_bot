@@ -1,6 +1,7 @@
 """Exact quantity conversions and owned-inventory reconciliation policies."""
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
+import json
 
 
 def _finite(value: Decimal, name: str, *, positive: bool = False) -> Decimal:
@@ -19,6 +20,72 @@ def native_to_base(qty_native: Decimal, multiplier: Decimal) -> Decimal:
     coefficient = q_coefficient * m_coefficient
     digits = tuple(int(digit) for digit in str(coefficient)) if coefficient else (0,)
     return Decimal((q.sign ^ m.sign, digits, q.exponent + m.exponent))
+
+
+def copy_abs(value: Decimal, name: str = "quantity") -> Decimal:
+    """Remove a Decimal sign without applying the active arithmetic context."""
+    return _finite(value, name).copy_abs()
+
+
+def exact_sum(values) -> Decimal:
+    """Add finite Decimals by aligned integer coefficients, independent of context."""
+    items = tuple(_finite(value, "sum item") for value in values)
+    if not items:
+        return Decimal(0)
+    exponent = min(value.as_tuple().exponent for value in items)
+    total = 0
+    for value in items:
+        parts = value.as_tuple()
+        coefficient = int(''.join(str(digit) for digit in parts.digits))
+        if parts.sign:
+            coefficient = -coefficient
+        total += coefficient * 10 ** (parts.exponent - exponent)
+    digits = tuple(int(digit) for digit in str(abs(total))) if total else (0,)
+    return Decimal((int(total < 0), digits, exponent))
+
+
+def _decimal_values(value):
+    """Yield exact decimal strings from a public accounting event payload."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _decimal_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _decimal_values(item)
+    elif isinstance(value, str):
+        try:
+            item = Decimal(value)
+        except (InvalidOperation, ValueError):
+            return
+        if item.is_finite():
+            yield item
+
+
+def exact_leg_rebuild(con, *, deal_id: str | None = None, operation_id: str | None = None):
+    """Run the existing accounting rules with enough local precision for their full input.
+
+    The conservative bound sums every coefficient width and exponent span in
+    the selected public facts.  It therefore exceeds the width of any product,
+    aligned sum or subtraction performed by ``leg_accounting.rebuild`` without
+    changing the process-wide Decimal context or duplicating accounting rules.
+    """
+    from . import leg_accounting
+    query = "SELECT json FROM exec_events WHERE kind=?"
+    args = [leg_accounting.KIND]
+    if deal_id is not None:
+        query += " AND deal_id=?"
+        args.append(deal_id)
+    values = []
+    for (raw,) in con.execute(query, tuple(args)).fetchall():
+        payload = json.loads(raw)
+        if operation_id is not None and payload.get("operation_id") != operation_id:
+            continue
+        values.extend(_decimal_values(payload))
+    precision = 32 + sum(len(value.as_tuple().digits) + abs(value.as_tuple().exponent) + 2
+                         for value in values)
+    with localcontext() as decimal_context:
+        decimal_context.prec = max(32, precision)
+        return leg_accounting.rebuild(con, deal_id=deal_id, operation_id=operation_id)
 
 
 def base_to_native_floor(exposure_base: Decimal, multiplier: Decimal, step_native: Decimal) -> Decimal:

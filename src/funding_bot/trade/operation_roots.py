@@ -182,19 +182,34 @@ def _assert_generic_scopes_available(con, deal_id: str, plan: OperationPlan) -> 
         other = dict(row)
         if other["id"] == deal_id:
             continue
+        raw = other.get("inst_json")
+        if not isinstance(raw, str) or not raw.strip():
+            raise store.StoreError("active peer frozen identity is missing or unreadable")
         try:
-            frozen = json.loads(other.get("inst_json") or "{}")
+            frozen = json.loads(raw)
         except (TypeError, ValueError):
-            frozen = {}
+            raise store.StoreError("active peer frozen identity is missing or unreadable") from None
+        if not isinstance(frozen, Mapping):
+            raise store.StoreError("active peer frozen identity is not an object")
         if frozen.get("generic_position_v1") is True:
-            scopes = {_generic_scope(item) for item in frozen.get("legs", ())}
-            if wanted & {scope for scope in scopes if scope is not None}:
+            legs = frozen.get("legs")
+            if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+                raise store.StoreError("active peer generic identity is incomplete")
+            scopes = tuple(_generic_scope(item) for item in legs)
+            if any(scope is None for scope in scopes):
+                raise store.StoreError("active peer generic identity is incomplete")
+            if wanted & set(scopes):
                 raise store.StoreError("generic leg scope is already owned by an active deal")
+            continue
         # Legacy rows have only one persisted perp scope.  Refuse only when it
         # is an exact complete scope, never by a guessed account or chain.
         legacy_scope = frozen.get("perp_scope")
         if isinstance(legacy_scope, (list, tuple)) and tuple(legacy_scope) in wanted:
             raise store.StoreError("generic leg scope conflicts with active legacy deal")
+        if not isinstance(legacy_scope, (list, tuple)) or len(legacy_scope) != 5:
+            raise store.StoreError("active peer legacy scope is incomplete")
+        if any(item is not None and not isinstance(item, str) for item in legacy_scope):
+            raise store.StoreError("active peer legacy scope is incomplete")
 
 
 def generic_propose(con, *, deal: Mapping, plan: OperationPlan, profile_id: str,

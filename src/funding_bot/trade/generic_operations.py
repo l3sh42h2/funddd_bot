@@ -23,7 +23,8 @@ from .operation_plan import LegBound, OperationPlan
 from .operation_roots import _generic_identity, generic_propose, validate_generic_parent
 from .operations import EndDecision, OperationController
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator, TwoLegProgram
-from .quantity_units import base_to_native_floor, native_to_base, reconcile_owned_inventory
+from .quantity_units import (base_to_native_floor, copy_abs, exact_leg_rebuild, exact_sum,
+                             native_to_base, reconcile_owned_inventory)
 
 
 READER = 5
@@ -220,7 +221,7 @@ class GenericOperationCoordinator:
         if plan.kind == "rehedge":
             tolerance_base = native_to_base(leading.step, leading.multiplier)
             balanced = (lead is not None and self._proven_execution(lead)
-                        and abs(self._parent_delta(run.did, plan)) <= tolerance_base)
+                        and copy_abs(self._parent_delta(run.did, plan)) <= tolerance_base)
         else:
             balanced = (lead is not None and hedge_result is not None and self._proven_execution(lead)
                         and self._proven_execution(hedge_result)
@@ -399,18 +400,18 @@ class GenericOperationCoordinator:
             nonlocal action
             delta = self._parent_delta(run.did, plan)
             tolerance = native_to_base(leg.step, leg.multiplier)
-            if abs(delta) <= tolerance:
+            if copy_abs(delta) <= tolerance:
                 self._stop_without_reserve(run, op, "generic rehedge is already within approved residual")
                 raise _GenericHalt()
             side = "SELL" if delta > 0 else "BUY"
             if bound.side != side:
                 raise store.StoreError("generic rehedge leading leg cannot reduce proven parent delta")
-            qty = base_to_native_floor(abs(delta), leg.multiplier, leg.step)
+            qty = base_to_native_floor(copy_abs(delta), leg.multiplier, leg.step)
             if qty <= 0 or qty < bound.min_qty or qty > bound.max_qty:
                 raise store.StoreError("generic rehedge correction lies outside frozen approved bound")
             existing = self._leg_parent_qty(run.did, leg)
             reduces_existing = (side == "BUY" and existing < 0) or (side == "SELL" and existing > 0)
-            if reduces_existing and native_to_base(qty, leg.multiplier) > abs(existing):
+            if reduces_existing and native_to_base(qty, leg.multiplier) > copy_abs(existing):
                 raise store.StoreError("generic rehedge would cross the proven leg position through zero")
             increases_direction = (side == "BUY" and existing >= 0) or (side == "SELL" and existing <= 0)
             if increases_direction and ((side == "BUY" and leg.direction != "long") or
@@ -439,7 +440,7 @@ class GenericOperationCoordinator:
                 raise _GenericHalt()
             self._record_result(run, op, leg, action.side, result)
             tolerance = native_to_base(leg.step, leg.multiplier)
-            if not self._proven_execution(result) or abs(self._parent_delta(run.did, plan)) > tolerance:
+            if not self._proven_execution(result) or copy_abs(self._parent_delta(run.did, plan)) > tolerance:
                 self._pause_risk(run, op, result, None, "generic rehedge remains outside approved exposure")
                 raise _GenericHalt()
 
@@ -487,7 +488,7 @@ class GenericOperationCoordinator:
     def _hedge_quantity(self, deal_id: str, plan: OperationPlan, hedge, leading) -> Decimal:
         # The accounting projection includes a proven spot base fee.  Deriving
         # from the Result quantity alone would leave an unhedged inventory.
-        exposure = abs(self._parent_delta(deal_id, plan))
+        exposure = copy_abs(self._parent_delta(deal_id, plan))
         if exposure == 0:
             raise store.StoreError("leading generic result did not create a hedgeable parent delta")
         quantity = base_to_native_floor(exposure, hedge.multiplier, hedge.step)
@@ -561,13 +562,12 @@ class GenericOperationCoordinator:
             authorize(leg, action)
 
     def _leg_parent_qty(self, deal_id: str, leg) -> Decimal:
-        from .leg_accounting import rebuild
         values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
-                  for row in rebuild(self.con, deal_id=deal_id)["legs"]}
+                  for row in exact_leg_rebuild(self.con, deal_id=deal_id)["legs"]}
         return values.get((leg.leg_id, leg.fingerprint), Decimal(0))
 
     def _parent_delta(self, deal_id: str, plan: OperationPlan) -> Decimal:
-        return sum((self._leg_parent_qty(deal_id, leg) for leg in plan.legs), Decimal(0))
+        return exact_sum(self._leg_parent_qty(deal_id, leg) for leg in plan.legs)
 
     def _submit_or_resolve(self, run, op, adapter, leg, bound, action, *, reserve: bool) -> Result:
         sent = self._sent_attempts(run.iid)
@@ -811,17 +811,15 @@ class GenericOperationCoordinator:
         self._transition(run, (store.OpState.STOPPED,), store.IntentStatus.FAILED, reason=reason, proof=proof)
 
     def _balanced_book(self, operation_id: str, leading, hedge) -> bool:
-        from .leg_accounting import rebuild
         values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
-                  for row in rebuild(self.con, operation_id=operation_id)["legs"]}
+                  for row in exact_leg_rebuild(self.con, operation_id=operation_id)["legs"]}
         lead = values.get((leading.leg_id, leading.fingerprint))
         paired = values.get((hedge.leg_id, hedge.fingerprint))
-        return lead is not None and paired is not None and lead + paired == 0
+        return lead is not None and paired is not None and exact_sum((lead, paired)) == 0
 
     def _parent_is_flat(self, deal_id: str, plan: OperationPlan) -> bool:
-        from .leg_accounting import rebuild
         values = {(row["leg_id"], row["spec_hash"]): Decimal(row["qty"])
-                  for row in rebuild(self.con, deal_id=deal_id)["legs"]}
+                  for row in exact_leg_rebuild(self.con, deal_id=deal_id)["legs"]}
         return all(values.get((leg.leg_id, leg.fingerprint), Decimal(0)) == 0 for leg in plan.legs)
 
     def _pause_unknown(self, run, reason: str) -> None:

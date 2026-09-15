@@ -5,9 +5,9 @@ import json
 import math
 import time
 
-from . import store, leg_accounting
+from . import store
 from .operation_plan import OperationPlan
-from .quantity_units import native_to_base, reconcile_owned_inventory
+from .quantity_units import copy_abs, exact_leg_rebuild, exact_sum, native_to_base, reconcile_owned_inventory
 
 
 def is_generic(deal):
@@ -51,12 +51,12 @@ def check(con, deal, *, registry=None, context_factory=None, now=None, resolve=F
     if intent is None:
         return Check(None, None, None, 'нет замороженного плана двух ног')
     plan = OperationPlan.from_json(intent['plan_json'])
-    projection = leg_accounting.rebuild(con, deal_id=deal['id'])
+    projection = exact_leg_rebuild(con, deal_id=deal['id'])
     book = {(x['leg_id'], x['spec_hash']): D(x['qty']) for x in projection['legs']}
     known = all((s.leg_id, s.fingerprint) in book for s in plan.legs)
-    delta = sum(book[(s.leg_id, s.fingerprint)] for s in plan.legs) if known else None
+    delta = exact_sum(book[(s.leg_id, s.fingerprint)] for s in plan.legs) if known else None
     hedge = next(s for s in plan.legs if s.leg_id != plan.leading_leg_id)
-    hedged = abs(delta) < native_to_base(hedge.step, hedge.multiplier) if known else None
+    hedged = copy_abs(delta) < native_to_base(hedge.step, hedge.multiplier) if known else None
     op = store.active_operation(con, deal['id'])
     if op is not None and (int(op['reserved_raw']) or op['state'] == store.OpState.PAUSED_UNKNOWN):
         return Check(None, hedged, delta, 'исход исполнения выясняется; повторная отправка запрещена')

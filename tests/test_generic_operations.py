@@ -1,6 +1,6 @@
 """Generic two-leg root invariants beyond the adapter extension matrix."""
 from dataclasses import replace
-from decimal import Decimal as D
+from decimal import Decimal as D, localcontext
 import json
 import time
 
@@ -461,6 +461,199 @@ def test_rehedge_multiplier_point_one_uses_native_contracts_without_crossing_own
 def test_rehedge_native_floor_never_rounds_exposure_up_at_decimal_context_boundary():
     exposure_base = D("1.9999999999999999999999999999")
     assert base_to_native_floor(exposure_base, D("0.1"), D(1)) == D(19)
+
+
+@pytest.mark.parametrize(("exposure_base", "multiplier"), (
+    (D("1.9999999999999999999999999999"), D("0.1")),
+    (D("199.99999999999999999999999999"), D(10)),
+))
+def test_rehedge_caller_preserves_exact_floor_for_small_and_large_multiplier(exposure_base, multiplier):
+    coordinator = type("Sizing", (), {"_parent_delta": lambda *_: exposure_base})()
+    leg = type("Leg", (), {"multiplier": multiplier, "step": D(1)})()
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        assert GenericOperationCoordinator._hedge_quantity(coordinator, "D", None, leg, None) == D(19)
+
+
+def test_parent_delta_sum_is_context_independent():
+    exposure_base = D("1.9999999999999999999999999999")
+    quantities = {"positive": exposure_base, "zero": D(0)}
+    coordinator = type("Sizing", (), {"_leg_parent_qty": lambda self, _did, leg: quantities[leg]})()
+    plan_with_legs = type("Plan", (), {"legs": ("positive", "zero")})()
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        assert GenericOperationCoordinator._parent_delta(coordinator, "D", plan_with_legs) == exposure_base
+
+
+@pytest.mark.parametrize(("actual_qty", "multiplier", "expected"), (
+    (D("19.999999999999999999999999999"), D("0.1"), D("1.9999999999999999999999999999")),
+    (D("19.999999999999999999999999999"), D(10), D("199.99999999999999999999999999")),
+))
+def test_parent_delta_rebuilds_real_execution_fact_without_context_rounding(
+        tmp_path, actual_qty, multiplier, expected):
+    con = store.connect(tmp_path / "trade.db")
+    a = spec("fixture_cex_perp", "lead", "long", multiplier=multiplier)
+    b = spec("fixture_cex_perp", "hedge", "short")
+    entry = plan(a, b, operation_id="generic-exact-fact")
+    did = deal(con, entry, "DGEXACTFACT")
+    fact = leg_accounting.ExecutionFact(
+        entry.operation_id, a.leg_id, a.fingerprint,
+        json.dumps(a.scope, ensure_ascii=False, separators=(",", ":")),
+        "order:exact-boundary", "BUY", actual_qty, multiplier, "final",
+        market_kind="perpetual", base_currency=a.asset_id,
+        settlement_currency=a.settlement_currency, fees_complete=True,
+    )
+    leg_accounting.record_fact(con, fact, deal_id=did)
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+
+    with localcontext() as decimal_context:
+        decimal_context.prec = 28
+        assert coordinator._leg_parent_qty(did, a) == expected
+        assert coordinator._parent_delta(did, entry) == expected
+
+
+def test_rehedge_positive_owned_perp_multiplier_ten_sells_reduce_only_to_zero(tmp_path):
+    con = store.connect(tmp_path / "trade.db")
+    a = spec("fixture_cex_perp", "lead", "long", multiplier=D(10))
+    b = spec("fixture_cex_perp", "hedge", "short")
+    entry = plan(a, b, operation_id="generic-m10-parent")
+    did = deal(con, entry, "DGM10")
+    transports = (Transport(), Transport())
+    for item in transports:
+        item.clock = time.time()
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    iid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=entry, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=iid, operation_id=entry.operation_id,
+                                    leg_id=leg.leg_id) for leg in entry.legs]
+    coordinator.context = context(entry.legs, transports, journals)
+    assert coordinator.approve(iid, nonce)
+    transports[0].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    transports[0].fail_after_send = False
+    assert coordinator.resume(iid).state == store.OpState.PAUSED_RISK
+
+    bounds = {
+        a.leg_id: LegBound("SELL", D(0), D("0.2"), a.quote_currency, D(20), reduce_only=True,
+                           min_receive=D(0), min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("SELL", D(0), D(2), b.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    correction = OperationPlan("generic-m10-correction", "rehedge", (a, b), a.leg_id, D(2), D(2),
+                               time.time() + 600, "floor", bounds, {"owner": "fixture", "mode": "dry"})
+    rid, rnonce = coordinator.propose(deal=store.get_deal(con, did), plan=correction, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=rid, operation_id=correction.operation_id,
+                                    leg_id=leg.leg_id) for leg in correction.legs]
+    coordinator.context = context(correction.legs, transports, journals)
+    assert coordinator.approve(rid, rnonce)
+    assert coordinator.execute(rid).state == store.OpState.OPEN
+    assert (transports[0].sent[-1][2].side, transports[0].sent[-1][2].reduce_only,
+            transports[0].sent[-1][2].quantity) == ("SELL", True, D("0.2"))
+    assert sum(D(row["qty"]) for row in leg_accounting.rebuild(con, deal_id=did)["legs"]) == 0
+
+
+def test_rehedge_negative_owned_perp_multiplier_ten_buys_reduce_only_to_zero(tmp_path):
+    con = store.connect(tmp_path / "trade.db")
+    a = spec("fixture_cex_spot", "lead", "long")
+    b = spec("fixture_cex_perp", "hedge", "short", multiplier=D(10))
+    entry = replace(plan(a, b, operation_id="generic-negative-m10-parent"), leading_leg_id=b.leg_id)
+    did = deal(con, entry, "DGNEGM10")
+    transports = (Transport(), Transport())
+    for item in transports:
+        item.clock = time.time()
+    coordinator = GenericOperationCoordinator(con, registry(), None)
+    iid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=entry, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=iid, operation_id=entry.operation_id,
+                                    leg_id=leg.leg_id) for leg in entry.legs]
+    coordinator.context = context(entry.legs, transports, journals)
+    assert coordinator.approve(iid, nonce)
+    transports[1].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    transports[1].fail_after_send = False
+    assert coordinator.resume(iid).state == store.OpState.PAUSED_RISK
+
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), D(2), a.quote_currency, D(20),
+                           min_receive=D(0), min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("BUY", D(0), D("0.2"), b.quote_currency, D(20), reduce_only=True,
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    correction = OperationPlan("generic-negative-m10-correction", "rehedge", (a, b), b.leg_id,
+                               D(2), D(2), time.time() + 600, "floor", bounds,
+                               {"owner": "fixture", "mode": "dry"})
+    rid, rnonce = coordinator.propose(deal=store.get_deal(con, did), plan=correction, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=rid,
+                                    operation_id=correction.operation_id, leg_id=leg.leg_id)
+                for leg in correction.legs]
+    coordinator.context = context(correction.legs, transports, journals)
+    assert coordinator.approve(rid, rnonce)
+    assert coordinator.execute(rid).state == store.OpState.OPEN
+    assert (transports[1].sent[-1][2].side, transports[1].sent[-1][2].reduce_only,
+            transports[1].sent[-1][2].quantity) == ("BUY", True, D("0.2"))
+    assert sum(D(row["qty"]) for row in leg_accounting.rebuild(con, deal_id=did)["legs"]) == 0
+
+
+def test_rehedge_cross_zero_refuses_before_dispatch(tmp_path, monkeypatch):
+    con, did, entry, iid, coordinator, transports, _ctx = approved_entry(
+        tmp_path, operation_id="generic-cross-parent", leading_leg_id="hedge",
+    )
+    transports[1].fail_after_send = True
+    assert coordinator.execute(iid).state == store.OpState.PAUSED_UNKNOWN
+    transports[1].fail_after_send = False
+    assert coordinator.resume(iid).state == store.OpState.PAUSED_RISK
+
+    a, b = entry.legs
+    bounds = {
+        a.leg_id: LegBound("BUY", D(0), D(2), a.quote_currency, D(20), min_receive=D(0),
+                           min_receive_currency=a.quote_currency),
+        b.leg_id: LegBound("BUY", D(0), D(3), b.quote_currency, D(20), reduce_only=True,
+                           min_receive=D(0), min_receive_currency=b.quote_currency),
+    }
+    correction = OperationPlan("generic-cross-correction", "rehedge", (a, b), b.leg_id, D(3), D(3),
+                               time.time() + 600, "floor", bounds, {"owner": "fixture", "mode": "dry"})
+    rid, nonce = coordinator.propose(deal=store.get_deal(con, did), plan=correction, profile_id="fixture")
+    journals = [EventAttemptJournal(con, deal_id=did, intent_id=rid, operation_id=correction.operation_id,
+                                    leg_id=leg.leg_id) for leg in correction.legs]
+    coordinator.context = context(correction.legs, transports, journals)
+    assert coordinator.approve(rid, nonce)
+    monkeypatch.setattr(coordinator, "_parent_delta", lambda *_: D(-3))
+    before = [len(item.sent) for item in transports]
+    with pytest.raises(store.StoreError, match="cross"):
+        coordinator.execute(rid)
+    assert [len(item.sent) for item in transports] == before
+    assert not [event for event in store.events(con, did)
+                if event["kind"] == EVENT_DISPATCH and event["intent_id"] == rid]
+
+
+@pytest.mark.parametrize("corruption", ("{", "", "[]", '{"generic_position_v1":true,"legs":[]}'))
+def test_unknown_active_peer_with_unreadable_or_incomplete_identity_blocks_new_proposal(
+        tmp_path, monkeypatch, corruption):
+    con, did, original, iid, coordinator, transports, ctx = approved_entry(
+        tmp_path, operation_id="generic-corrupt-peer-old",
+    )
+    monkeypatch.setattr(ctx.for_leg(original.legs[0]), "submit",
+                        lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("crash after durable claim")))
+    with pytest.raises(KeyboardInterrupt):
+        coordinator.execute(iid)
+    con, _recovered = reopen_generic(tmp_path, con, did, original, iid, transports)
+    root_before = store.get_operation(con, original.operation_id)
+    assert root_before["state"] == store.OpState.PAUSED_UNKNOWN and int(root_before["reserved_raw"]) > 0
+    con.execute("UPDATE deals SET inst_json=? WHERE id=?", (corruption, did))
+
+    candidate = replace(original, operation_id="generic-corrupt-peer-new")
+    candidate_did = deal(con, candidate, "DGCORRUPTNEW")
+    candidate_coordinator = GenericOperationCoordinator(con, registry(), None)
+    with pytest.raises(store.StoreError, match="active peer"):
+        candidate_coordinator.propose(
+            deal=store.get_deal(con, candidate_did), plan=candidate, profile_id="fixture",
+        )
+    assert store.get_operation(con, candidate.operation_id) is None
+    assert not con.execute("SELECT 1 FROM intents WHERE deal_id=?", (candidate_did,)).fetchone()
+    assert [len(item.sent) for item in transports] == [0, 0]
+    assert not con.execute("SELECT 1 FROM exec_events WHERE deal_id=? AND kind=?",
+                           (candidate_did, EVENT_DISPATCH)).fetchone()
+    root_after = store.get_operation(con, original.operation_id)
+    assert (root_after["state"], root_after["reserved_raw"]) == (
+        root_before["state"], root_before["reserved_raw"])
 
 
 @pytest.mark.parametrize("fault", ("readonly_peer", "unhedged_cap"))
