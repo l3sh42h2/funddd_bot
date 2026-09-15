@@ -872,6 +872,66 @@ def test_recovered_open_peer_allows_disjoint_scope_after_reopen(tmp_path, monkey
             deal=store.get_deal(con, overlap_did), plan=overlapping, profile_id="fixture")
 
 
+@pytest.mark.parametrize("damage", (
+    "missing_terminal", "other_root", "other_intent", "status_mismatch", "malformed_payload",
+    "nonzero_reserve", "incomplete_target", "changed_parent",
+))
+def test_recovered_open_peer_requires_intact_terminal_proof(tmp_path, damage):
+    """A retained partial intent owns scope only through its exact terminal proof.
+
+    This is a real SQLite proposal check rather than a reader-only assertion.
+    Any damaged proof must fail closed even for otherwise-disjoint accounts.
+    """
+    con, did, first, iid, coordinator, _transports, _ctx = approved_entry(
+        tmp_path, operation_id="generic-terminal-proof-" + damage)
+    assert coordinator.execute(iid).state == store.OpState.OPEN
+    end = con.execute(
+        "SELECT rowid,json FROM exec_events WHERE deal_id=? AND kind='operation_end'", (did,)
+    ).fetchone()
+    assert end is not None
+    # This fixture models a damaged historical DB.  The production journal is
+    # append-only; removing its guards here is only what lets the reader prove
+    # that it refuses corrupted evidence rather than trusting a status alone.
+    con.execute("DROP TRIGGER exec_events_no_update")
+    con.execute("DROP TRIGGER exec_events_no_delete")
+    payload = json.loads(end[1])
+    payload["intent_state"] = store.IntentStatus.PARTIAL
+    con.execute("UPDATE intents SET status=? WHERE id=?", (store.IntentStatus.PARTIAL, iid))
+    con.execute("UPDATE exec_events SET json=? WHERE rowid=?", (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), end[0],
+    ))
+
+    if damage == "missing_terminal":
+        con.execute("DELETE FROM exec_events WHERE rowid=?", (end[0],))
+    elif damage == "other_root":
+        payload["operation_id"] = "unrelated-root"
+        con.execute("UPDATE exec_events SET json=? WHERE rowid=?", (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")), end[0],
+        ))
+    elif damage == "other_intent":
+        con.execute("UPDATE exec_events SET intent_id=? WHERE rowid=?", ("unrelated-intent", end[0]))
+    elif damage == "status_mismatch":
+        con.execute("UPDATE intents SET status=? WHERE id=?", (store.IntentStatus.INTERRUPTED, iid))
+    elif damage == "malformed_payload":
+        con.execute("UPDATE exec_events SET json=? WHERE rowid=?", ("{not-json", end[0]))
+    elif damage == "nonzero_reserve":
+        con.execute("UPDATE operations SET reserved_raw='1' WHERE id=?", (first.operation_id,))
+    elif damage == "incomplete_target":
+        con.execute("UPDATE operations SET confirmed_raw='1999' WHERE id=?", (first.operation_id,))
+    else:
+        con.execute("UPDATE deals SET inst_json='{}' WHERE id=?", (did,))
+
+    candidate = plan(
+        replace(first.legs[0], account="account:disjoint-spot"),
+        replace(first.legs[1], account="account:disjoint-perp"),
+        operation_id="generic-terminal-proof-candidate-" + damage,
+    )
+    candidate_id = deal(con, candidate, "DTERMINAL" + damage.upper())
+    with pytest.raises(store.StoreError, match="scope|identity|settled|plan"):
+        GenericOperationCoordinator(con, registry(), None).propose(
+            deal=store.get_deal(con, candidate_id), plan=candidate, profile_id="fixture")
+
+
 @pytest.mark.parametrize("peer_kind", ("generic", "legacy"))
 def test_active_cex_peer_scope_accepts_nullable_optional_identifiers_without_normalizing(tmp_path, peer_kind):
     con = store.connect(tmp_path / "trade.db")
