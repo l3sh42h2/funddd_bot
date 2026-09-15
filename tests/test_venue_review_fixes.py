@@ -72,6 +72,19 @@ class _Exhausted(_SlowVenue):
         raise BudgetExceeded("вес 70 %")
 
 
+class _ParallelProbeVenue(_SlowVenue):
+    """Подтверждает одновременный старт двух площадок без порога по времени CI."""
+
+    def __init__(self, name: str, calls: list, started: threading.Barrier):
+        super().__init__(name, calls)
+        self.started = started
+
+    def history_since(self, symbol, start_ms, end_ms=None):
+        self.calls.append((self.name, symbol, threading.current_thread().name))
+        self.started.wait(timeout=2)
+        return []
+
+
 def _gaps(venues_, n):
     now = int(time.time() * 1000)
     g = {"needs_repair": True, "latest_missing": True, "missing": [now - 3_600_000], "since": now - 7_200_000}
@@ -81,13 +94,11 @@ def _gaps(venues_, n):
 def test_repair_runs_venues_in_parallel_with_one_call_budget(tmp_path):
     con = db.connect(tmp_path / "f.db")
     calls, reports = [], []
-    clients = {"va": _SlowVenue("va", calls), "vb": _SlowVenue("vb", calls)}
+    started = threading.Barrier(2)
+    clients = {"va": _ParallelProbeVenue("va", calls, started), "vb": _ParallelProbeVenue("vb", calls, started)}
     gaps = _gaps(clients, 3)
-    t0 = time.time()
     funding.repair(con, clients, gaps, {}, report=lambda leg, ok: reports.append((leg, ok)))
-    dt = time.time() - t0
     assert len(calls) == 6 and sorted(reports) == sorted((k, True) for k in gaps)
-    assert dt < 1.0, f"площадки шли по очереди: {dt:.2f} с (по очереди — 1.2 с)"
     assert threading.current_thread().name not in {t for _, _, t in calls}
     calls.clear()
     funding.repair(con, clients, gaps, {}, max_calls=4)      # бюджет вызовов общий на все площадки
