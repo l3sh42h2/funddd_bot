@@ -70,3 +70,14 @@ def test_generic_report_exposes_confirmed_basis_without_claiming_total_pnl(tmp_p
     basis = report['legs'][0]['cost_basis']
     assert basis['complete'] and basis['realized_pnl_quote'] == '1.000000'
     assert report['pnl'] is None and 'Реализованный спот-результат: 1.000000 USDC.' in render(report)
+
+
+def test_duplicate_cash_receipt_is_not_silently_selected(tmp_path):
+    import json
+    con = store.connect(tmp_path / 'trade.db')
+    s = spec('fixture_cex_spot', 'spot', 'long')
+    _record(con, s, native='buy-1', side='BUY', qty='2', quote='4')
+    raw = con.execute("SELECT json FROM exec_events WHERE kind='leg_execution_cash_v1'").fetchone()[0]
+    store.event(con, 'leg_execution_cash_v1', deal_id='deal-1', **json.loads(raw))
+    leg = cost_basis.rebuild(con, deal_id='deal-1')['legs'][0]
+    assert not leg['complete'] and leg['reasons'] == ('cash_receipt_ambiguous',)

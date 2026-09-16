@@ -57,7 +57,7 @@ def rebuild(con, *, deal_id: str) -> dict[str, Any]:
         (deal_id, FACT_KIND, CASH_KIND),
     ).fetchall()
     facts: list[tuple[int, dict[str, Any]]] = []
-    cash: dict[str, dict[str, Any]] = {}
+    cash: dict[str, list[dict[str, Any]]] = {}
     malformed = []
     for rowid, kind, raw in rows:
         try:
@@ -70,7 +70,7 @@ def rebuild(con, *, deal_id: str) -> dict[str, Any]:
         if kind == FACT_KIND:
             facts.append((rowid, payload))
         else:
-            cash[payload["identity"]] = payload
+            cash.setdefault(payload["identity"], []).append(payload)
 
     legs: dict[tuple[str, str], dict[str, Any]] = {}
     for _, fact in facts:
@@ -90,10 +90,14 @@ def rebuild(con, *, deal_id: str) -> dict[str, Any]:
                 fact["spec_hash"], fact["base_currency"], fact["settlement_currency"]):
             _fail(leg, "frozen_leg_changed")
             continue
-        receipt = cash.get(fact["identity"])
-        if receipt is None:
+        receipts = cash.get(fact["identity"], ())
+        if not receipts:
             _fail(leg, "cash_receipt_missing")
             continue
+        if len(receipts) != 1:
+            _fail(leg, "cash_receipt_ambiguous")
+            continue
+        receipt = receipts[0]
         if any(receipt.get(k) != fact.get(k) for k in ("operation_id", "leg_id", "spec_hash", "scope", "native_ref")):
             _fail(leg, "cash_receipt_identity_mismatch")
             continue
