@@ -1,0 +1,48 @@
+{
+  "approve_tx_hashes": [],
+  "as_of_ms": 1789239422044,
+  "deal_id": "D9W8M",
+  "family": "evm",
+  "fee_rate": null,
+  "marks": {
+    "native_quote": null,
+    "perp_quote": null,
+    "spot_quote": null
+  },
+  "observation_ts": 1789239422.0438187,
+  "snapshot_version": 1,
+  "tables": {
+    "clips": [],
+    "deals": [
+      {
+        "carry": "0",
+        "chain": "bsc",
+        "coin": "AIW3",
+        "created": 1789239392.791172,
+        "dust": "0",
+        "id": "D9W8M",
+        "leg_usd": "200",
+        "perp_venue": "aster",
+        "sim": 0,
+        "state": "ABORTED",
+        "symbol": "AIW3USDT",
+        "token": "0x37e94fc028903e74275478b65160d6d2c0e8880b",
+        "token_dec": 18,
+        "updated": 1789239422.0438187
+      }
+    ],
+    "dex_txs": [],
+    "funding_income": [],
+    "intents": [
+      {
+        "created": 1789239392.7953396,
+        "deal_id": "D9W8M",
+        "id": "ENZYF",
+        "kind": "entry",
+        "status": "failed"
+      }
+    ],
+    "perp_fills": [],
+    "perp_orders": []
+  }
+}
