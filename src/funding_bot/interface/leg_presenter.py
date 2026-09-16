@@ -17,6 +17,16 @@ def render(report):
             lines.append('Комиссии подтверждены не полностью.')
         if not leg['cash_complete']:
             lines.append('Денежные потоки подтверждены не полностью.')
+        basis = leg.get('cost_basis')
+        if basis is not None:
+            if basis['complete']:
+                unit = escape(str(basis['quote_currency']))
+                if basis['average_cost_quote'] is not None:
+                    lines.append(f"Средняя стоимость остатка: {escape(str(basis['average_cost_quote']))} {unit}.")
+                if basis['realized_pnl_quote'] is not None:
+                    lines.append(f"Реализованный спот-результат: {escape(str(basis['realized_pnl_quote']))} {unit}.")
+            else:
+                lines.append('Cost basis подтверждён не полностью: ' + escape(', '.join(basis['reasons'])) + '.')
         if leg.get('market_kind') == 'perpetual' and not leg.get('funding_complete'):
             lines.append('Полнота истории фандинга не подтверждена.')
     if report.get('pnl') is None:

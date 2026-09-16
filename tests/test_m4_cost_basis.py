@@ -57,3 +57,16 @@ def test_sell_cannot_use_other_deal_or_unconfirmed_inventory(tmp_path):
     assert not one['complete'] and one['realized_pnl_quote'] is None
     assert one['reasons'] == ('sell_exceeds_confirmed_inventory',)
     assert cost_basis.rebuild(con, deal_id='another')['legs'] == ()
+
+
+def test_generic_report_exposes_confirmed_basis_without_claiming_total_pnl(tmp_path):
+    from funding_bot.core.leg_report import build
+    from funding_bot.interface.leg_presenter import render
+    con = store.connect(tmp_path / 'trade.db')
+    s = spec('fixture_cex_spot', 'spot', 'long')
+    _record(con, s, native='buy-1', side='BUY', qty='2', quote='4')
+    _record(con, s, native='sell-1', side='SELL', qty='1', quote='3')
+    report = build(con, deal_id='deal-1')
+    basis = report['legs'][0]['cost_basis']
+    assert basis['complete'] and basis['realized_pnl_quote'] == '1.000000'
+    assert report['pnl'] is None and 'Реализованный спот-результат: 1.000000 USDC.' in render(report)
