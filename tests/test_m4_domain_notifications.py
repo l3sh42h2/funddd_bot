@@ -77,6 +77,39 @@ def test_execution_notice_crosses_core_without_html_and_renders_at_interface(tmp
         out.execution_notice(42, 'progress', dict(facts, extra='not allowed'))
 
 
+def test_new_execution_and_proposal_dtos_fence_rollback_readers(tmp_path):
+    """Versions 5 and 6 are persisted reader fences, just like versions 2–4."""
+    conns = Conns(tmp_path/'trade.db')
+    out = Outbox(Journal(conns))
+    progress = dict(intent_id='I1', kind='entry', coin='A', clip=1, clips=1,
+                    spot_usd=D('2'), spot_qty=D('1'), spot_avg=D('2'), perp_qty=D('1'), perp_usd=D('2'),
+                    perp_avg=D('2'), imbalance_qty=D(0), imbalance_usd=D(0), gas_usd=D(0), fees_usd=D(0),
+                    note=None, sim=True, total_usd=D('2'), step=D(1), m=D(1))
+    old = dict(compatible_readers=[1, 2], schema_version=2, dto_version=4)
+    out.execution_notice(42, 'progress', progress)
+    db = job.database_info(tmp_path/'trade.db')
+    assert db['notification_dto_version'] == 5
+    assert not job.compatible_reader(old, db)
+    assert job.compatible_reader(dict(old, dto_version=5), db)
+
+    con = conns.get()
+    did = store.create_deal(con, coin='A', chain='bsc', token='0x'+'a'*40, token_dec=18,
+                            perp_venue='aster', symbol='AUSDT', leg_usd=D(100), owner_json='{}', sim=True)
+    iid, nonce = store.create_intent(con, deal_id=did, kind='entry', spec={'coin': 'A'}, plan={})
+    out.plan_guard = lambda _: None
+    summary = plan_summary(store.get_intent(con, iid), store.get_deal(con, did))
+    facts = dict(intent_id=iid, kind='rehedge', coin='A', deal_id=did, delta=None, qty=None, side=None, usd=None,
+                 perp_venue='aster', step=None, ttl_s=60, sim=True, m=None)
+    out.plan_proposed(42, iid, nonce, summary, 'fix_plan', facts)
+    db = job.database_info(tmp_path/'trade.db')
+    assert db['notification_dto_version'] == 6
+    assert not job.compatible_reader(dict(old, dto_version=5), db)
+    assert job.compatible_reader(dict(old, dto_version=6), db)
+    # A current core must also accept the reader fence it just persisted after
+    # an ordinary restart.
+    assert Journal(conns).notifications()[0]['dto_version'] == 5
+
+
 def test_ui_retries_unrenderable_event_and_ack_restart_does_not_resend(tmp_path):
     sent = []
     events = [dict(id=1, kind='approval_reply', dto_version=999, callback_id='cb', reason='accepted')]

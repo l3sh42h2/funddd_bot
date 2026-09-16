@@ -73,19 +73,29 @@ def rebuild(con, *, deal_id: str) -> dict[str, Any]:
             cash.setdefault(payload["identity"], []).append(payload)
 
     legs: dict[tuple[str, str], dict[str, Any]] = {}
+    # A fact with a usable leg/scope key but damaged immutable identity must
+    # poison that leg.  Silently skipping it would make a previously valid
+    # partial inventory look complete with a smaller quantity.  Keep pending
+    # failures too: the damaged fact can precede the first valid fact for the
+    # same leg in an append-only journal.
+    malformed_legs: dict[tuple[str, str], set[str]] = {}
     for _, fact in facts:
         if fact.get("market_kind") != "spot":
             continue
         key = (fact.get("leg_id"), fact.get("scope"))
-        try:
-            if not all(isinstance(fact.get(k), str) and fact[k] for k in
-                       ("leg_id", "scope", "spec_hash", "base_currency", "settlement_currency", "identity")):
-                raise ValueError("identity fields")
-            if fact.get("side") not in ("BUY", "SELL"):
-                raise ValueError("side")
-        except ValueError:
-            continue  # no safe namespace to expose
+        if not all(isinstance(fact.get(k), str) and fact[k] for k in ("leg_id", "scope")):
+            malformed.append((None, FACT_KIND))
+            continue
+        if (not all(isinstance(fact.get(k), str) and fact[k] for k in
+                    ("spec_hash", "base_currency", "settlement_currency", "identity"))
+                or fact.get("side") not in ("BUY", "SELL")):
+            malformed_legs.setdefault(key, set()).add("malformed_execution_event")
+            if key in legs:
+                _fail(legs[key], "malformed_execution_event")
+            continue
         leg = legs.setdefault(key, _leg(fact))
+        for reason in malformed_legs.get(key, ()):
+            _fail(leg, reason)
         if (leg["spec_hash"], leg["base_currency"], leg["quote_currency"]) != (
                 fact["spec_hash"], fact["base_currency"], fact["settlement_currency"]):
             _fail(leg, "frozen_leg_changed")

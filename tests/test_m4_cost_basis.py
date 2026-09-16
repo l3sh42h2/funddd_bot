@@ -81,3 +81,18 @@ def test_duplicate_cash_receipt_is_not_silently_selected(tmp_path):
     store.event(con, 'leg_execution_cash_v1', deal_id='deal-1', **json.loads(raw))
     leg = cost_basis.rebuild(con, deal_id='deal-1')['legs'][0]
     assert not leg['complete'] and leg['reasons'] == ('cash_receipt_ambiguous',)
+
+
+def test_malformed_second_fact_never_silently_understates_open_inventory(tmp_path):
+    """A corrupt append-only fact for a known spot leg must poison its report."""
+    con = store.connect(tmp_path / 'trade.db')
+    s = spec('fixture_cex_spot', 'spot', 'long')
+    _record(con, s, native='buy-1', side='BUY', qty='2', quote='4')
+    raw = con.execute("SELECT json FROM exec_events WHERE kind='leg_execution_fact_v1'").fetchone()[0]
+    damaged = json.loads(raw)
+    damaged['side'] = 'BROKEN'
+    store.event(con, 'leg_execution_fact_v1', deal_id='deal-1', **damaged)
+    leg = cost_basis.rebuild(con, deal_id='deal-1')['legs'][0]
+    assert not leg['complete']
+    assert leg['basis_quote'] is None and leg['average_cost_quote'] is None
+    assert leg['reasons'] == ('malformed_execution_event',)

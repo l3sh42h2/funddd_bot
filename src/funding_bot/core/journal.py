@@ -25,7 +25,7 @@ class Journal:
         con = self.conns.get()
         if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_meta'").fetchone():
             version = con.execute("SELECT value FROM core_meta WHERE key='schema_version'").fetchone()
-            if version and version[0] not in ('1', '2', '3', '4'):
+            if version and version[0] not in ('1', '2', '3', '4', '5', '6'):
                 raise RpcError('unsupported_core_schema')
         con.executescript(SCHEMA)
         con.execute("INSERT OR IGNORE INTO core_meta VALUES('schema_version','1')")
@@ -98,7 +98,11 @@ class Journal:
         # A new wire event and its rollback reader fence must commit together.
         from ..trade import store
         with store.tx(con):
-            if payload.get('dto_version') in (2, 3, 4):
+            # A persisted event fences rollback readers. Every defined version
+            # (including execution notices v5 and proposal views v6) must
+            # advance that fence; otherwise an old interface may be accepted
+            # after it can no longer decode an outbox row.
+            if payload.get('dto_version') in (2, 3, 4, 5, 6):
                 # Old Journal implementations already enforce this gate. A
                 # previous artifact's runner must not boot an unaware core.
                 version = str(payload['dto_version'])
