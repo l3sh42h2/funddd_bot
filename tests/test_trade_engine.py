@@ -467,6 +467,30 @@ def sends(e) -> tuple[int, int]:
     return len(e.spot.swaps), len(e.perp.calls)
 
 
+def test_replan_never_merges_approved_remaining_clips(tmp_path, monkeypatch):
+    """Свежая оценка восстановления не имеет права превратить остаток одобренных
+    небольших DEX-свапов в один большой: это меняет impact и MEV-риск после «да»."""
+    e = live_env(tmp_path, clip='"auto"')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(500), chat=OWNER)
+    it, deal = store.get_intent(e.con, p.intent_id), store.get_deal(e.con, p.deal_id)
+    spec = eng.json.loads(it["spec_json"])
+    run = eng.Run(it=it, deal=deal, kind="entry", spec=spec, plan=p.plan, legs=e.legs_live,
+                  cfg=owner.OwnerCfg.from_frozen(spec["owner"]), token=deal["token"], dec=int(deal["token_dec"]),
+                  symbol=deal["symbol"], stable=STABLE, sdec=18, f=FILT, started=0)
+    captured = []
+    def fake_plan(**kw):
+        captured.append(kw["lim"])
+        return SimpleNamespace(clips=[SimpleNamespace(dex_in_units=kw["total_in_units"])])
+    monkeypatch.setattr(eng.planner, "plan", fake_plan)
+
+    # Модель обновления стремится схлопнуть оставшиеся $2,100 в один клип.
+    # Исполнитель обязан передать планировщику потолок исходного клипа $350.
+    remaining, approved_clip = 2100 * E18, 350 * E18
+    assert e.engine._replan_rest(run, remaining, D(0), approved_clip, approved_clip) == [remaining]
+    assert captured[0].clip_max_usd == D("350")
+
+
+
 # ==== 1. полный dry-run входа и выхода ==========================================================================
 def test_dry_run_entry_and_exit_full_flow(tmp_path):
     e = sim_env(tmp_path)

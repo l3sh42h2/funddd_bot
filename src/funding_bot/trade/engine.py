@@ -2619,8 +2619,13 @@ class Engine:
         except (TypeError, ValueError, InvalidOperation, ZeroDivisionError):
             return
 
-    def _replan_rest(self, run: Run, remaining: int, r: D, done: int) -> list[int]:
-        """Остаток — заново по той же калибровке, свежему стакану и ИЗМЕРЕННОМУ r: при r ≈ 0 он схлопывается в клип."""
+    def _replan_rest(self, run: Run, remaining: int, r: D, done: int, max_input: int) -> list[int]:
+        """Перекотировать остаток, не укрупняя ни один ещё не исполненный клип.
+
+        Одобрение фиксирует не только суммарный бюджет, но и размер клипов. Иначе
+        оптимизатор после первого клипа может выбрать ``n=1`` и превратить остаток
+        нескольких небольших swaps в один большой, с другим влиянием на пул и MEV-риском.
+        """
         con = self.conns.get()
         perp = run.legs.perp
         calib = _calib_from(run.plan.inputs["calib"])
@@ -2635,8 +2640,12 @@ class Engine:
                                  sigma_1s=sigma_1s(perp, run.symbol),
                                  funding_h=rate / D(str(run.spec.get("period_h") or 1)),
                                  native_px=run.legs.native_px(), chain=_deal_cv(run.deal)[0])
-            lim = replace(_lim(run.cfg, run.deal), deal_max_usd=None, alpha=alpha,
-                          beta_bps=beta, ab_band=band)
+            base_lim = _lim(run.cfg, run.deal)
+            cap = to_usd(max_input)
+            if isinstance(base_lim.clip_max_usd, D):
+                cap = min(cap, base_lim.clip_max_usd)
+            lim = replace(base_lim, deal_max_usd=None, clip_max_usd=cap,
+                          alpha=alpha, beta_bps=beta, ab_band=band)
             d0 = planner.dex_cost(max(run.seq, 1), to_usd(done), calib.k, calib.g, r, calib.c0).d_end \
                 if done > 0 else ZERO
             carry = deal_book(con, run.did).delta(run.dec) or ZERO       # перенос после клипа (M1: как исполнитель)
@@ -2648,7 +2657,8 @@ class Engine:
             raise Pause("replan", f"остаток не планируется: {e}") from None
         except Exception as e:                 # noqa — стакан/фандинг не прочитаны
             raise Pause("replan", f"остаток не планируется: {redact(e)}") from None
-        store.event(con, "replan", deal_id=run.did, intent_id=run.iid, r=r, n=len(p.clips))
+        store.event(con, "replan", deal_id=run.did, intent_id=run.iid, r=r, n=len(p.clips),
+                    clip_cap_usd=cap)
         return [c.dex_in_units for c in p.clips if c.dex_in_units > 0]
 
     def _after_clip(self, run: Run, clip_id: int, queue_: list[int], px0, m0, r: D, done: int) -> tuple[list[int], D]:
@@ -2667,7 +2677,7 @@ class Engine:
                 r = rm
                 c = store.get_clip(con, clip_id)
                 store.set_clip_state(con, clip_id, c["state"], recovery=float(rm))
-        return self._replan_rest(run, sum(queue_), r, done), r
+        return self._replan_rest(run, sum(queue_), r, done, max(queue_)), r
 
     def _progress(self, run: Run) -> None:
         if run.n_total < 2:                    # один клип — прогресс не пишем: сразу придёт итог (C: штатное не пишем)
