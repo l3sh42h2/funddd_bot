@@ -60,6 +60,19 @@ Outbox.plan_proposed` больше не принимает `legacy_body` — п�
 throttled-edit) — `sol_views.progress()` его в текст не выводит, ровно как у EVM `progress`; `interface.present()`
 и `tg/bot.py: BotHooks.notice` помечают `sol_progress` тем же «без звука»/edit-in-place, что и `progress`.
 
+**Уточнение (Claude, 2026-09-16, патч `m4-progress-edit-in-place-20260916`):** последняя часть фразы выше —
+про `interface.present()` — на момент этого патча была неточна, поймано независимым ревью AC-07 и подтверждено
+Codex. «Без звука» (`silent=True`) `present()` действительно уже проставлял для `progress`/`sol_progress`; а
+вот edit-in-place — нет: `present()` для `kind=='execution_notice'` тогда безусловно возвращал `kind='send'`,
+без ветвления по `topic`, то есть в трёхпроцессном режиме (`core`+`interface`) каждая стадия прогресса шла
+НОВЫМ сообщением, а не правкой одного. Edit-in-place на момент этого патча реально работал только в
+однопроцессном `tg/bot.py: BotHooks.notice` (через `Bot.progress()` — тот самый throttle-механизм, что и
+`core/commands.py: Bot.progress()`, но `core/commands.py`'s `BotHooks.notice` эту ветку никогда не звал: она
+безусловно шла в `Bot.execution_notice` → DTO). `interface.present()` заработал так же только после
+`m4-progress-edit-in-place-20260916`, который добавил `interface/progress_tracker.py: ProgressTracker`
+(intent_id → message_id, в памяти interface) и ветвление в `present()`. См. тот патчноут за архитектурным
+решением и границами.
+
 ## Не тронуто (явно)
 
 - **sim-гейт** (`operation_roots.py` ~266/324) не менялся, даже не открывался.
