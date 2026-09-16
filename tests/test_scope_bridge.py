@@ -169,8 +169,7 @@ def test_fixture_has_the_expected_real_row_counts(tmp_path):
 
 
 def test_shadow_write_never_activates_scoped_accounting_for_a_real_deal(tmp_path):
-    """The invariant this whole change exists to protect: recording the shadow binding (even
-    together with installing the real, still-dormant scoped_accounting schema) must not change
+    """The invariant this whole change exists to protect: recording the shadow binding must not change
     deal_scope()/is_bound(), and therefore must not change what
     engine.deal_fills()/accounting.sources() (and cabinet/dashboard/tg through them) return for
     this real deal."""
@@ -179,7 +178,6 @@ def test_shadow_write_never_activates_scoped_accounting_for_a_real_deal(tmp_path
         before_fills = engine.deal_fills(con, "DQA9Q")
         assert len(before_fills) == 2
 
-        scope_bridge.ensure_scoped_accounting_schema(con)
         scope = scope_bridge.record_shadow_binding(con, DQA9Q_BINDING)
         assert scope.account_scope == DQA9Q_BINDING["account"]
 
@@ -188,10 +186,9 @@ def test_shadow_write_never_activates_scoped_accounting_for_a_real_deal(tmp_path
         assert accounting.sources(con, "DQA9Q") is None
         assert engine.deal_fills(con, "DQA9Q") == before_fills
 
-        # The real, activating tables exist now (ensure_scoped_accounting_schema installed
-        # them) but are empty -- nothing here ever calls bind_deal()/add_fills()/add_funding().
-        assert con.execute("SELECT count(*) FROM scoped_deal_accounts").fetchone()[0] == 0
-        assert con.execute("SELECT count(*) FROM scoped_account_proofs").fetchone()[0] == 0
+        # Shadow observation must not even install the future activating tables.
+        assert con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scoped_deal_accounts'").fetchone() is None
+        assert con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scoped_account_proofs'").fetchone() is None
 
         # The shadow-only table, by contrast, has exactly the one row.
         assert con.execute("SELECT count(*) FROM shadow_scope_bindings").fetchone()[0] == 1
@@ -224,16 +221,6 @@ def test_shadow_scope_read_back_matches_stored_row(tmp_path):
         row = dict(con.execute("SELECT * FROM shadow_scope_bindings WHERE deal_id='DQA9Q'").fetchone())
         assert row["source_provenance"] == "authenticated_legacy_orders"
         assert row["source_sim"] == 0
-    finally:
-        con.close()
-
-
-def test_ensure_scoped_accounting_schema_is_idempotent_and_inert(tmp_path):
-    con, _ = _materialized(tmp_path)
-    try:
-        scope_bridge.ensure_scoped_accounting_schema(con)
-        scope_bridge.ensure_scoped_accounting_schema(con)  # repeat: must not raise
-        assert scoped_accounting.deal_scope(con, "DQA9Q") is None
     finally:
         con.close()
 

@@ -26,14 +26,9 @@ path reads.
   (see ``_SHADOW_DDL`` below), created by this module and read only by this
   module's own helpers and its tests. Grep the tree: no other module names
   that table.
-- ``ensure_scoped_accounting_schema()`` below does call the *real*
-  ``scoped_accounting.migrate()``. That is deliberate and safe: it only
-  installs the (already-written, already-tested, currently never-invoked)
-  scoped_accounting DDL with ``CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS``, and
-  ``scoped_accounting.deal_scope()`` returns ``None`` for every deal as long
-  as ``scoped_deal_accounts`` has no row for it -- which stays true forever
-  unless something calls ``bind_deal()``, which this module never does. See
-  that function's docstring for the full argument.
+- It does not call ``scoped_accounting.migrate()``. Shadow observation must
+  not add the future authoritative accounting schema to a live database: that
+  migration and any activation remain a separate owner-approved cutover.
 
 Callers (currently: ``adapters/execution_scope.py``'s legacy-binding paths)
 must treat every function here as best-effort: wrap calls in
@@ -139,21 +134,6 @@ def to_proven_scope(binding: Mapping[str, Any]) -> ProvenScope:
                             proof_kind=_PROOF_KIND, proof_ref=proof_ref, version=1)
     except scoped_accounting.ScopedAccountingError as exc:
         raise ScopeBridgeError(f"converted scope failed ProvenScope validation: {exc}") from exc
-
-
-def ensure_scoped_accounting_schema(con, *, now: float | None = None) -> None:
-    """Install the real (still-dormant) M4 scoped_accounting schema, if it is missing.
-
-    Safe and additive: delegates to ``scoped_accounting.migrate()``, which only issues
-    ``CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS`` and is documented not to touch
-    ``store.SCHEMA_VERSION``. This does not bind any deal and does not change
-    ``scoped_accounting.deal_scope()``/``accounting.is_bound()`` for any deal: both still
-    require a row in ``scoped_deal_accounts``, and nothing in this module (or anywhere else
-    right now) writes one. Per the M4 real-data replay report, these tables do not exist on
-    production today -- ``scoped_accounting.migrate()`` has never been called outside tests --
-    so this closes that specific gap without activating anything.
-    """
-    scoped_accounting.migrate(con, now=now)
 
 
 _SHADOW_DDL = (

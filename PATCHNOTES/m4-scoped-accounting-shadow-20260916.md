@@ -190,3 +190,17 @@ approval` будет принято, `bind_draft()` тоже потребует 
 - Не трогал `.env`/ключи/секреты; ничего из них не печатал.
 - Не открывал и не писал в боевой `trade.db` на VPS ни разу.
 - `owner.toml`: новых денежных параметров/порогов/флагов нет — добавлять было нечего.
+
+## Дополнение Codex — изоляция schema side effect, 16.09.2026
+
+При независимом merge-review обнаружено, что прежний shadow hook всё же вызывал
+`scoped_accounting.migrate()` и создавал будущие авторитетные accounting-таблицы
+на live DB. Хотя он не вызывал `bind_deal()` и не переключал reader, это не
+соответствовало строгому режиму shadow-only.
+
+`ensure_scoped_accounting_schema()` удалён из hook и больше не вызывается.
+Shadow bridge создаёт только собственную append-only таблицу
+`shadow_scope_bindings`; scoped schema и её будущая активация остаются отдельным
+владельческим решением. Профиль: `tests/test_scope_bridge.py`,
+`tests/test_m4_execution_scope.py`, `tests/test_m4_real_data_replay.py` —
+59 passed. Production этим дополнением не менялся.

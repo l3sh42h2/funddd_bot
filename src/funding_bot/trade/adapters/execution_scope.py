@@ -227,7 +227,6 @@ def _shadow_bridge_installed(con, deal):
             return
         from .. import scope_bridge
         binding = {**saved, 'deal_id': deal['id']}
-        scope_bridge.ensure_scoped_accounting_schema(con)
         scope_bridge.record_shadow_binding(con, binding)
     except Exception as exc:                                     # noqa — shadow-only, never blocks real execution
         log.warning('scope_bridge: shadow binding step failed for deal %s (non-fatal): %s',
