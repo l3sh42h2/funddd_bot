@@ -233,6 +233,13 @@ class Outbox:
         return self._emit(dict(kind='final_report', dto_version=EXECUTION_REPORT_VERSION,
                                chat_id=chat_id, snapshot=encode(asdict(snapshot)), solana=type(snapshot) is SolFinalView))
 
+    def execution_notice(self, chat_id, topic, facts):
+        from ..ipc.notifications import EXECUTION_NOTICE_VERSION, validate_execution_notice
+        from ..ipc.reports import encode
+        validate_execution_notice(topic, facts)
+        return self._emit(dict(kind='execution_notice', dto_version=EXECUTION_NOTICE_VERSION,
+                               chat_id=chat_id, topic=topic, facts=encode(facts)))
+
     def positions_report(self, chat_id, snapshots, *, at, matched, mismatch, sim):
         from dataclasses import asdict
         from ..ipc.notifications import DTO_VERSION, GENERIC_POSITION_VERSION

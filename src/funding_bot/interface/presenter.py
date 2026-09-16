@@ -1,5 +1,5 @@
 """Render durable domain notifications at the interface boundary."""
-from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_POSITION_VERSION, APPROVAL_REASONS
+from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_POSITION_VERSION, EXECUTION_NOTICE_VERSION, APPROVAL_REASONS
 from ..ipc.protocol import RpcError
 
 
@@ -8,11 +8,16 @@ def present(event, *, transport_health=None):
     if kind in ('send', 'edit', 'answer'):
         return event  # Already queued legacy messages remain deliverable.
     expected = EXECUTION_REPORT_VERSION if kind == 'final_report' else DTO_VERSION
+    if kind == 'execution_notice':
+        expected = EXECUTION_NOTICE_VERSION
     if kind == 'positions_report' and event.get('dto_version') == GENERIC_POSITION_VERSION:
         expected = GENERIC_POSITION_VERSION
     if type(event.get('dto_version')) is not int or event['dto_version'] != expected:
         raise RpcError('unsupported_notification_version')
     from ..tg import views
+    if kind == 'execution_notice':
+        return dict(kind='send', chat_id=event['chat_id'], text=render_execution_notice(event['topic'], event['facts']), html=True,
+                    silent=event['topic'] == 'progress')
     if kind == 'final_report':
         from ..ipc.reports import decode, FinalView, SolFinalView
         if type(event.get('solana', False)) is not bool:
@@ -91,3 +96,21 @@ def present(event, *, transport_health=None):
                     text=views.plan_closed(event['action'], head.title, event['at'], head.sim),
                     html=True, reply_markup=None)
     raise RpcError('unsupported_notification')
+
+
+def render_execution_notice(topic, encoded_facts):
+    """Renderer used only by interface and the legacy Telegram compatibility bot."""
+    from ..ipc.notifications import validate_execution_notice
+    from ..ipc.reports import decode
+    from types import SimpleNamespace
+    facts = decode(encoded_facts)
+    validate_execution_notice(topic, facts)
+    from ..tg import views
+    if topic == 'executor_crash':
+        return views.executor_crash(facts['intent_id'], facts['error'])
+    if topic == 'refused':
+        return views.refused(facts['reason'])
+    if topic == 'auto_unwind':
+        return views.auto_unwind(facts['coin'], facts['qty'], facts['usd'], facts['sim'])
+    renderers = {'halt': views.halt, 'progress': views.progress, 'perp_closed': views.perp_closed, 'fix_done': views.fix_done}
+    return renderers[topic](SimpleNamespace(**facts))

@@ -60,6 +60,23 @@ def test_dto_fence_commits_with_event_and_prevents_older_rollback(tmp_path):
     assert not job.compatible_reader(old, job.database_info(tmp_path/'trade.db'))
 
 
+def test_execution_notice_crosses_core_without_html_and_renders_at_interface(tmp_path):
+    from funding_bot.ipc.notifications import EXECUTION_NOTICE_VERSION
+    out = Outbox(Journal(Conns(tmp_path/'trade.db')))
+    facts = dict(intent_id='I1', kind='entry', coin='<A>', clip=1, clips=2,
+                 spot_usd=D('2'), spot_qty=D('1'), spot_avg=D('2'), perp_qty=D('1'), perp_usd=D('2'),
+                 perp_avg=D('2'), imbalance_qty=D(0), imbalance_usd=D(0), gas_usd=D('0.01'), fees_usd=D(0),
+                 note=None, sim=True, total_usd=D('4'), step=D('.1'), m=D(1))
+    out.execution_notice(42, 'progress', facts)
+    event = out.journal.notifications()[0]
+    assert event['dto_version'] == EXECUTION_NOTICE_VERSION and 'text' not in event
+    assert event['facts']['coin'] == '<A>'
+    wire = present(event)
+    assert wire['kind'] == 'send' and wire['silent'] is True and '&lt;A&gt;' in wire['text']
+    with pytest.raises(ValueError, match='invalid execution notice'):
+        out.execution_notice(42, 'progress', dict(facts, extra='not allowed'))
+
+
 def test_ui_retries_unrenderable_event_and_ack_restart_does_not_resend(tmp_path):
     sent = []
     events = [dict(id=1, kind='approval_reply', dto_version=999, callback_id='cb', reason='accepted')]

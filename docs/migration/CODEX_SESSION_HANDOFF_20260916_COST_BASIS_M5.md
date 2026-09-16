@@ -50,9 +50,10 @@ credentials.
 
 ## Known open work — do not mark accepted from this handoff
 
-- AC-07 remains open. `trade/engine.py` still creates HTML for refusal, plan,
-  execution progress and operational notices. Moving only the existing final
-  report or only `Hooks` would leave that boundary in the core.
+- AC-07 remains open. The later `m4-evm-execution-notice-dto-20260916` patch
+  moves EVM execution/recovery notifications to a facts-only DTO, but
+  `trade/engine.py` still creates HTML for desk/planning and some legacy
+  `Refused.html` paths.
 - AC-15 needs product approval of the basis policy and replay comparison with
   historical/legacy evidence before a report becomes authoritative.
 - M5 still needs a separate staging host for a true detached-systemd/SSH-loss,

@@ -181,6 +181,14 @@ class RecHooks(Hooks):
     def report(self, html):
         self.reports.append(html)
 
+    def notice(self, topic, facts):
+        from funding_bot.interface.presenter import render_execution_notice
+        text = render_execution_notice(topic, facts)
+        if topic == 'progress':
+            self.progresses.append((facts['intent_id'], text))
+        else:
+            self.reports.append(text)
+
     def final_report(self, snapshot):
         self.reports.append(views.final(snapshot))
 

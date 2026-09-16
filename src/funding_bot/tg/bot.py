@@ -108,6 +108,14 @@ class BotHooks(Hooks):
     def report(self, html: str) -> None:
         self.bot.say(html)
 
+    def notice(self, topic: str, facts: dict) -> None:
+        from ..interface.presenter import render_execution_notice
+        text = render_execution_notice(topic, facts)
+        if topic == 'progress':
+            self.bot.progress(facts['intent_id'], text)
+        else:
+            self.bot.say(text)
+
     def final_report(self, snapshot) -> None:
         from ..ipc.reports import SolFinalView
         if type(snapshot) is SolFinalView:

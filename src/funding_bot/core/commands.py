@@ -93,6 +93,9 @@ class BotHooks(Hooks):
     def report(self, html: str) -> None:
         self.bot.say(html)
 
+    def notice(self, topic: str, facts: dict) -> None:
+        self.bot.execution_notice(topic, facts)
+
     def final_report(self, snapshot) -> None:
         chat = self.bot.chat()
         if chat is None:
@@ -399,6 +402,11 @@ class Bot:
         self.propose(chat, fn)
 
     # --- прогресс исполнения ---
+    def execution_notice(self, topic: str, facts: dict) -> None:
+        chat = self.chat()
+        if chat is not None:
+            self.sender.execution_notice(chat, topic, facts)
+
     def progress(self, iid: str, html: str) -> None:
         """Одно сообщение прогресса на намерение: первое — новое, дальше — правка не чаще TG_EDIT_MIN_S."""
         chat = self.chat()

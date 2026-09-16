@@ -1672,6 +1672,7 @@ class Hooks:
 
     def progress(self, iid: str, html: str) -> None: ...
     def report(self, html: str) -> None: ...
+    def notice(self, topic: str, facts: dict) -> None: ...
     def final_report(self, snapshot) -> None: ...
     def requote(self, iid: str, reason: str) -> None: ...
 
@@ -1829,7 +1830,7 @@ class Engine:
         except Exception as e:                 # noqa — исполнитель не умирает; сделка уже на паузе или не начата
             log.exception("исполнитель: %s", iid)
             try:
-                self.hooks.report(_views().executor_crash(iid, f"{type(e).__name__}: {redact(e)}"))
+                self.hooks.notice('executor_crash', {'intent_id': iid, 'error': f"{type(e).__name__}: {redact(e)}"})
             except Exception:                  # noqa
                 pass
         finally:
@@ -1860,7 +1861,7 @@ class Engine:
                 store.set_deal_state(con, deal['id'], DealState.PAUSED, reason='unresolved prerequisite')
             if not store.set_intent_status(con, iid, IntentStatus.FAILED, expect=expect, err=text):
                 raise store.StoreError('refusal CAS failed')
-        self.hooks.report(_views().refused(text))
+        self.hooks.notice('refused', {'reason': text})
 
     def _execute(self, iid: str) -> None:
         con = self.conns.get()
@@ -2219,17 +2220,14 @@ class Engine:
             self._unwind_due[run.did] = self.clock() + float(auto)
         done = con.execute("SELECT count(*) FROM clips WHERE intent_id=? AND state=?",
                            (run.iid, str(ClipState.BALANCED))).fetchone()[0]   # «после клипа 1/2», а не «на 2/2»
-        v = _views()
-        self.hooks.report(v.halt(v.HaltView(
+        self.hooks.notice('halt', dict(
             intent_id=run.iid, kind="entry" if run.kind == "entry" else "exit", coin=run.deal["coin"], reason=p.text,
             perp_venue=run.deal["perp_venue"], deal_id=run.did, clip=run.seq or None, clips=run.n_total or None,
             perp_pos=self._safe_pos(run), wallet_tokens=self._wallet_tokens(run, bk),
             unhedged_qty=unhedged, unhedged_usd=(abs(unhedged) * px_tok) if (unhedged is not None and px_tok) else None,
-            # «откачу сам в …» — только если откат действительно запланирован (то же условие, что у _unwind_due выше)
             auto_unwind_s=auto if (unhedged and unhedged >= ts and target == DealState.PAUSED) else None,
-            sim=run.legs.sim,
-            ts=self.clock(), clips_done=int(done), state=str(target), step=run.f.step,
-            m=getattr(bk, "m_view", bk.m))))
+            sim=run.legs.sim, ts=self.clock(), clips_done=int(done), state=str(target), step=run.f.step,
+            m=getattr(bk, "m_view", bk.m)))
 
     def _safe_pos(self, run: Run) -> D | None:
         try:
@@ -2263,8 +2261,8 @@ class Engine:
                 prop = self.desk.propose_fix("undo", did, chat=None)
                 if store.approve_intent(con, prop.intent_id, prop.nonce):
                     store.event(con, "auto_unwind", deal_id=did, intent_id=prop.intent_id)
-                    self.hooks.report(_views().auto_unwind(deal["coin"], dget((prop.plan.est or {}).get("delta")),
-                                                           prop.plan.leg_usd, bool(deal["sim"])))
+                    self.hooks.notice('auto_unwind', dict(coin=deal['coin'], qty=dget((prop.plan.est or {}).get('delta')),
+                                      usd=prop.plan.leg_usd, sim=bool(deal['sim'])))
                     self.execute(prop.intent_id)
             except (Refused, store.StoreError) as e:
                 log.warning("авто-откат %s не начат: %s", did, e)
@@ -2663,7 +2661,6 @@ class Engine:
         if run.n_total < 2:                    # один клип — прогресс не пишем: сразу придёт итог (C: штатное не пишем)
             return
         try:
-            v = _views()
             con = self.conns.get()
             fee = D(str(config.FEES_TAKER[run.legs.perp.venue]))
             pn = report.progress_numbers(kind="entry" if run.kind == "entry" else "exit",
@@ -2671,13 +2668,13 @@ class Engine:
                                          n_planned=run.n_total,
                                          txs=run.sim_txs if run.legs.sim else intent_txs(con, run.iid),
                                          native_px=run.legs.native_px(), fee_taker=fee, m=run.m)
-            self.hooks.progress(run.iid, v.progress(v.ProgressView(
+            self.hooks.notice('progress', dict(
                 intent_id=run.iid, kind="entry" if run.kind == "entry" else "exit", coin=run.deal["coin"],
                 clip=run.seq, clips=run.n_total, spot_usd=pn["dex_usd"], spot_qty=pn["dex_tokens"],
                 spot_avg=pn["dex_avg_px"], perp_qty=pn["perp_qty"], perp_usd=pn["perp_quote"],
                 perp_avg=pn["perp_avg_px"], imbalance_qty=pn["imbalance"], imbalance_usd=pn["imbalance_usd"],
                 gas_usd=pn["gas_usd"], fees_usd=pn["commission_usd"], sim=run.legs.sim, total_usd=run.plan.leg_usd,
-                step=run.f.step, m=run.mv)))
+                note=None, step=run.f.step, m=run.mv))
         except Exception as e:                 # noqa — отчёт не ломает исполнение
             log.warning("прогресс %s: %s", run.iid, redact(e))
 
@@ -2836,13 +2833,12 @@ class Engine:
             reason="перп закрыт, спот остался — «откат» продаст спот" if run.m_known else
                    "перп закрыт, спот остался — «выход» продаст спот"))
         after = deal_book(con, run.did)
-        v = _views()
         tokens = after.tokens(run.dec)
         avg = (hr.quote / hr.filled) if hr.filled else None       # оценка спота по цене откупа (за контракт)
-        self.hooks.report(v.perp_closed(v.PerpClosedView(
+        self.hooks.notice('perp_closed', dict(
             coin=run.deal["coin"], deal_id=run.did, qty=hr.filled, usd=hr.quote, spot_qty=tokens,
             spot_usd=(tokens * avg / run.m) if (tokens is not None and avg and run.m_known) else None,
-            step=run.f.step, sim=run.legs.sim, m=run.mv)))
+            step=run.f.step, sim=run.legs.sim, m=run.mv))
 
     # --- дохедж / откат ---
     def _deal_fix_state(self, run: Run) -> None:
@@ -2953,10 +2949,9 @@ class Engine:
             reason="сбалансировано" if new == DealState.PAUSED else None))
         what = noop or f"{side or 'DEX'} {qty} = {usd}"                  # журнал: сырые числа
         store.event(con, "fixed", deal_id=run.did, intent_id=run.iid, intent_kind=run.kind, what=what, state=str(new))
-        v = _views()
-        self.hooks.report(v.fix_done(v.FixDoneView(
+        self.hooks.notice('fix_done', dict(
             kind=run.kind, coin=run.deal["coin"], deal_id=run.did, state=str(new), qty=qty, usd=usd, side=side,
-            noop=noop, delta=bk.delta(run.dec) if bk.known else None, step=step, sim=run.legs.sim, m=bk.m_view)))
+            noop=noop, delta=bk.delta(run.dec) if bk.known else None, step=step, sim=run.legs.sim, m=bk.m_view))
 
     # --- итог ---
     def _backfill(self, run: Run) -> None:
