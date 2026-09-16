@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
 import pytest
 from funding_bot import cabinet, cli, config, serve
-from funding_bot.trade import store
+from funding_bot.trade import owner, store
 
 JSC = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc"
 LOGIN = "owner-test"
@@ -365,6 +365,28 @@ def test_csrf_origin_and_referer(tmp_path, monkeypatch):
     ck = login_ok(cab)
     r = cab.handle(rq("POST", "/cabinet/logout", {"Cookie": ck, "Host": H, "Origin": "https://evil.example"}))
     assert r.code == 403 and not is_form(cab.handle(rq("GET", "/cabinet", {"Cookie": ck})))   # сессия жива
+
+
+def test_cabinet_shows_readonly_trading_profiles_without_configuration_details(tmp_path):
+    class Cfg:
+        def profile_enabled(self, pid): return pid in (owner.LEGACY_PROFILE, owner.SOL_HL)
+        def profile_mode(self, pid): return "live" if pid == owner.LEGACY_PROFILE else "dry"
+        def profile_live_blockers(self, pid): return [] if pid == owner.LEGACY_PROFILE else ["secret-looking-detail"]
+    profiles = owner.profile_views(Cfg())
+    frag = cabinet.venues_fragment({"trading_profiles": profiles})
+    assert "OKX DEX · BSC" in frag and "Aster" in frag and "включена" in frag
+    assert "Hyperliquid" in frag and "не торгует" in frag and "режим dry" in frag
+    assert "secret-looking-detail" not in frag
+    # The fragment is part of the authenticated page and the JSON refresh payload.
+    cab = make_cab(tmp_path, db=tmp_path / "missing.db", clock=Clock(),
+                   env={"CABINET_LOGIN": LOGIN, "CABINET_PASS_HASH": HASH})
+    snap = {"now": T0, "deals": [], "drafts": 0, "err": None, "trading_profiles": profiles}
+    cab.snapshot_loader = lambda: snap
+    ck = login_ok(cab)
+    page = cab.handle(rq("GET", "/cabinet", {"Cookie": ck})).body.decode()
+    refresh = json.loads(cab.handle(rq("GET", "/cabinet/deals.json", {"Cookie": ck})).body)
+    assert "Торговые связки" in page and "включена" in refresh["venues_html"]
+
 
 
 # --- страница сделок ------------------------------------------------------------------------------------------

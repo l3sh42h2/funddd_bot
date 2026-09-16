@@ -347,6 +347,15 @@ class CoreService:
             if self.snapshotter is not None:
                 try:
                     snapshot = self.snapshotter(self.conns.get())
+                    # Веб-интерфейс получает только read-only DTO через IPC. Статус
+                    # связок строит core из owner.toml; интерфейс сам файл с торговыми
+                    # настройками не открывает.
+                    try:
+                        from ..trade.owner import profile_views
+                        snapshot["trading_profiles"] = profile_views(self.bot.owner_loader())
+                    except Exception:
+                        snapshot["trading_profiles"] = []
+                        snapshot["profiles_error"] = "статус торговых связок недоступен"
                     from ..ipc.values import encode
                     snapshot = encode(snapshot)
                     with self.snapshot_lock:

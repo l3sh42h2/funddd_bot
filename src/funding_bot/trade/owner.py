@@ -156,6 +156,42 @@ PROFILE_IDS = (LEGACY_PROFILE, *SOL_PROFILES, RH_GATE)
 # EVM-связки прежнего движка (спот OKX DEX × перп): профиль ↔ (сеть спота, площадка перпа)
 EVM_PROFILES = {LEGACY_PROFILE: ("bsc", "aster"), RH_GATE: ("robinhood", "gate")}
 EVM_PROFILE_OF = {v: k for k, v in EVM_PROFILES.items()}
+# Публичные подписи профилей. Это не перечень рынков коллектора, а единственный
+# источник правды о реально разрешённых торговых связках для кабинета владельца.
+PROFILE_LEGS = {
+    LEGACY_PROFILE: ("OKX DEX · BSC", "Aster"),
+    RH_GATE: ("OKX DEX · Robinhood", "Gate"),
+    SOL_HL: ("Solana DEX · Jupiter / OKX", "Hyperliquid"),
+    SOL_GATE: ("Solana DEX · Jupiter / OKX", "Gate"),
+    SOL_ASTER: ("Solana DEX · Jupiter / OKX", "Aster"),
+}
+
+
+def profile_views(cfg) -> list[dict[str, str | bool]]:
+    """Безопасная read-only проекция разрешений профилей для владельца.
+
+    Не возвращает адреса, имена переменных или перечень пустых полей: кабинет
+    должен отвечать на «какие биржи торгуются», а не раскрывать конфигурацию.
+    """
+    out = []
+    for profile_id in PROFILE_IDS:
+        spot, perp = PROFILE_LEGS[profile_id]
+        enabled, mode = cfg.profile_enabled(profile_id), cfg.profile_mode(profile_id)
+        blockers = cfg.profile_live_blockers(profile_id)
+        live = enabled and mode == "live" and not blockers
+        if live:
+            state, reason = "live", "разрешена"
+        elif not enabled:
+            state, reason = "off", "выключена владельцем"
+        elif mode != "live":
+            state, reason = mode, f"режим {mode}"
+        elif blockers:
+            state, reason = "blocked", "не настроена для live"
+        else:  # defensive: never label an unverified state as enabled for trading
+            state, reason = "blocked", "статус не подтверждён"
+        out.append(dict(id=profile_id, spot=spot, perp=perp, live=live, state=state, reason=reason))
+    return out
+
 # кошелёк EVM связки: старая — [wallets] bsc (как было); новые — подсекция схемы 2, чтобы замороженная копия
 # настроек сделок BSC не изменилась ни на ключ
 EVM_WALLET_KEY = {"bsc": "wallets.bsc", "robinhood": "wallets.rh_gate.evm_address"}

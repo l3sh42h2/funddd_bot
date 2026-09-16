@@ -512,6 +512,7 @@ CAB_CSS = """
 .hist th:first-child,.hist td:first-child{text-align:left}
 .hist th{color:var(--mut);font-weight:400;font-size:11px}
 .hist .tot{margin-top:4px}
+.venues{margin:14px 0 18px}.venues h2{font-size:15px;margin:0 0 7px}.venue{display:flex;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line);font-size:13px}.venue .pair{flex:1;margin:0}.venue .state{white-space:nowrap;font-weight:600}.venue .off{color:var(--mut)}.venue .on{color:var(--good)}
 """
 STYLE = BASE_CSS + CAB_CSS
 
@@ -552,6 +553,7 @@ JS = r"""
         if(tw) tw.scrollTop = open[id];
       }
       document.getElementById('sum').textContent = j.summary;
+      var venues = document.getElementById('venues'); if(venues) venues.innerHTML = j.venues_html;
       var u = document.getElementById('upd'); u.innerHTML = j.upd; times(u);
     }).catch(function(){});
   }
@@ -737,6 +739,25 @@ def summary_text(snap: dict) -> str:
     return s
 
 
+def venues_fragment(snap: dict) -> str:
+    """Статус поддерживаемых торговых связок из core DTO, не из публичной витрины рынков."""
+    profiles = snap.get("trading_profiles")
+    if not isinstance(profiles, list):
+        return '<section class="venues"><h2>Торговые связки</h2><div class="m">статус недоступен</div></section>'
+    rows = []
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        spot, perp, reason = (html.escape(str(p.get(k) or "—")) for k in ("spot", "perp", "reason"))
+        live = p.get("live") is True
+        status = "включена" if live else "не торгует"
+        rows.append(f'<div class="venue"><div class="pair">{spot} <span class="up">▲</span> | {perp} '
+                    f'<span class="dn">▼</span></div><span class="state {"on" if live else "off"}">{status}'
+                    f'<span class="s">{reason}</span></span></div>')
+    body = "".join(rows) or '<div class="m">статус торговых связок недоступен</div>'
+    return '<section class="venues"><h2>Торговые связки</h2>' + body + '</section>'
+
+
 def deals_fragment(snap: dict) -> str:
     if snap.get("err"):
         return f'<div class="empty r">{html.escape(snap["err"])}</div>'
@@ -749,7 +770,8 @@ def deals_page(snap: dict) -> Resp:
     body = (_HEAD.format('<form method="post" action="/cabinet/logout"><button class="btn" type="submit">выйти</button>'
                          '</form>') +
             f'<div class="sum"><span id="sum">{html.escape(summary_text(snap))}</span> · только просмотр · '
-            f'обновлено <span id="upd">{_t(snap["now"])}</span></div><div id="deals">{deals_fragment(snap)}</div>')
+            f'обновлено <span id="upd">{_t(snap["now"])}</span></div><div id="venues">{venues_fragment(snap)}</div>'
+            f'<div id="deals">{deals_fragment(snap)}</div>')
     return _html(200, _doc(body, script=True))
 
 
@@ -825,7 +847,7 @@ class Cabinet:
             return _json(401, {"error": "login"})
         snap = self.snapshot()
         return _json(200, {"ts": int(snap["now"]), "html": deals_fragment(snap), "summary": summary_text(snap),
-                           "upd": _t(snap["now"])})
+                           "venues_html": venues_fragment(snap), "upd": _t(snap["now"])})
 
     def login(self, req: Req) -> Resp:
         if not self.enabled:
