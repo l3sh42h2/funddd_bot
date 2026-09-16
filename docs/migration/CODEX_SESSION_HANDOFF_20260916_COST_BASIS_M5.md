@@ -1,7 +1,7 @@
 # Codex handoff — cost basis and M5 Linux evidence
 
 Branch: `codex/migration-m4-m5`  
-Candidate head: `2d3a002e0d44e90b7355255ce4c8f8b23af0d1eb`
+Candidate head at handoff update: `d4485e5f695bb8fd90ff51e1e0cbe496a0600cf8`
 
 ## Changes for review
 
@@ -38,7 +38,7 @@ PYTHONPATH=src:tests python3 -m pytest -q \
   tests/test_m4_leg_accounting.py -p no:cacheprovider
 ```
 
-Result: `35 passed in 0.25s`.
+Result after integration and the ambiguous-cash regression: `60 passed in 2.78s`.
 
 ### `2d3a002e0d44e90b7355255ce4c8f8b23af0d1eb` — M5 Linux evidence
 
