@@ -11,6 +11,7 @@ from ..ipc.protocol import Client, RpcError
 from ..market_snapshot import atomic_json
 from ..build_info import BUILD_ID
 from ..core.release import load_release
+from .progress_tracker import ProgressTracker
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class Interface:
         self.last_core = None
         self.inflight = set()
         self.inflight_lock = threading.RLock()
+        self.progress = ProgressTracker()  # intent_id -> message_id for progress/sol_progress edit-in-place
         self.boot_id = os.urandom(12).hex()
         self.release = load_release()
 
@@ -130,7 +132,7 @@ class Interface:
                 ev = present(ev, transport_health={
                     'sender_fails': getattr(self.sender, 'fails', 0),
                     'tg_last_ok_ago_s': time.time() - self.last_poll if self.last_poll is not None else None,
-                })
+                }, progress=self.progress)
             except Exception:
                 done(None)
                 raise
@@ -148,15 +150,32 @@ class Interface:
                     continue
                 done({})
             elif kind == 'send':
+                # progress_intent_id is set only for a first progress/sol_progress send (presenter.py); once
+                # Telegram hands back its message_id, ProgressTracker.resolved() both remembers it for the
+                # next stage's 'edit' and returns any newer text queued (as 'wait') while this was in flight,
+                # which we flush right away as one throttled edit instead of waiting for another notice.
+                track_iid = ev.get('progress_intent_id')
+                def on_sent(res, iid=track_iid):
+                    if iid is not None:
+                        message_id = res.get('message_id') if res else None
+                        pending = self.progress.resolved(iid, message_id)
+                        if pending is not None and message_id is not None:
+                            chat_id, text = pending
+                            self.sender.edit(chat_id, message_id, text, html=True, throttle=True)
+                    done(res)
                 ok = self.sender.send(ev['chat_id'], ev['text'], html=ev.get('html', True),
-                                      reply_markup=ev.get('reply_markup'), silent=ev.get('silent',False), on_done=done)
+                                      reply_markup=ev.get('reply_markup'), silent=ev.get('silent',False), on_done=on_sent)
                 if not ok:
-                    done(None)
+                    on_sent(None)
             elif kind == 'edit':
                 ok = self.sender.edit(ev['chat_id'], ev['message_id'], ev['text'], html=ev.get('html',True),
                                       reply_markup=ev.get('reply_markup'), throttle=ev.get('throttle',False), on_done=done)
                 if not ok:
                     done(None)
+            elif kind == 'noop':
+                # progress/sol_progress notice coalesced into an in-flight send's follow-up edit
+                # (presenter.py) — nothing to deliver, just ack so it is not re-read forever.
+                done({})
             else:
                 done(None)
                 raise RpcError('unsupported_notification')

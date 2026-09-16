@@ -40,8 +40,10 @@ EXECUTION_NOTICE_FIELDS = {
     'fix_done': frozenset(('kind', 'coin', 'deal_id', 'state', 'qty', 'usd', 'side', 'noop', 'delta', 'step', 'sim', 'm')),
     'sol_halt': frozenset(('kind', 'coin', 'deal_id', 'intent_id', 'reason', 'state', 'wallet_tokens', 'perp_pos',
                            'delta', 'delta_usd', 'need_qty', 'sim')),
-    # intent_id is routing only (which message to edit), like EVM 'progress' — sol_views.progress() never
-    # renders it into text.
+    # intent_id is routing only, never rendered into text (sol_views.progress() doesn't read it, like EVM
+    # 'progress'): interface.presenter.present()/ProgressTracker use it to find this intent's open progress
+    # message and edit it in place instead of sending a new one each stage — see
+    # interface/progress_tracker.py and PATCHNOTES/m4-progress-edit-in-place-20260916.md.
     'sol_progress': frozenset(('intent_id', 'kind', 'coin', 'fullcoin', 'stage', 'path', 'tokens', 'perp_qty', 'sim')),
 }
 

@@ -3,8 +3,22 @@ from ..ipc.notifications import (DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_
                                  EXECUTION_NOTICE_VERSION, PROPOSAL_VIEW_VERSION, APPROVAL_REASONS)
 from ..ipc.protocol import RpcError
 
+# Multi-stage execution notices for one intent_id: routed through a ProgressTracker (below) so repeat
+# stages edit the same Telegram message instead of sending a new one each time — see
+# interface/progress_tracker.py and PATCHNOTES/m4-progress-edit-in-place-20260916.md.
+PROGRESS_TOPICS = ('progress', 'sol_progress')
+# Topics that end a progress/sol_progress chain on the non-success path and carry intent_id — used to drop
+# its tracked message_id so ProgressTracker doesn't hold it forever. fix_done/perp_closed/final_report also
+# end a chain on the success path but carry no intent_id to key a drop by; the patchnote above explains why
+# that gap is still safe (bounded by ProgressTracker.max_tracked, and intent_id is never reused).
+PROGRESS_TERMINAL_TOPICS = ('halt', 'sol_halt', 'executor_crash')
 
-def present(event, *, transport_health=None):
+
+def present(event, *, transport_health=None, progress=None):
+    """progress: optional interface.progress_tracker.ProgressTracker. Routes PROGRESS_TOPICS to 'edit' (same
+    message) instead of always 'send' (new message) — see module notes above. None (the default; every
+    caller that doesn't pass one — tests, cli.py's render_execution_notice-only path) preserves the old
+    always-'send' behaviour exactly, so this parameter is purely additive."""
     kind = event.get('kind')
     if kind in ('send', 'edit', 'answer'):
         return event  # Already queued legacy messages remain deliverable.
@@ -19,8 +33,27 @@ def present(event, *, transport_health=None):
         raise RpcError('unsupported_notification_version')
     from ..tg import views
     if kind == 'execution_notice':
-        return dict(kind='send', chat_id=event['chat_id'], text=render_execution_notice(event['topic'], event['facts']), html=True,
-                    silent=event['topic'] in ('progress', 'sol_progress'))
+        topic = event['topic']
+        if progress is not None and topic in PROGRESS_TERMINAL_TOPICS:
+            iid = _decode_execution_facts(topic, event['facts']).get('intent_id')
+            if iid:
+                progress.forget(iid)
+        if progress is not None and topic in PROGRESS_TOPICS:
+            facts = _decode_execution_facts(topic, event['facts'])
+            text = _render_from_facts(topic, facts)
+            action, message_id = progress.route(facts['intent_id'], event['chat_id'], text)
+            if action == 'edit':
+                return dict(kind='edit', chat_id=event['chat_id'], message_id=message_id, text=text,
+                            html=True, throttle=True)
+            if action == 'wait':
+                # A first send for this intent_id is already in flight; ProgressTracker stashed this
+                # (newer) text to flush as an edit once resolved(). Nothing to deliver right now — 'noop'
+                # acks the notification so it is not re-read forever (Interface.deliver_once()).
+                return dict(kind='noop')
+            return dict(kind='send', chat_id=event['chat_id'], text=text, html=True, silent=True,
+                        progress_intent_id=facts['intent_id'])
+        return dict(kind='send', chat_id=event['chat_id'], text=render_execution_notice(topic, event['facts']),
+                    html=True, silent=topic in PROGRESS_TOPICS)
     if kind == 'final_report':
         from ..ipc.reports import decode, FinalView, SolFinalView
         if type(event.get('solana', False)) is not bool:
@@ -102,13 +135,18 @@ def present(event, *, transport_health=None):
     raise RpcError('unsupported_notification')
 
 
-def render_execution_notice(topic, encoded_facts):
-    """Renderer used only by interface and the legacy Telegram compatibility bot."""
+def _decode_execution_facts(topic, encoded_facts):
+    """Shared by render_execution_notice and present()'s progress/sol_progress routing (which needs
+    intent_id before it can render), so both see exactly the same decoded-and-validated facts."""
     from ..ipc.notifications import validate_execution_notice
     from ..ipc.reports import decode
-    from types import SimpleNamespace
     facts = decode(encoded_facts)
     validate_execution_notice(topic, facts)
+    return facts
+
+
+def _render_from_facts(topic, facts):
+    from types import SimpleNamespace
     from ..tg import views
     if topic == 'executor_crash':
         return views.executor_crash(facts['intent_id'], facts['error'])
@@ -134,6 +172,11 @@ def render_execution_notice(topic, encoded_facts):
         return sol_views.progress(SimpleNamespace(**facts))
     renderers = {'halt': views.halt, 'progress': views.progress, 'perp_closed': views.perp_closed, 'fix_done': views.fix_done}
     return renderers[topic](SimpleNamespace(**facts))
+
+
+def render_execution_notice(topic, encoded_facts):
+    """Renderer used only by interface and the legacy Telegram compatibility bot."""
+    return _render_from_facts(topic, _decode_execution_facts(topic, encoded_facts))
 
 
 def render_proposal_view(topic, encoded_facts):
