@@ -80,10 +80,37 @@ def rebuild(con, *, deal_id: str) -> dict[str, Any]:
     # same leg in an append-only journal.
     malformed_legs: dict[tuple[str, str], set[str]] = {}
     for _, fact in facts:
-        if fact.get("market_kind") != "spot":
-            continue
+        # The discriminator must be classified with `key` already in hand, not
+        # before it -- otherwise a damaged value is indistinguishable from a
+        # legitimate `perpetual` fact and silently understates an already-open
+        # leg instead of poisoning it (FINAL-03).
         key = (fact.get("leg_id"), fact.get("scope"))
-        if not all(isinstance(fact.get(k), str) and fact[k] for k in ("leg_id", "scope")):
+        has_key = all(isinstance(fact.get(k), str) and fact[k] for k in ("leg_id", "scope"))
+        if "market_kind" in fact:
+            market_kind = fact.get("market_kind")
+        else:
+            # No discriminator field at all: the shape of a journal row written
+            # before this field existed. Normalized to "spot" for the same
+            # reason leg_accounting._fact() already defaults a missing field to
+            # "spot" (`p.get("market_kind", "spot")`) -- a documented
+            # compatibility choice, not a silent guess. See PATCHNOTES/
+            # final-review-03-cost-basis-market-kind-fix-20260916.md. A
+            # present-but-null/empty/unknown value is never given this pass.
+            market_kind = "spot"
+        if market_kind == "perpetual":
+            continue  # legitimate non-spot fact: not part of spot cost basis
+        if market_kind != "spot":
+            # None, "", or any other value that is not a recognised
+            # discriminator is a damaged fact, not a legitimate perpetual one,
+            # and must not be dropped as if it were.
+            if not has_key:
+                malformed.append((None, FACT_KIND))
+                continue
+            malformed_legs.setdefault(key, set()).add("malformed_market_kind")
+            if key in legs:
+                _fail(legs[key], "malformed_market_kind")
+            continue
+        if not has_key:
             malformed.append((None, FACT_KIND))
             continue
         if (not all(isinstance(fact.get(k), str) and fact[k] for k in
