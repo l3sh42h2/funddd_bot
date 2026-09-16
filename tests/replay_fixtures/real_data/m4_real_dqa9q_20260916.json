@@ -1,0 +1,745 @@
+{
+  "approve_tx_hashes": [
+    {
+      "intent_id": "EEEMF",
+      "tx_hash": "0xa2828caf9b4e812314c8ebd76bf0cae9b6d1906c10d40e40fda367ec0148a6bc"
+    }
+  ],
+  "as_of_ms": 1789545775817,
+  "deal_id": "DQA9Q",
+  "family": "evm",
+  "fee_rate": null,
+  "marks": {
+    "native_quote": "708.67376172387150",
+    "perp_quote": "0.0409100",
+    "spot_quote": "0.04070429106994568988091937676"
+  },
+  "observation_ts": 1789545775.8165255,
+  "snapshot_version": 1,
+  "tables": {
+    "clips": [
+      {
+        "carry_in": "0",
+        "carry_out": "0.151005294831441679",
+        "created": 1789239552.1004035,
+        "dex_in": "200000000000000000000",
+        "dex_out": "4902151005294831441679",
+        "id": 1,
+        "intent_id": "EEEMF",
+        "perp_qty": "4902",
+        "perp_quote": "200.6388600",
+        "planned_in": "200000000000000000000",
+        "seq": 1,
+        "state": "BALANCED",
+        "updated": 1789239554.622714
+      }
+    ],
+    "deals": [
+      {
+        "carry": "0.151005294831441679",
+        "chain": "bsc",
+        "coin": "AIW3",
+        "created": 1789239533.0560975,
+        "dust": "0",
+        "id": "DQA9Q",
+        "inst_json": "{\"chain\":\"bsc\",\"contract_type\":null,\"ident_ev\":null,\"period_h\":\"1\",\"perp_base_asset\":\"AIW3\",\"perp_symbol\":\"AIW3USDT\",\"perp_venue\":\"aster\",\"px_ratio\":\"1.00322520323358725453960735\",\"quote_asset\":\"USDT\",\"schema\":1,\"source\":\"migration:verified_ratio\",\"spot_units_per_token\":\"1\",\"token\":\"0x37e94fc028903e74275478b65160d6d2c0e8880b\",\"token_dec\":18,\"units_per_contract\":\"1\",\"verified\":true,\"verified_ts\":1789307469.4197378,\"why\":null}",
+        "leg_usd": "200",
+        "perp_venue": "aster",
+        "sim": 0,
+        "state": "OPEN",
+        "symbol": "AIW3USDT",
+        "token": "0x37e94fc028903e74275478b65160d6d2c0e8880b",
+        "token_dec": 18,
+        "updated": 1789239556.139675
+      }
+    ],
+    "dex_txs": [
+      {
+        "amount_in": "200000000000000000000",
+        "amount_out": "4902151005294831441679",
+        "chain": "bsc",
+        "clip_id": 1,
+        "eff_gas_price": "71625000",
+        "gas_used": 220530,
+        "id": 2,
+        "kind": "swap",
+        "resolved_ts": 1789239553.9287126,
+        "sent_ts": 1789239552.7197773,
+        "state": "MINED_OK",
+        "status": 1,
+        "tx_hash": "0x4b5e73271da1c7fe3776223c0a29f0a89c068e0215548d4980f1192e3ab71764"
+      },
+      {
+        "chain": "bsc",
+        "eff_gas_price": "71625000",
+        "gas_used": 46506,
+        "id": 1,
+        "kind": "approve",
+        "resolved_ts": 1789239551.0775726,
+        "sent_ts": 1789239549.8234453,
+        "state": "MINED_OK",
+        "status": 1,
+        "tx_hash": "0xa2828caf9b4e812314c8ebd76bf0cae9b6d1906c10d40e40fda367ec0148a6bc"
+      }
+    ],
+    "funding_income": [
+      {
+        "income": "0.07284394",
+        "symbol": "AIW3USDT",
+        "tran_id": 512307518135460370,
+        "ts": 1789239600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06845065",
+        "symbol": "AIW3USDT",
+        "tran_id": 512458516351017200,
+        "ts": 1789243200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00249987",
+        "symbol": "AIW3USDT",
+        "tran_id": 512609507897630740,
+        "ts": 1789246800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06911785",
+        "symbol": "AIW3USDT",
+        "tran_id": 512760502631916480,
+        "ts": 1789250400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06908062",
+        "symbol": "AIW3USDT",
+        "tran_id": 512911497743690050,
+        "ts": 1789254000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06908062",
+        "symbol": "AIW3USDT",
+        "tran_id": 513062498308055780,
+        "ts": 1789257600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00250798",
+        "symbol": "AIW3USDT",
+        "tran_id": 513213487254201820,
+        "ts": 1789261200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00250921",
+        "symbol": "AIW3USDT",
+        "tran_id": 513364496249120860,
+        "ts": 1789264800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00250890",
+        "symbol": "AIW3USDT",
+        "tran_id": 513515478148833860,
+        "ts": 1789268400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00951538",
+        "symbol": "AIW3USDT",
+        "tran_id": 513666477329080900,
+        "ts": 1789272000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.04756079",
+        "symbol": "AIW3USDT",
+        "tran_id": 513817469211240180,
+        "ts": 1789275600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.07487204",
+        "symbol": "AIW3USDT",
+        "tran_id": 513968484875102260,
+        "ts": 1789279200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06916063",
+        "symbol": "AIW3USDT",
+        "tran_id": 514119460063928570,
+        "ts": 1789282800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00249885",
+        "symbol": "AIW3USDT",
+        "tran_id": 514270462222133600,
+        "ts": 1789286400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06749402",
+        "symbol": "AIW3USDT",
+        "tran_id": 514421450203586640,
+        "ts": 1789290000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06905233",
+        "symbol": "AIW3USDT",
+        "tran_id": 514572446112278300,
+        "ts": 1789293600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.08431536",
+        "symbol": "AIW3USDT",
+        "tran_id": 514723439252727780,
+        "ts": 1789297200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09137933",
+        "symbol": "AIW3USDT",
+        "tran_id": 514874438013544640,
+        "ts": 1789300800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00249599",
+        "symbol": "AIW3USDT",
+        "tran_id": 515025429308498950,
+        "ts": 1789304400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09504206",
+        "symbol": "AIW3USDT",
+        "tran_id": 515176425049415800,
+        "ts": 1789308000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09581455",
+        "symbol": "AIW3USDT",
+        "tran_id": 515327419699816610,
+        "ts": 1789311600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09596212",
+        "symbol": "AIW3USDT",
+        "tran_id": 515478421103042840,
+        "ts": 1789315200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10275509",
+        "symbol": "AIW3USDT",
+        "tran_id": 515629409084499690,
+        "ts": 1789318800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09485111",
+        "symbol": "AIW3USDT",
+        "tran_id": 515780403818784170,
+        "ts": 1789322400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10037212",
+        "symbol": "AIW3USDT",
+        "tran_id": 515931398511124680,
+        "ts": 1789326000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00249591",
+        "symbol": "AIW3USDT",
+        "tran_id": 516082398194688730,
+        "ts": 1789329600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00249591",
+        "symbol": "AIW3USDT",
+        "tran_id": 516233389657415960,
+        "ts": 1789333200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09406138",
+        "symbol": "AIW3USDT",
+        "tran_id": 516384383385069080,
+        "ts": 1789336800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09627574",
+        "symbol": "AIW3USDT",
+        "tran_id": 516535378161297330,
+        "ts": 1789340400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10324030",
+        "symbol": "AIW3USDT",
+        "tran_id": 516686381116416630,
+        "ts": 1789344000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09615728",
+        "symbol": "AIW3USDT",
+        "tran_id": 516837368217070090,
+        "ts": 1789347600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09574353",
+        "symbol": "AIW3USDT",
+        "tran_id": 516988363161069450,
+        "ts": 1789351200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.08864442",
+        "symbol": "AIW3USDT",
+        "tran_id": 517139358272842190,
+        "ts": 1789354800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.00250667",
+        "symbol": "AIW3USDT",
+        "tran_id": 517290357075600020,
+        "ts": 1789358400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06826799",
+        "symbol": "AIW3USDT",
+        "tran_id": 517441347573637680,
+        "ts": 1789362000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.04128277",
+        "symbol": "AIW3USDT",
+        "tran_id": 517592342937067540,
+        "ts": 1789365600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.03443631",
+        "symbol": "AIW3USDT",
+        "tran_id": 517743338468271610,
+        "ts": 1789369200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.03703277",
+        "symbol": "AIW3USDT",
+        "tran_id": 517894340039273090,
+        "ts": 1789372800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.03958438",
+        "symbol": "AIW3USDT",
+        "tran_id": 518045327811012930,
+        "ts": 1789376400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.07865845",
+        "symbol": "AIW3USDT",
+        "tran_id": 518196322545296410,
+        "ts": 1789380000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09516525",
+        "symbol": "AIW3USDT",
+        "tran_id": 518347317699010730,
+        "ts": 1789383600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10036557",
+        "symbol": "AIW3USDT",
+        "tran_id": 518498316753429020,
+        "ts": 1789387200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.15956005",
+        "symbol": "AIW3USDT",
+        "tran_id": 518649307251466440,
+        "ts": 1789390800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.12776303",
+        "symbol": "AIW3USDT",
+        "tran_id": 518800303831245550,
+        "ts": 1789394400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.14413382",
+        "symbol": "AIW3USDT",
+        "tran_id": 518951297684728200,
+        "ts": 1789398000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.14012793",
+        "symbol": "AIW3USDT",
+        "tran_id": 519102299423501030,
+        "ts": 1789401600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.14693786",
+        "symbol": "AIW3USDT",
+        "tran_id": 519253287027468650,
+        "ts": 1789405200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.07987878",
+        "symbol": "AIW3USDT",
+        "tran_id": 519404282307013020,
+        "ts": 1789408800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06895397",
+        "symbol": "AIW3USDT",
+        "tran_id": 519555277838213650,
+        "ts": 1789412400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.07129300",
+        "symbol": "AIW3USDT",
+        "tran_id": 519706276515144580,
+        "ts": 1789416000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.07037343",
+        "symbol": "AIW3USDT",
+        "tran_id": 519857266971239080,
+        "ts": 1789419600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.08378027",
+        "symbol": "AIW3USDT",
+        "tran_id": 520008262250783150,
+        "ts": 1789423200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10664159",
+        "symbol": "AIW3USDT",
+        "tran_id": 520159258285304230,
+        "ts": 1789426800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.16489837",
+        "symbol": "AIW3USDT",
+        "tran_id": 520310261156537750,
+        "ts": 1789430400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.15586029",
+        "symbol": "AIW3USDT",
+        "tran_id": 520461247879700740,
+        "ts": 1789434000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.14823326",
+        "symbol": "AIW3USDT",
+        "tran_id": 520612241523467430,
+        "ts": 1789437600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.10078802",
+        "symbol": "AIW3USDT",
+        "tran_id": 520763237641871930,
+        "ts": 1789441200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05117555",
+        "symbol": "AIW3USDT",
+        "tran_id": 520914236989892930,
+        "ts": 1789444800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.12324383",
+        "symbol": "AIW3USDT",
+        "tran_id": 521065227445987660,
+        "ts": 1789448400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.13192853",
+        "symbol": "AIW3USDT",
+        "tran_id": 521216222138327490,
+        "ts": 1789452000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05682400",
+        "symbol": "AIW3USDT",
+        "tran_id": 521367217040384390,
+        "ts": 1789455600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.02286416",
+        "symbol": "AIW3USDT",
+        "tran_id": 521518218737214100,
+        "ts": 1789459200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.04341834",
+        "symbol": "AIW3USDT",
+        "tran_id": 521669206425069270,
+        "ts": 1789462800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.22659324",
+        "symbol": "AIW3USDT",
+        "tran_id": 521820201327126550,
+        "ts": 1789466400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.17078225",
+        "symbol": "AIW3USDT",
+        "tran_id": 521971196732500110,
+        "ts": 1789470000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.13036216",
+        "symbol": "AIW3USDT",
+        "tran_id": 522122195912745150,
+        "ts": 1789473600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.12267262",
+        "symbol": "AIW3USDT",
+        "tran_id": 522273187081871920,
+        "ts": 1789477200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06138863",
+        "symbol": "AIW3USDT",
+        "tran_id": 522424181396728100,
+        "ts": 1789480800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.14490262",
+        "symbol": "AIW3USDT",
+        "tran_id": 522575176340726660,
+        "ts": 1789484400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.13854690",
+        "symbol": "AIW3USDT",
+        "tran_id": 522726177743955140,
+        "ts": 1789488000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.12530917",
+        "symbol": "AIW3USDT",
+        "tran_id": 522877165641525380,
+        "ts": 1789491600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.12155484",
+        "symbol": "AIW3USDT",
+        "tran_id": 523028161172727780,
+        "ts": 1789495200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09494798",
+        "symbol": "AIW3USDT",
+        "tran_id": 523179156368384220,
+        "ts": 1789498800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09222845",
+        "symbol": "AIW3USDT",
+        "tran_id": 523330155590574700,
+        "ts": 1789502400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09252699",
+        "symbol": "AIW3USDT",
+        "tran_id": 523481145123922540,
+        "ts": 1789506000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09693046",
+        "symbol": "AIW3USDT",
+        "tran_id": 523632141074555370,
+        "ts": 1789509600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.09926811",
+        "symbol": "AIW3USDT",
+        "tran_id": 523783135599124790,
+        "ts": 1789513200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06101472",
+        "symbol": "AIW3USDT",
+        "tran_id": 523934138260644000,
+        "ts": 1789516800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.04884817",
+        "symbol": "AIW3USDT",
+        "tran_id": 524085125487126370,
+        "ts": 1789520400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05572026",
+        "symbol": "AIW3USDT",
+        "tran_id": 524236120389183370,
+        "ts": 1789524000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05037476",
+        "symbol": "AIW3USDT",
+        "tran_id": 524387115123467320,
+        "ts": 1789527600000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05246023",
+        "symbol": "AIW3USDT",
+        "tran_id": 524538114848973340,
+        "ts": 1789531200000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06196163",
+        "symbol": "AIW3USDT",
+        "tran_id": 524689105095353840,
+        "ts": 1789534800000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05645678",
+        "symbol": "AIW3USDT",
+        "tran_id": 524840100626557090,
+        "ts": 1789538400000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.05708192",
+        "symbol": "AIW3USDT",
+        "tran_id": 524991094735094100,
+        "ts": 1789542000000,
+        "venue": "aster"
+      },
+      {
+        "income": "0.06843578",
+        "symbol": "AIW3USDT",
+        "tran_id": 525142097061070300,
+        "ts": 1789545600000,
+        "venue": "aster"
+      }
+    ],
+    "intents": [
+      {
+        "created": 1789239533.0593874,
+        "deal_id": "DQA9Q",
+        "id": "EEEMF",
+        "kind": "entry",
+        "status": "done"
+      }
+    ],
+    "perp_fills": [
+      {
+        "commission_abs": "0.06177155",
+        "commission_asset": "USDT",
+        "maker": 0,
+        "order_id": 2304696,
+        "price": "0.0409300",
+        "qty": "3773",
+        "quote_qty": "154.4288900",
+        "realized_pnl": "0",
+        "trade_id": 996225,
+        "ts": 1789239554450,
+        "venue": "aster"
+      },
+      {
+        "commission_abs": "0.01848398",
+        "commission_asset": "USDT",
+        "maker": 0,
+        "order_id": 2304696,
+        "price": "0.0409300",
+        "qty": "1129",
+        "quote_qty": "46.2099700",
+        "realized_pnl": "0",
+        "trade_id": 996226,
+        "ts": 1789239554450,
+        "venue": "aster"
+      }
+    ],
+    "perp_orders": [
+      {
+        "avg_price": "0.0409300",
+        "client_id": "fb-DQA9Q-e01-c1-a1",
+        "clip_id": 1,
+        "cum_quote": "200.6388600",
+        "executed_qty": "4902",
+        "id": 1,
+        "order_id": 2304696,
+        "reduce_only": 0,
+        "resolved_ts": 1789239554.6026032,
+        "sent_ts": 1789239554.2531865,
+        "side": "SELL",
+        "state": "FILLED",
+        "symbol": "AIW3USDT",
+        "venue": "aster"
+      }
+    ]
+  }
+}
