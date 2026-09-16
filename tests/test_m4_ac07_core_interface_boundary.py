@@ -39,9 +39,11 @@ def test_engine_and_sol_flow_never_render_html_for_refusals_and_plans():
     # plan_cli — единственная сознательная оговорка (см. docstring модуля выше и PATCHNOTES); всё до неё —
     # путь исполнителя владельца, который обязан отдавать только факты.
     engine_runtime_src = engine_src.split("# --- CLI `funding_bot plan`")[0]
-    # Только вызовы через _views()/_sv()/"v" (локальный алиас _views()/_sv() — единственный стиль обращения к tg
-    # в этом кодовом стиле, см. def _views()/_sv()) — не self.busy() (Engine — идёт ли исполнение сейчас) и не
-    # упоминания имён в docstring-прозе ("tg.views.PlanView" и т.п., без accessor перед именем не совпадёт).
+    # Только вызовы через "v" — локальный алиас trade/formatters.py (AC-07 formatter extraction, 16.09; раньше
+    # был _views()/_sv(), сам ленивый импорт tg убран — см. test_no_tg_import_outside_plan_cli ниже) — не
+    # self.busy() (Engine — идёт ли исполнение сейчас) и не упоминания имён в docstring-прозе ("tg.views.PlanView"
+    # и т.п., без accessor перед именем не совпадёт). formatters не знает про HTML вовсе, так что этот сет имён
+    # (рендер плана/отказа) он физически не может дать — паттерн остаётся на случай будущей регрессии.
     accessor = r'(?:_views\(\)|_sv\(\)|\bv)\.'
     forbidden_calls = ('refused', 'busy', 'owner_missing', 'owner_config_error', 'fix_plan', 'plan')
     forbidden_ctors = ('PlanView', 'FixPlanView', 'SolPlanView', 'SolHaltView', 'SolProgressView', 'FixDoneView')
@@ -56,6 +58,39 @@ def test_engine_and_sol_flow_never_render_html_for_refusals_and_plans():
     for name in ('hooks.report(', 'hooks.progress('):
         assert name not in engine_runtime_src, f'{name!r} остался в trade/engine.py — заменяется hooks.notice(...)'
         assert name not in sol_src, f'{name!r} остался в trade/sol_flow.py — заменяется hooks.notice(...)'
+
+
+def test_no_tg_import_outside_plan_cli():
+    """AC-07 закрыт буквально (ревью Codex 16.09, docs/migration/CODEX_REVIEW_CLAUDE_MIGRATION_20260916.md):
+    тест выше (test_engine_and_sol_flow_never_render_html_for_refusals_and_plans) проверял только, что через
+    _views()/_sv()/"v" не рендерится HTML — но сам факт ленивого импорта tg.views/tg.sol_views ради чистых
+    числовых форматтеров (num, pct, dur, tok, money(html=False), DEAL_STATE_LABEL, VENUE_LABEL и т.п.) оставался:
+    Codex указал, что это формально всё ещё нарушает «core не зависит от Telegram/presenters» (docs/
+    MIGRATION_ACCEPTANCE.md). Эти форматтеры перенесены в trade/formatters.py — чистый модуль без единого
+    упоминания Telegram/HTML (PATCHNOTES/m4-ac07-formatter-extraction-20260916.md); engine.py/sol_flow.py/
+    reconcile.py импортируют только его, обычным top-level импортом (скрывать больше нечего).
+
+    Проверяется весь каталог trade/ (рекурсивно, как в задаче), а не только engine.py/sol_flow.py — вдруг импорт
+    остался где-то ещё (он и был: trade/reconcile.py, тем же способом, до этого патча).
+    `trade/engine.py: plan_cli()` — единственная оставленная, документированная оговорка (см. её docstring и тест
+    выше): однопроцессный CLI-инструмент разработчика (`funding_bot plan`), core/interface границы здесь нет."""
+    import funding_bot.trade as trade_pkg
+    trade_dir = Path(trade_pkg.__file__).parent
+    tg_import = re.compile(r'_views\(\)|_sv\(\)|from funding_bot\.tg|from \.\.tg|from \.tg\b|^\s*import tg\b', re.M)
+    offenders = []
+    for py in sorted(trade_dir.rglob('*.py')):
+        src = py.read_text(encoding='utf-8')
+        if py.name == 'engine.py':
+            src = src.split("# --- CLI `funding_bot plan`")[0]   # plan_cli — документированное исключение ниже
+        for m in tg_import.finditer(src):
+            line_no = src.count('\n', 0, m.start()) + 1
+            offenders.append(f'{py.relative_to(trade_dir.parent)}:{line_no}: {m.group(0)!r}')
+    assert not offenders, f'lazy/top-level tg-импорт остался в trade/: {offenders}'
+    # plan_cli действительно единственное место — и оно действительно всё ещё импортирует tg (иначе оговорка в
+    # docstring выше врёт).
+    import funding_bot.trade.engine as engine_mod
+    plan_cli_src = _source(engine_mod).split("# --- CLI `funding_bot plan`")[1]
+    assert 'from ..tg import views' in plan_cli_src and 'from ..tg.sender import to_plain' in plan_cli_src
 
 
 def test_refused_proposal_notice_carry_no_html():

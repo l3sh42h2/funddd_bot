@@ -28,7 +28,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Invali
 from typing import Any, Callable, Mapping
 from .. import config
 from ..symbols import norm_symbol_factor
-from . import owner as owner_mod, planner, report, store, tconfig
+from . import formatters, owner as owner_mod, planner, report, store, tconfig
 from .keys import effective_mode, redact
 from .owner import OwnerCfg, OwnerConfigError, OwnerMissing
 from .ledger_flows import spot_quote_flows, perp_quote_flows
@@ -222,7 +222,7 @@ def unit_refusal(coin: str, symbol: str, *, m: D | None = None, allow_multiplier
     имени символа). База символа — другой актив — отказ всегда (разрешение владельца его не снимает); имя символа и
     биржа расходятся — отказ; m ≠ 1 без разрешения владельца (owner.toml [perp.aster] allow_contract_multiplier =
     true, _allow_multiplier) — отказ до любого действия, текст называет ключ."""
-    v = _views()
+    v = formatters
     norm, fac = _name_units(coin, symbol)
     if norm != coin.upper():
         raise Refused(f"контракт {symbol} — это {norm}, а не {coin}: другой актив, не торгую")
@@ -374,7 +374,7 @@ def legacy_instrument(con, deal: Mapping, now: float | None = None) -> Instrumen
         else:
             ratio = (qq / q) / ((D(din) / D(10) ** int(sdec)) / (D(dout) / D(10) ** dec))
             if not (D(1) / tconfig.UNIT_PX_RATIO_MAX <= ratio <= tconfig.UNIT_PX_RATIO_MAX):
-                why = f"цена контракта / цена токена = {_views().num(ratio, 4)} — единицы не сходятся"
+                why = f"цена контракта / цена токена = {formatters.num(ratio, 4)} — единицы не сходятся"
     ok = why is None
     source = "migration:verified_ratio" if ok else ("legacy:m_unknown" if m_bad else "legacy:unverified")
     return InstrumentSpec(chain=str(deal["chain"]), token=str(deal["token"]).lower(), token_dec=dec,
@@ -681,11 +681,6 @@ class PairInfo:
     venue: str = VENUE                          # площадка перпа пары (EVM-связки: aster | gate)
 
 
-def _views():
-    from ..tg import views            # чистые шаблоны; импорт здесь — trade не тянет tg при импорте модуля
-    return views
-
-
 def _calib_from(d: dict) -> planner.Calib:
     pts = tuple((D(str(a)), D(str(b))) for a, b in (d.get("points") or ()))
     return planner.Calib(kind=d["kind"], k=D(str(d["k"])), c0=D(str(d["c0"])), g=D(str(d["g"])),
@@ -757,7 +752,7 @@ class Desk:
         from ..operator_commands import EXIT_FMT
         from .runtime import profile_of_deal
         deal = self.resolve_deal(cmd.target)
-        v = _views()
+        v = formatters
         if not is_sol_deal(deal):
             if cmd.profile not in (None, owner_mod.LEGACY_PROFILE) or cmd.tokens is not None or cmd.usdc is not None:
                 raise Refused(f"сделка {deal['id']} — связки BSC/Aster, формат: {EXIT_FMT}")
@@ -826,7 +821,7 @@ class Desk:
                 raise Refused(topic='owner_missing', facts={'keys': list(e.keys), 'action': action}) from None
 
     def find_pair(self, coin: str, spot: str, perp: str, *, allow_multiplier: bool = False) -> PairInfo:
-        v = _views()
+        v = formatters
         dex, _, chain = spot.partition("·")
         venue = str(perp).strip().lower()
         chains = sorted(c for (c, vn) in owner_mod.EVM_PROFILE_OF if vn == venue)   # сети спота связок этого перпа
@@ -943,7 +938,7 @@ class Desk:
         по монете заново не выбираем; decimals с цепи и контракт с биржи обязаны совпасть с замороженными.
         carry0 — дельта сделки в токенах до плана («продолжить», перекотировка добора): при m ≠ 1 контракты клипов
         считаются с переносом, как у исполнителя (ревью 13.09, M1)."""
-        v = _views()
+        v = formatters
         cfg = cfg or self.cfg()
         sim = (self._pair_mode(cfg, *_cmd_cv(spot_s, perp_s)) != "live") if sim is None else sim
         if write_checks:
@@ -1007,7 +1002,7 @@ class Desk:
         """Спецификация инструмента входа (ревью 13.09, С1): m — с биржи (baseAsset exchangeInfo), база контракта —
         та же монета, множитель — только с разрешения владельца, а цена контракта / m ≈ цене токена на DEX
         (UNIT_PX_RATIO_MAX — единицы, не видные ни в имени, ни в baseAsset). Любое «не знаю» — отказ до свопа."""
-        v = _views()
+        v = formatters
         venue = v.VENUE_LABEL.get(pair.venue, pair.venue)
         fn = getattr(legs.perp, "instrument", None)
         pi, err = None, "нога не отдаёт контракт"
@@ -1037,7 +1032,7 @@ class Desk:
     def _entry_live_notes(self, cfg, legs: Legs, pair: PairInfo, bal: dict, total: int, usd: D, sdec: int,
                           plan: Plan | None = None) -> list[str]:
         """Предпроверки, которые в live — отказ, а в симуляции — заметка в плане."""
-        v = _views()
+        v = formatters
         notes = []
         vl = v.VENUE_LABEL.get(pair.venue, pair.venue)
         stn, nat = tconfig.STABLE_SYMBOL.get(pair.chain, "USDT"), tconfig.NATIVE_SYMBOL.get(pair.chain, "BNB")
@@ -1109,7 +1104,7 @@ class Desk:
             except (ValueError, InvalidOperation, AttributeError):
                 continue
         if used >= stop:
-            v = _views()
+            v = formatters
             raise Refused(f"дневной стоп: издержки сегодня {v.money(used, html=False)} ≥ {v.leg(stop)} — "
                                     "вход запрещён")
 
@@ -1190,7 +1185,7 @@ class Desk:
         m ≠ 1 (ревью 13.09, M2): частичный выход, который откупил бы весь шорт или оставил меньше шага·m токенов, —
         полный (план и шапка так и называют); to_full=False (перекотировка одобренного частичного у кнопки) — отказ,
         одобрено было другое. m не известен (M3) — только полный выход без сверки дельты (_plan_blind_exit)."""
-        v = _views()
+        v = formatters
         cfg = cfg or self.cfg()
         sim = bool(deal["sim"])
         if write_checks:
@@ -1305,7 +1300,7 @@ class Desk:
         """Полный выход сделки, у которой m не известен (ревью 13.09, M3): дельту ног в токенах не посчитать — план её
         не сверяет и выход на клипы не делит. Весь спот сделки (min журнала и кошелька) — одним свопом, затем весь шорт
         журнала (контракты) — BUY reduceOnly. Ни то, ни другое от m не зависит (как «выход перп» и откат)."""
-        v = _views()
+        v = formatters
         dec, stable = int(deal["token_dec"]), ctx["stable"]
         lim = _lim(cfg, deal)
         fee = D(str(config.FEES_TAKER[legs.perp.venue]))
@@ -1372,7 +1367,7 @@ class Desk:
 
     # --- дохедж / откат / продолжить ---
     def _deficit(self, deal: dict) -> tuple[Legs, DealBook, Any, D]:
-        v = _views()
+        v = formatters
         legs = self._deal_legs(deal)
         bk = deal_book(self.conns.get(), deal["id"])
         if not bk.known:
@@ -1382,7 +1377,7 @@ class Desk:
 
     def propose_fix(self, kind: str, target: str, chat: int | None) -> Proposal:
         """«дохедж <id>» (перп на голую часть) и «откат <id>» (продать голый лонг на DEX) — тоже только кнопкой."""
-        v = _views()
+        v = formatters
         cfg = self.cfg()
         deal = self.resolve_deal(target)
         if is_sol_deal(deal):
@@ -1453,7 +1448,7 @@ class Desk:
     def propose_resume(self, target: str, chat: int | None) -> Proposal | Notice:
         """«продолжить <id>»: HALTED_MISMATCH — сверка и (если сошлось) PAUSED; иначе свежий план на остаток
         прерванного входа или выхода. Сам исполнитель ничего не продолжает."""
-        v = _views()
+        v = formatters
         deal = self.resolve_deal(target)
         if is_sol_deal(deal):
             return self.sol().propose_resume(deal, chat)
@@ -1520,7 +1515,7 @@ class Desk:
         """«продолжить» прерванного частичного выхода (ревью 13.09, Н1): остаток = цель прерванного намерения в токенах −
         продано им. Каждое звено хранит свою цель, у кнопки её не пересчитывают — по цепочке это цель корня − Σ продаж.
         Частичный остаётся частичным (all=False); полный выход идёт веткой spec.all и остаётся полным."""
-        v = _views()
+        v = formatters
         cfg = self.cfg()
         sim = bool(deal["sim"])
         self._common_checks(cfg, sim, "выход", *_deal_cv(deal))
@@ -2037,7 +2032,7 @@ class Engine:
             self.hooks.notice('refused', {'reason': f"перекотировка: инструмент {run.deal['coin']} сменился — "
                                           "ничего не отправлено, нужен новый план"})
             return None
-        v = _views()
+        v = formatters
         reasons = []
         drift = run.cfg.get("exec.plan_cost_drift_pct")
         old, new = dget(run.plan.est.get("total_pct")), dget(fresh.est.get("total_pct"))
@@ -2114,13 +2109,13 @@ class Engine:
             if reserve is not None:
                 nat = run.legs.spot.balances(run.token).get("native")
                 if nat is None or D(nat) < reserve * WEI:
-                    have = "не прочитан" if nat is None else _views().num(D(nat) / WEI, 4)
+                    have = "не прочитан" if nat is None else formatters.num(D(nat) / WEI, 4)
                     raise Pause("native", f"{tconfig.NATIVE_SYMBOL.get(ch, 'BNB')} {have} — меньше резерва "
-                                          f"{_views().num(reserve, 4)}")
+                                          f"{formatters.num(reserve, 4)}")
         if run.kind == "entry":
             cap = cfg.get("limits.deal_max_usd_per_leg")
             if cap is not None and D(str(run.deal["leg_usd"])) > cap:
-                v = _views()
+                v = formatters
                 raise Pause("limit", f"сумма сделки {v.leg(run.deal['leg_usd'])} больше нового лимита {v.leg(cap)}")
             f0 = dget(run.spec.get("funding_h"))
             if f0 is not None and f0 > 0:
@@ -2129,11 +2124,11 @@ class Engine:
                 except Exception as e:         # noqa
                     raise Pause("funding", f"фандинг не прочитан: {redact(e)}") from None
                 if rate <= 0:
-                    raise Pause("funding_sign", f"фандинг сменил знак: {_views().pct(rate * 100, 3, sign=True)} за "
+                    raise Pause("funding_sign", f"фандинг сменил знак: {formatters.pct(rate * 100, 3, sign=True)} за "
                                                 "интервал")
         tmax, t_auto = self._exec_time_max(run)
         if tmax is not None and self.clock() - run.started > float(tmax):
-            took = _views().dur(float(tmax))
+            took = formatters.dur(float(tmax))
             raise Pause("exec_time", f"исполнение дольше {took} (exec_time_max_s auto — число плана)" if t_auto
                         else f"исполнение дольше {took} (exec_time_max_s)")
         if invariant:
@@ -2179,7 +2174,7 @@ class Engine:
         bk = deal_book(self.conns.get(), run.did)
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
-        v = _views()
+        v = formatters
         if bk.m_known:
             delta, ts = bk.delta(run.dec), bk.tstep(run.f.step)
             if not (ZERO <= delta < ts):
@@ -2295,7 +2290,7 @@ class Engine:
         try:
             run.legs.perp.setup(run.symbol, int(lev), mt)
         except Exception as e:                 # noqa — настройка идемпотентна; сделок ещё нет
-            venue = _views().VENUE_LABEL.get(run.legs.perp.venue, run.legs.perp.venue)
+            venue = formatters.VENUE_LABEL.get(run.legs.perp.venue, run.legs.perp.venue)
             raise Pause("setup", f"настройка {run.symbol} на {venue}: {redact(e)}") from None
 
     def _approve(self, run: Run, token: str, need: int) -> None:
@@ -2446,7 +2441,7 @@ class Engine:
             if under:
                 partial += 1
                 if partial > tconfig.ASTER_IOC_PARTIAL_RETRIES:
-                    v = _views()
+                    v = formatters
                     return HedgeResult(filled, quote, "deficit",
                                        f"IOC исполнилась не полностью {partial} "
                                        f"{v.plural(partial, 'раз', 'раза', 'раз')} (кэп {v.px(cap0)}) — не хватает "
@@ -2513,7 +2508,7 @@ class Engine:
                     attempt += 1
                     continue
                 reason = "reduce_only_reject" if category == "reduce_only" else "perp_rejected"
-                v = _views()                   # владельцу: «Aster −2022», а не «aster -2022» (минус — «−»)
+                v = formatters                   # владельцу: «Aster −2022», а не «aster -2022» (минус — «−»)
                 c = "?" if code is None else str(code).replace("-", v.MINUS)
                 raise Pause(reason, f"{v.VENUE_LABEL.get(perp.venue, perp.venue)} {c}: "
                                     f"{getattr(perp, 'last_error', '') or 'отказ'}")
@@ -2709,7 +2704,7 @@ class Engine:
             raise Pause("limit", f"открытых сделок {n_open} из {mx} (max_open_deals) — вход не начинаю")
         cap = cfg.get("limits.deal_max_usd_per_leg")
         if cap is not None and D(str(run.deal["leg_usd"])) > cap:
-            v = _views()
+            v = formatters
             raise Pause("limit", f"сумма сделки {v.leg(run.deal['leg_usd'])} больше нового лимита {v.leg(cap)}")
         inst = deal_instrument(self.conns.get(), run.deal)
         if not inst.verified:                  # одобрено раньше, а m сделки не подтверждён (ревью 13.09, R6)
@@ -2876,7 +2871,7 @@ class Engine:
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         if not bk.m_known:                     # одобрено раньше, а m сделки теперь не известен (ревью 13.09, M3)
-            raise Pause("inst_unverified", f"{_views().m_unknown_text(run.did)} ({bk.inst_why}) — дохедж не отправляю")
+            raise Pause("inst_unverified", f"{formatters.m_unknown_text(run.did)} ({bk.inst_why}) — дохедж не отправляю")
         delta, step, m = bk.delta(run.dec), run.f.step, bk.m
         decision = Exposure(D(1), m, step).decide(bk.tokens(run.dec), bk.short, "rehedge")
         side, qty, ro = decision.side, decision.quantity, decision.reduce_only
@@ -2924,7 +2919,7 @@ class Engine:
         if not bk.known:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         if not bk.m_known:                     # авто-откат и одобренный раньше: дельта по m = 1 — голый шорт (M3)
-            raise Pause("inst_unverified", f"{_views().m_unknown_text(run.did)} ({bk.inst_why}) — откат не отправляю")
+            raise Pause("inst_unverified", f"{formatters.m_unknown_text(run.did)} ({bk.inst_why}) — откат не отправляю")
         delta, ts = bk.delta(run.dec), bk.tstep(run.f.step)
         if delta < ts:
             return self._settle_fix(run, noop="голого лонга нет — ничего не продано")
@@ -2991,7 +2986,7 @@ class Engine:
             # (последний клип выхода и так продаёт min(журнал, кошелёк)) — та же мера, что в reconcile.check_deal
             ts = bk.tstep(run.f.step)
             if int(wal) < bk.tokens_raw:
-                v = _views()
+                v = formatters
                 raise Pause("position_mismatch", f"в кошельке {v.tok(D(int(wal)) / D(10) ** run.dec, step=ts)} "
                                                  f"— меньше, чем по журналу сделки "
                                                  f"{v.tok(bk.tokens(run.dec), step=ts)} {run.deal['coin']}")
@@ -3168,10 +3163,11 @@ def plan_cli(coin: str, spot: str, perp: str, usd: D, *, owner_path=None, db_pat
     Единственное место в этом модуле, где рендер плана в текст остаётся рядом с Desk: это не путь исполнителя —
     отдельная команда `funding_bot plan` в один процесс, без core/interface IPC (AC-07 — про границу процессов)."""
     from types import SimpleNamespace
+    from ..tg import views as _tg_views      # исключение AC-07: однопроцессный CLI, границы core/interface нет
     from ..tg.sender import to_plain
     cfg = owner_mod.load(owner_path)
     conns = Conns(db_path)
     rt = runtime or build_runtime(cfg, conns, mode="dry")
     desk = Desk(conns, lambda sim: rt.sim if sim else None, owner_loader=lambda: cfg, table_loader=table_loader)
     plan, ctx = desk.plan_entry(coin, spot, perp, usd, cfg=cfg, sim=True, write_checks=False)
-    return to_plain(_views().plan(SimpleNamespace(**desk.plan_view("—", plan, ctx))))
+    return to_plain(_tg_views.plan(SimpleNamespace(**desk.plan_view("—", plan, ctx))))

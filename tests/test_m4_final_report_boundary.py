@@ -57,15 +57,19 @@ def test_final_dto_fence_is_atomic_monotonic_and_rejects_old_reader(tmp_path):
 
 
 def test_final_core_does_not_invoke_renderer(tmp_path,monkeypatch):
+    """core-final (_final) must never touch the Telegram presenter. Until 16.09 this was enforced by hijacking
+    engine._views (the lazy tg.views accessor) mid-call so any access would raise. That shared accessor is gone
+    now: engine.py/sol_flow.py import only the pure trade/formatters.py (AC-07 formatter extraction,
+    PATCHNOTES/m4-ac07-formatter-extraction-20260916.md) and reach `tg` only from plan_cli's own local import,
+    which _final() cannot reach. The stronger, static guarantee — no `tg` import anywhere in engine.py/sol_flow.py
+    outside plan_cli — is asserted once for the whole file by
+    test_m4_ac07_core_interface_boundary.py::test_no_tg_import_outside_plan_cli."""
     from test_m4_accounting_integration import final_run,bind,history
     import test_marks as legacy
-    from funding_bot.trade import engine,store
+    from funding_bot.trade import store
     con=store.connect(tmp_path/'trade.db')
     legacy.dqa9q(con);scope=bind(con);history(con,scope)
     worker,run=final_run(con,monkeypatch)
-    def forbidden():
-        raise AssertionError('core final accessed Telegram presenter')
-    monkeypatch.setattr(engine,'_views',forbidden)
     snapshot,cost,extra=worker._final(run,legacy.NOW,False)
     assert type(snapshot) is FinalView and snapshot.perp_qty==D(4902) and cost is not None
     assert extra['accounting_cost_revision']
@@ -97,17 +101,16 @@ def test_sol_final_wire_preserves_old_text_and_unknowns(tmp_path,kind,state,comp
 
 
 def test_actual_sol_final_does_not_access_presenter(tmp_path,monkeypatch):
+    """SOL final (_final) must never touch the presenter — same reasoning as
+    test_final_core_does_not_invoke_renderer above. sol_flow._sv (the lazy tg.sol_views accessor) is gone;
+    superseded by the static no-tg-import test (see that docstring)."""
     import sol_c2_world as w
     from funding_bot.trade import sol_flow
     from funding_bot.ipc.reports import SolFinalView
     original=sol_flow.SolEngine._final
     snapshots=[]
     def no_presenter(*args,**kwargs):
-        def forbidden():
-            raise AssertionError('SOL final accessed presenter')
-        with monkeypatch.context() as m:
-            m.setattr(sol_flow,'_sv',forbidden)
-            result=original(*args,**kwargs)
+        result=original(*args,**kwargs)
         assert type(result) is SolFinalView
         snapshots.append(result)
         return result

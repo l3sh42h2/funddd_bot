@@ -24,8 +24,8 @@ import json, logging, time
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from typing import Any, Mapping
-from . import hl_rules as R, instruments as I, planner, store, tconfig
-from .engine import (HedgeResult, Notice, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book,
+from . import formatters, hl_rules as R, instruments as I, planner, store, tconfig
+from .engine import (HedgeResult, Notice, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, deal_book,
                      deal_instrument, dget)
 from .exposure import Exposure
 from .operations import ClipLifecycle, OperationController, SpotSettlement
@@ -50,11 +50,6 @@ PREVIEW_COLLECT_S = 10.0      # срок сбора котировок, если
 BOOK_LEVELS = 20
 _UNKNOWN_REASONS = ("dex_unknown", "perp_unknown", "position_unknown", "book_unknown")
 _RISK_REASONS = ("hedge_deficit", "surplus", "reduce_only_reject", "position_mismatch", "error")
-
-
-def _sv():
-    from ..tg import sol_views
-    return sol_views
 
 
 def _lim(cfg: OwnerCfg, name: str, profile: str = SOL_HL) -> Any:
@@ -583,7 +578,7 @@ class SolDesk:
 
     @staticmethod
     def others(dec, winner) -> tuple[str, ...]:
-        sv = _sv()
+        sv = formatters
         out = []
         for x in dec.ranked:
             c = x.cand
@@ -593,7 +588,7 @@ class SolDesk:
                 wm = next((y.metric for y in dec.ranked if y.cand is winner), None)
                 if wm:
                     d = (x.metric / wm - 1) * BPS if dec.side == "entry" else (1 - x.metric / wm) * BPS
-                    out.append(f"{sv.PATH_LABEL.get(c.path, c.path)}: хуже на {_views().pct(d / 100, 2)}")
+                    out.append(f"{sv.PATH_LABEL.get(c.path, c.path)}: хуже на {formatters.pct(d / 100, 2)}")
                     continue
             r = next((r for r in c.reasons if not r.startswith("limit_missing")), c.reasons[0] if c.reasons else "")
             out.append(f"{sv.PATH_LABEL.get(c.path, c.path)}: {sv.reason(r)}")
@@ -608,7 +603,7 @@ class SolDesk:
                "verified_source": "подтверждено источником"}.get(inst.identity_status)
         if who is None:
             return None
-        return f"mint {_sv().short_mint(inst.token)} ↔ {inst.perp_symbol}: {who} до {str(inst.identity_expires_at)[:10]}"
+        return f"mint {formatters.short_mint(inst.token)} ↔ {inst.perp_symbol}: {who} до {str(inst.identity_expires_at)[:10]}"
 
     # --- вход ---
     def plan_entry(self, text: str, usdc: D, *, spot_policy: str = "auto", perp_dex: str | None = None,
@@ -639,7 +634,7 @@ class SolDesk:
         if write_checks:              # G04: одна незакрытая сделка на scope перпа; повторный вход — добор (выключен)
             for d in store.active_deals(con):
                 if d.get("perp_scope") == inst.perp_scope or (d["chain"] == inst.chain and d["token"] == inst.token):
-                    st = _views().DEAL_STATE_LABEL.get(d["state"], d["state"])
+                    st = formatters.DEAL_STATE_LABEL.get(d["state"], d["state"])
                     raise self.refuse(f"по {rec.display_symbol} уже есть сделка {d['id']} ({st}) — добор в пилоте "
                                       "выключен")
         for k in ("max_clip_usdc", "max_operation_usdc", "max_total_position_usdc"):
@@ -647,7 +642,7 @@ class SolDesk:
             if v is None:
                 notes.append(f"не задан {k}")
             elif usdc > v:
-                raise self.refuse(f"{_views().num(usdc)} USDC больше лимита {k} = {_views().num(v)} — один клип пилота")
+                raise self.refuse(f"{formatters.num(usdc)} USDC больше лимита {k} = {formatters.num(v)} — один клип пилота")
         # свежий mint против записи реестра (S03–S06): расхождение — отказ всегда; не прочитан — только live
         try:
             mm = I.mint_mismatches(rec, legs.spot.mint_value(inst.token))
@@ -697,7 +692,7 @@ class SolDesk:
             raise self.refuse(f"нет проверенного маршрута спота ({why}): {'; '.join(self.others(dec, None)) or '—'}")
         if dec.winner is None:
             notes.append("маршрут не прошёл бы в live: " + ", ".join(dict.fromkeys(
-                _sv().reason(r) for r in winner.reasons)))
+                formatters.reason(r) for r in winner.reasons)))
         book = perp.book(inst.perp_symbol, BOOK_LEVELS)
         if not book.bids or not book.asks:
             raise self.refuse(f"стакан {inst.perp_symbol} пуст — объём шорта неизвестен")
@@ -722,7 +717,7 @@ class SolDesk:
                                     surplus_tokens=surplus)
         except PlanRefused as e:
             raise self.refuse(str(e)) from None
-        v = _views()
+        v = formatters
         mb = _lim(cfg, "min_entry_basis_all_in_bps", self.profile)
         if rc.basis_all_in_bps is None:
             notes.append("курсовой с издержками неизвестен (расход или ставка перпа не известны)")
@@ -860,7 +855,7 @@ class SolDesk:
         sim = bool(deal["sim"])
         if write_checks:
             self.common(cfg, sim, "выход")
-        v = _views()
+        v = formatters
         if deal["state"] not in (DealState.OPEN, DealState.PAUSED):
             raise self.refuse(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])} — выход не "
                               "начинаю")
@@ -924,7 +919,7 @@ class SolDesk:
         notes = []
         if dec.winner is None:
             notes.append("маршрут не прошёл бы в live: " + ", ".join(dict.fromkeys(
-                _sv().reason(r) for r in winner.reasons)))
+                formatters.reason(r) for r in winner.reasons)))
         book = perp.book(inst.perp_symbol, BOOK_LEVELS)
         if not book.asks:
             raise self.refuse(f"аски {inst.perp_symbol} пусты — откуп шорта неизвестен")
@@ -1003,7 +998,7 @@ class SolDesk:
 
     # --- дохедж / откат / продолжить ---
     def propose_fix(self, kind: str, deal: Mapping, chat: int | None) -> Proposal:
-        v = _views()
+        v = formatters
         if kind != "rehedge":
             raise self.refuse(f"«откат» в пилоте выключен — «выход {deal['id']}» продаёт спот сделки и закрывает шорт")
         cfg = self.d.cfg()
@@ -1058,7 +1053,7 @@ class SolDesk:
         return Proposal(iid, nonce, deal["id"], "rehedge", 'fix_plan', facts, plan, superseded=tuple(superseded))
 
     def propose_resume(self, deal: Mapping, chat: int | None) -> Proposal | Notice:
-        v = _views()
+        v = formatters
         con = self.con
         if deal["state"] in (DealState.ABORTED, DealState.CLOSED):
             raise self.refuse(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])} — "
@@ -1389,7 +1384,7 @@ class SolEngine:
         filters (or its stricter native helpers), never from the SOL profile.
         Недобор — только разница по новой книге; UNKNOWN — settle_unknown по сохранённому cloid, повтор — только
         после доказанного «не выставлена». Попытки и срок — лимиты владельца."""
-        con, perp, cfg, v = self.con, run.legs.perp, run.cfg, _views()
+        con, perp, cfg, v = self.con, run.legs.perp, run.cfg, formatters
         store.set_clip_state(con, clip_id, ClipState.PERP_SENT)
         slip = _lim(cfg, "max_hedge_slippage_bps", run.inst.profile_id)
         if slip is None and not run.legs.sim:
@@ -1508,7 +1503,7 @@ class SolEngine:
             raise Pause("book_unknown", f"книга сделки неизвестна: {bk.why}")
         d = _delta(run.inst, bk.tokens(run.dec), bk.short)
         if not (ZERO <= d < _tokens_per_step(run.inst, run.step)):
-            raise Pause("hedge_deficit", f"дельта ног {_views().tok(d, True)} — вне [0, шаг)")
+            raise Pause("hedge_deficit", f"дельта ног {formatters.tok(d, True)} — вне [0, шаг)")
         if position and not run.legs.sim:
             pos = None
             for i in range(3):
@@ -1731,8 +1726,8 @@ class SolEngine:
             lim = _lim(cfg, "max_unhedged_ms", run.inst.profile_id)
             store.event(con, "unhedged", deal_id=run.did, intent_id=run.iid, ms=naked_ms, limit_ms=lim)
             if lim is not None and naked_ms > int(lim):
-                warn.append(f"нога была без хеджа {_views().dur(naked_ms / 1000)} — дольше лимита "
-                            f"{_views().dur(int(lim) / 1000)}")
+                warn.append(f"нога была без хеджа {formatters.dur(naked_ms / 1000)} — дольше лимита "
+                            f"{formatters.dur(int(lim) / 1000)}")
         hashes = self._perp_hashes(run)          # native finality links where the adapter exposes them
         pnl = None
         if new == DealState.CLOSED:              # итог сделки по накопительной книге (G10): каждое событие — один раз

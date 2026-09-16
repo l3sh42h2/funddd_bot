@@ -24,28 +24,24 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_EVEN
+from decimal import Decimal, ROUND_CEILING
 from typing import Any, Iterable, Mapping
 from ..trade import tconfig
 from .parse import Unknown, callback_data
 from .sender import escape, tx_link
+from ..trade.formatters import (
+    NBSP, MINUS, DASH, USD, CENT, VENUE_LABEL, DEAL_STATE_LABEL,
+    _d, _signed, num, money, _leg_num, leg, tok, px, pct, dur, plural, contracts, m_unknown_text,
+)
 
-NBSP = " "             # неразрывный пробел: число не переносится
-MINUS = "−"
-DASH = "—"
-USD = NBSP + "$"
-CENT = Decimal("0.01")
 SIM_MARK = "🧪"
 SIM_PREFIX = f"{SIM_MARK} <b>СИМУЛЯЦИЯ</b> · деньги не двигаются"
 
 CHAIN_LABEL = {"bsc": "BSC", "sol": "Solana", "rh": "Robinhood", "robinhood": "Robinhood"}
 NATIVE = {"bsc": "BNB", "sol": "SOL", "rh": "ETH", "robinhood": "ETH"}
-VENUE_LABEL = {"aster": "Aster", "binance": "Binance", "hyperliquid": "Hyperliquid", "gate": "Gate"}
 MODE_LABEL = {"dry": "симуляция", "readonly": "только чтение", "live": "live"}
 FIX_WORD = {"rehedge": "Дохедж", "undo": "Откат"}
-DEAL_STATE_LABEL = {"DRAFT": "черновик", "ENTERING": "входит", "PAUSED": "на паузе", "OPEN": "открыта",
-                    "EXITING": "выходит", "CLOSED": "закрыта", "ABORTED": "снята",
-                    "HALTED_MISMATCH": "остановлена: расхождение"}
+# DEAL_STATE_LABEL, VENUE_LABEL -- теперь в trade/formatters.py (AC-07, 16.09)
 # Причина паузы сделки — внутренний код (engine.Pause.reason); владельцу — по-русски
 REASON_LABEL = {"stop": "стоп владельца", "terminate": "остановка службы", "restart": "перезапуск",
                 "hedge_deficit": "перп не добран", "reduce_only_reject": "биржа отклонила reduceOnly",
@@ -121,61 +117,8 @@ def key_label(key: str) -> str:
 
 
 # --- форматирование чисел и времени (общие для views, движка и сверки) ------------------------------------
-def _d(v: Any) -> Decimal | None:
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, Decimal):
-        return v if v.is_finite() else None
-    try:
-        d = Decimal(repr(v)) if isinstance(v, float) else Decimal(str(v))
-    except (InvalidOperation, ValueError):
-        return None
-    return d if d.is_finite() else None
-
-
-def _signed(body: str, neg: bool, pos: bool, sign: bool) -> str:
-    return (MINUS if neg else ("+" if sign and pos else "")) + body
-
-
-def num(v: Any, places: int = 2, sign: bool = False) -> str:
-    """Число с places знаками, тысячи — неразрывным пробелом; None → «—»."""
-    d = _d(v)
-    if d is None:
-        return DASH
-    q = d.quantize(Decimal(1).scaleb(-places), ROUND_HALF_EVEN)
-    body = format(abs(q), f",.{places}f").replace(",", NBSP)
-    return _signed(body, q < 0, q > 0, sign)
-
-
 def usd(v: Any, places: int = 2, sign: bool = False) -> str:
     return num(v, places, sign)
-
-
-def money(v: Any, sign: bool = False, unit: bool = True, html: bool = True) -> str:
-    """Издержки, PnL, фандинг: 2 знака и « $». Меньше цента — «< 0.01 $», а не «0.00» (деньги были). html=False —
-    для текста, который потом ещё раз пройдёт escape() (отказы и причины паузы из движка)."""
-    d = _d(v)
-    if d is None:
-        return DASH
-    tail = USD if unit else ""
-    if d != 0 and abs(d) < CENT:
-        return _signed(("&lt;" if html else "<") + NBSP + "0.01", d < 0 and sign, d > 0, sign) + tail
-    return num(d, 2, sign) + tail
-
-
-def _leg_num(v: Any) -> str:
-    """Размер без «$»: целое — без копеек («200»), иначе 2 знака («199.50»)."""
-    d = _d(v)
-    if d is None:
-        return DASH
-    q = d.quantize(CENT, ROUND_HALF_EVEN)
-    return num(q, 0 if q == q.to_integral_value() else 2)
-
-
-def leg(v: Any) -> str:
-    """Размер ноги: «200 $», «199.50 $»."""
-    s = _leg_num(v)
-    return s if s == DASH else s + USD
 
 
 def about(v: Any) -> str:
@@ -184,35 +127,6 @@ def about(v: Any) -> str:
     if d is None:
         return DASH
     return num(d, 0) + USD if abs(d) >= 100 else money(d)
-
-
-def tok(v: Any, sign: bool = False, step: Any = None) -> str:
-    """Токены: целые с разрядами («4 902»); при шаге перпа меньше 1 — до его знаков; остаток меньше шага (или меньше 1,
-    если шаг неизвестен) — 2 значащие цифры («+0.15»)."""
-    d = _d(v)
-    if d is None:
-        return DASH
-    st = _d(step)
-    unit = st if (st is not None and 0 < st < 1) else Decimal(1)
-    if d != 0 and abs(d) < unit:
-        return num(d, max(2, 1 - d.adjusted()), sign)
-    return num(d, max(0, -unit.normalize().as_tuple().exponent), sign)
-
-
-def px(v: Any, sig: int = 4) -> str:
-    """Цена: sig значащих цифр без экспоненты, нули справа сохраняются (0.04080, 1.235, 64 210)."""
-    d = _d(v)
-    if d is None:
-        return DASH
-    if d == 0:
-        return "0"
-    return num(d, max(0, sig - 1 - d.adjusted()))
-
-
-def pct(v: Any, places: int = 2, sign: bool = False) -> str:
-    """Процент: «0.32 %», со знаком «+0.036 %»/«−0.06 %». Фандинг — places=3."""
-    s = num(v, places, sign)
-    return s if s == DASH else f"{s}{NBSP}%"
 
 
 def hm(ts: float | None) -> str:
@@ -228,22 +142,6 @@ def hms(ts: float | None, seconds: bool = False) -> str:
     return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%H:%M:%S" if seconds else "%H:%M") + " UTC"
 
 
-def dur(s: float | None) -> str:
-    """47 с · 3 мин · 3 ч 10 мин · 2 д 4 ч."""
-    if s is None:
-        return DASH
-    s = max(0, int(round(float(s))))
-    if s < 60:
-        return f"{s} с"
-    if s < 3600:
-        return f"{s // 60} мин"
-    if s < 86400:
-        h, m = divmod(s // 60, 60)
-        return f"{h} ч" + (f" {m} мин" if m else "")
-    d, h = divmod(s // 3600, 24)
-    return f"{d} д" + (f" {h} ч" if h else "")
-
-
 def hours(h: Any) -> str:
     """Окупаемость: меньше часа — минутами, до 48 ч — «3.9 ч», дальше — «5 д 2 ч»."""
     d = _d(h)
@@ -252,15 +150,6 @@ def hours(h: Any) -> str:
     if 1 <= d < 48:
         return f"{num(d, 1)} ч"
     return dur(float(d) * 3600)
-
-
-def plural(n: int, one: str, few: str, many: str) -> str:
-    n = abs(int(n))
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return few
-    return many
 
 
 def short_addr(a: str | None) -> str:
@@ -341,27 +230,10 @@ def _tstep(step: Any, m: Any) -> Any:
     return step if (s is None or k is None or k == 1 or k == 0) else s * k     # 0 — m не известен
 
 
-def contracts(q: Any, m: Any = None, sign: bool = False, step: Any = None, coin: str | None = None) -> str:
-    """Количество перпа. m = 1 (или неизвестен) — как токены: «4 902 AIW3» (C: тексты m = 1 прежние); m ≠ 1 —
-    «2 контр. (= 2 000 токенов)» (владелец 13.09: только важное; единица названа в скобках, монета не нужна)."""
-    k = _d(m)
-    if k is None or k == 1:
-        return tok(q, sign, step) + (f" {coin}" if coin else "")
-    d = _d(q)
-    if d is not None and k == 0:            # m не известен (ревью 13.09, M3): контракты без пересчёта в токены
-        return f"{tok(d, sign, step)} контр."
-    return DASH if d is None else f"{tok(d, sign, step)} контр. (= {tok(d * k, sign)} токенов)"
-
-
 def _m_unknown(m: Any) -> bool:
     """m = 0 в тексте — множитель контракта сделки не известен (engine.DealBook.m_view)."""
     k = _d(m)
     return k is not None and k == 0
-
-
-def m_unknown_text(did: str) -> str:
-    """Ревью 13.09, M3: m сделки не известен — дельта ног не считается, «дохедж»/«откат» не предлагаются."""
-    return f"множитель контракта не известен — только «выход {did}» целиком"
 
 
 def _m_unknown_cmd(did: str) -> str:
