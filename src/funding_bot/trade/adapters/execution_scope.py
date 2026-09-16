@@ -6,13 +6,16 @@ never sufficient to assign an old deal to an account.
 """
 import json
 import hashlib
+import logging
 from decimal import Decimal as D
 
 from .contracts import AdapterError, ErrorKind
 from .native_journal import exclusive_transaction
 from .. import store
+from ..keys import redact
 from ..types import InstrumentSpec
 
+log = logging.getLogger(__name__)
 KIND = 'execution_account_binding_v1'
 
 
@@ -201,12 +204,46 @@ def _install_legacy(con, candidate):
     return account
 
 
+def _shadow_bridge_installed(con, deal):
+    """Shadow-only M4 step (owner-directed, 16.09.2026): best-effort mirror of this deal's
+    execution_account_binding_v1 event into scope_bridge's own audit-only tables.
+
+    Must never affect the caller: every failure is caught and logged here, never raised.
+    Not a source of truth for anything -- scope_bridge.py never writes to
+    scoped_deal_accounts/scoped_account_proofs, so this cannot change
+    scoped_accounting.deal_scope()/accounting.is_bound() for any deal, and therefore cannot
+    change what engine.deal_fills()/accounting.sources()/marks.journal()
+    (cabinet/dashboard/tg) return. See scope_bridge.py and
+    PATCHNOTES/m4-scoped-accounting-shadow-20260916.md.
+
+    Safe to call whether or not a binding already existed before this process started (it
+    reads back whatever is currently persisted via _saved(), so it also opportunistically
+    backfills the shadow table for bindings written before this code existed, e.g. DQA9Q's
+    2026-09-15 binding).
+    """
+    try:
+        saved = _saved(con, deal)
+        if saved is None:
+            return
+        from .. import scope_bridge
+        binding = {**saved, 'deal_id': deal['id']}
+        scope_bridge.ensure_scoped_accounting_schema(con)
+        scope_bridge.record_shadow_binding(con, binding)
+    except Exception as exc:                                     # noqa — shadow-only, never blocks real execution
+        log.warning('scope_bridge: shadow binding step failed for deal %s (non-fatal): %s',
+                    deal['id'], redact(exc))
+
+
 def bind_legacy(con, deal, native):
     if _saved(con, deal):
-        return account_for(con, deal, native)
+        account = account_for(con, deal, native)
+        _shadow_bridge_installed(con, deal)
+        return account
     candidate = _legacy_candidate(con, deal, native)
     with exclusive_transaction(con):
-        return _install_legacy(con, candidate)
+        account = _install_legacy(con, candidate)
+    _shadow_bridge_installed(con, deal)
+    return account
 
 
 def prepare_active_accounts(con, legs_fn):
@@ -214,13 +251,14 @@ def prepare_active_accounts(con, legs_fn):
     from ..runtime import is_sol_deal, legs_of
     from .. import owner
     from ..evm import _addr
-    failures, candidates, active_evm = [], [], False
+    failures, candidates, active_evm, evm_deals = [], [], False, []
     snapshot = store.active_deals(con)
     for deal in snapshot:
         from ..generic_recovery import is_generic
         if deal['sim'] or is_sol_deal(deal) or is_generic(deal):
             continue
         active_evm = True
+        evm_deals.append(deal)
         try:
             inst = InstrumentSpec.from_json(deal['inst_json'])
             if not inst.verified:
@@ -248,3 +286,9 @@ def prepare_active_accounts(con, legs_fn):
             store.require_reader(con, 4)
         for candidate in candidates:
             _install_legacy(con, candidate)
+    # Shadow-only M4 step, deliberately outside the transaction above: it must never hold that
+    # transaction's exclusive lock open, and by this point `failures` is empty (or we would
+    # already have raised), so every deal in evm_deals is either freshly bound or was already
+    # bound. See _shadow_bridge_installed.
+    for deal in evm_deals:
+        _shadow_bridge_installed(con, deal)
