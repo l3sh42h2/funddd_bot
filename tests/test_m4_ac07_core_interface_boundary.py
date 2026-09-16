@@ -8,6 +8,7 @@ their facts reproduces byte-for-byte what the old inline views.* calls used to b
 `trade/engine.py`'s `plan_cli` (the `funding_bot plan` CLI command) is a deliberate, documented exception: it is
 a single-process developer tool with no core/interface split to keep a boundary across, so it still renders
 locally via tg.views (see PATCHNOTES/m4-ac07-full-core-interface-boundary-20260916.md)."""
+import ast
 import re
 from decimal import Decimal as D
 from pathlib import Path
@@ -76,15 +77,42 @@ def test_no_tg_import_outside_plan_cli():
     выше): однопроцессный CLI-инструмент разработчика (`funding_bot plan`), core/interface границы здесь нет."""
     import funding_bot.trade as trade_pkg
     trade_dir = Path(trade_pkg.__file__).parent
-    tg_import = re.compile(r'_views\(\)|_sv\(\)|from funding_bot\.tg|from \.\.tg|from \.tg\b|^\s*import tg\b', re.M)
+    accessor_re = re.compile(r'_views\(\)|_sv\(\)')
+
+    def plan_cli_line_range(src):
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == 'plan_cli':
+                return range(node.lineno, node.end_lineno + 1)
+        return range(0, 0)
+
     offenders = []
     for py in sorted(trade_dir.rglob('*.py')):
         src = py.read_text(encoding='utf-8')
-        if py.name == 'engine.py':
-            src = src.split("# --- CLI `funding_bot plan`")[0]   # plan_cli — документированное исключение ниже
-        for m in tg_import.finditer(src):
+        exempt = plan_cli_line_range(src) if py.name == 'engine.py' else range(0, 0)
+        for m in accessor_re.finditer(src):
             line_no = src.count('\n', 0, m.start()) + 1
-            offenders.append(f'{py.relative_to(trade_dir.parent)}:{line_no}: {m.group(0)!r}')
+            if line_no not in exempt:
+                offenders.append(f'{py.relative_to(trade_dir.parent)}:{line_no}: {m.group(0)!r}')
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if getattr(node, 'lineno', -1) in exempt:
+                continue
+            # Catches every spelling that can put the `tg` package name in scope, however indirectly:
+            # `import tg`/`import funding_bot.tg.views as V` (module path contains 'tg'), `from funding_bot
+            # import tg`/`from . import tg` (importing the name 'tg' itself), `from ..tg import views`/
+            # `from funding_bot.tg import views` (module path contains 'tg'). Deliberately broad — this
+            # codebase has no unrelated symbol literally named 'tg', so false positives aren't a real risk,
+            # and a broad net is exactly what a regression guard needs.
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if 'tg' in alias.name.split('.'):
+                        offenders.append(f'{py.relative_to(trade_dir.parent)}:{node.lineno}: import {alias.name!r}')
+            elif isinstance(node, ast.ImportFrom):
+                module_parts = node.module.split('.') if node.module else []
+                name_parts = {alias.name for alias in node.names}
+                if 'tg' in module_parts or 'tg' in name_parts:
+                    offenders.append(f'{py.relative_to(trade_dir.parent)}:{node.lineno}: from {node.module!r} import {sorted(name_parts)!r}')
     assert not offenders, f'lazy/top-level tg-импорт остался в trade/: {offenders}'
     # plan_cli действительно единственное место — и оно действительно всё ещё импортирует tg (иначе оговорка в
     # docstring выше врёт).
