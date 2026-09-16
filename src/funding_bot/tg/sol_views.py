@@ -11,35 +11,11 @@ from typing import Any
 from ..trade import tconfig
 from . import views as V
 from .sender import escape, tx_link
-
-PATH_LABEL = {"jupiter_build_v2": "Jupiter", "jupiter_order_v2": "Jupiter Order", "okx_solana_v6": "OKX"}
-# короткие причины исключения маршрута (коды spot_router); прочие — кодом как есть
-REASON_SHORT = {
-    "path_disabled": "выключен", "external_signer": "внешний подписант — только показ", "capability": "только показ",
-    "not_validated": "не проверен", "not_simulated": "не симулирован", "no_credentials": "нет ключа",
-    "deadline": "не успел к сроку", "stale": "котировка устарела", "rate_limited": "лимит запросов",
-    "limit_missing": "не задан лимит", "hedge_depth": "стакан HL не покрывает", "margin_insufficient": "мало маржи HL",
-    "margin_unknown": "маржа HL неизвестна", "price_impact_over_limit": "удар цены выше допуска",
-    "network_fee_over_cap": "сеть дороже лимита", "tip_forbidden": "tip запрещён", "no_route": "нет маршрута",
-    "simulation_failed": "симуляция упала", "fee_unknown": "расход неизвестен", "book_stale": "стакан HL устарел",
-    "auth": "ключ не принят", "quota": "квота", "http": "сеть", "error": "сбой", "schema": "ответ не по контракту",
-    "route_foreign_sol": "SOL уходит на чужой счёт",
-}
+from ..trade.formatters import PATH_LABEL, REASON_SHORT, reason, short_mint
 
 
 def route(path: str | None) -> str:
     return escape(PATH_LABEL.get(str(path or ""), str(path or V.DASH)))
-
-
-def reason(code: str) -> str:
-    c = str(code).split(":", 1)[0]
-    return REASON_SHORT.get(c, c)
-
-
-def short_mint(mint: str | None) -> str:
-    """«9cRC…pump» — mint как есть (регистр значим), середина скрыта."""
-    m = str(mint or "")
-    return m if len(m) <= 12 else f"{m[:4]}…{m[-4:]}"
 
 
 def links(sig: str | None, hl_hashes: tuple[str, ...] = ()) -> str | None:

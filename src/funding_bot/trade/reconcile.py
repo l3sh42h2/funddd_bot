@@ -27,7 +27,7 @@ from typing import Any, Callable
 from .ledger_flows import perp_quote_flows
 from .operations import OperationController, SpotSettlement
 from .. import config
-from . import marks, report, store, tconfig
+from . import formatters, marks, report, store, tconfig
 from .engine import DealBook, Legs, backfill_instruments, deal_book, dget
 from .keys import redact
 from .runtime import ProfileDown, is_sol_deal, legs_of
@@ -70,14 +70,9 @@ class DealCheck:
         return getattr(self.book, "m_view", getattr(self.book, "m", D(1)))
 
 
-def _v():
-    from ..tg import views            # общие форматтеры сообщений; импорт здесь — trade не тянет tg при импорте модуля
-    return views
-
-
 def _q(x, sign: bool = False, step=None) -> str:
     """Токены в тексте сверки — тем же форматтером, что в сообщениях: «4 902», без 18 знаков после точки."""
-    return _v().tok(x, sign, step)
+    return formatters.tok(x, sign, step)
 
 
 def _tokens_by_clip(con, deal: dict) -> dict[int, tuple[str, str]]:
@@ -278,7 +273,7 @@ def check_deal(con, deal: dict, legs: Legs | None, *, resolve: bool = True, seed
     delta = bk.delta(dec)
     hedged = None if step is None else bk.hedged(dec, step)
     coin = deal["coin"]
-    ctr = lambda q, sign=False: _v().contracts(q, bk.m_view, sign, step)    # noqa: E731 — шорт и позиция: контракты
+    ctr = lambda q, sign=False: formatters.contracts(q, bk.m_view, sign, step)    # noqa: E731 — шорт и позиция: контракты
     if legs.sim:
         if seed and bk.known:
             for obj, fn, args in ((legs.spot, "seed", (deal["token"], int(bk.tokens_raw))),
@@ -325,7 +320,7 @@ def check_deal(con, deal: dict, legs: Legs | None, *, resolve: bool = True, seed
 
 def _hedge_note(chk: DealCheck, coin: str, step: D | None = None) -> DealCheck:
     if not getattr(chk.book, "m_known", True):  # ревью 13.09, M3: без советов «дохедж»/«откат» — дельта не известна
-        chk.detail += f"; {_v().m_unknown_text(chk.deal_id)}"
+        chk.detail += f"; {formatters.m_unknown_text(chk.deal_id)}"
         return chk
     if chk.hedged is False and chk.delta is not None:
         side = "голый лонг" if chk.delta > 0 else "голый шорт"
@@ -827,7 +822,7 @@ def health_checks(rt, cfg, symbol: str | None = None) -> list[tuple[str, bool | 
             rows = perp.balances()
             usdt = next((r for r in rows if isinstance(r, dict) and r.get("asset") == "USDT"), None)
             add("Aster: подписанный баланс (вариант с user)", True,
-                f"USDT доступно {_v().num(usdt.get('availableBalance')) if usdt else '—'}")
+                f"USDT доступно {formatters.num(usdt.get('availableBalance')) if usdt else '—'}")
         except Exception as e:                 # noqa
             add("Aster: подписанный баланс (вариант с user)", False, redact(e)[:160])
         try:
@@ -845,7 +840,7 @@ def health_checks(rt, cfg, symbol: str | None = None) -> list[tuple[str, bool | 
         if symbol:
             try:
                 c = perp.commission_rate(symbol)
-                rate = lambda k: _v().pct(None if dget(c.get(k)) is None else dget(c.get(k)) * 100, 3)
+                rate = lambda k: formatters.pct(None if dget(c.get(k)) is None else dget(c.get(k)) * 100, 3)
                 add(f"Aster: комиссия {symbol}", True, f"мейкер {rate('makerCommissionRate')}, тейкер "
                                                       f"{rate('takerCommissionRate')}")
             except Exception as e:             # noqa
@@ -866,7 +861,7 @@ def health_checks(rt, cfg, symbol: str | None = None) -> list[tuple[str, bool | 
     if clock is not None and hasattr(clock, "clock_offset_s"):
         try:
             off = clock.clock_offset_s()
-            add("часы против Aster", abs(off) <= tconfig.ASTER_CLOCK_SKEW_MAX_S, f"{_v().num(off, 2, sign=True)} с")
+            add("часы против Aster", abs(off) <= tconfig.ASTER_CLOCK_SKEW_MAX_S, f"{formatters.num(off, 2, sign=True)} с")
         except Exception as e:                 # noqa
             add("часы против Aster", None, redact(e)[:160])
     legs = live or getattr(rt, "sim", None)
