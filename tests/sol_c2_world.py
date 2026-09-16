@@ -447,6 +447,14 @@ class RecHooks(Hooks):
     def progress(self, iid, html):
         self.progresses.append((iid, html))
 
+    def notice(self, topic, facts):
+        from funding_bot.interface.presenter import render_execution_notice
+        text = render_execution_notice(topic, facts)
+        if topic in ('progress', 'sol_progress'):
+            self.progresses.append((facts['intent_id'], text))
+        else:
+            self.reports.append(text)
+
     def requote(self, iid, reason):
         self.requotes.append((iid, reason))
 

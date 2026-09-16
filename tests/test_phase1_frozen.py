@@ -152,7 +152,7 @@ def test_deal_column_changed_after_plan_sends_nothing(tmp_path, col, val):
     # и новый план по такой сделке — отказ у Desk, а не у кнопки
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER)
-    assert "и её инструмент расходятся" in ei.value.html
+    assert "и её инструмент расходятся" in fx.render(ei.value)
 
 
 # ==== 4. намерение прежнего кода (без отпечатка) ======================================================================
@@ -318,12 +318,12 @@ def test_plan_entry_with_frozen_pair_checks_chain_decimals_and_exchange_contract
     with pytest.raises(eng.Refused) as ei:
         e.desk.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=False, write_checks=False,
                           pair=_frozen_pair(e, units_per_contract=D(1000)))
-    assert "на бирже изменился (m 1000 → 1)" in ei.value.html
+    assert "на бирже изменился (m 1000 → 1)" in fx.render(ei.value)
     # decimals с цепи ≠ замороженным
     e.spot.decimals = lambda token, hint=None: 9
     with pytest.raises(eng.Refused) as ei:
         e.desk.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=False, write_checks=False, pair=_frozen_pair(e))
-    assert "ecimals токена AIW3 на цепи (9) ≠ сделке (18)" in ei.value.html
+    assert "ecimals токена AIW3 на цепи (9) ≠ сделке (18)" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0)
 
 
@@ -343,10 +343,10 @@ def test_pair_from_takes_frozen_instrument_not_the_table_row(tmp_path):
         e.desk.table_loader = lambda bad=bad: t0._table(**bad)
         with pytest.raises(eng.Refused) as ei:
             e.desk.pair_from(inst, deal, verify_table=True, spot_s="okx·bsc", perp_s="aster", cfg=e.loader())
-        assert "в таблице сменился" in ei.value.html
+        assert "в таблице сменился" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.pair_from(inst, dict(deal, perp_venue="binance"), verify_table=False)
-    assert "площадка binance ≠ aster" in ei.value.html
+    assert "площадка binance ≠ aster" in fx.render(ei.value)
 
 
 # ==== 9. «продолжить» входа: инструмент — сделки, таблица только подтверждает =========================================

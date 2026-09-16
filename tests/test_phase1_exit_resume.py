@@ -174,7 +174,7 @@ def test_mutated_legacy_spec_cannot_increase_durable_root_target(tmp_path):
     s = _spec(e, r.intent_id)
     assert s["all"] is False and s["units"] == remaining < eng.deal_book(e.con,p.deal_id).tokens_raw
     head = views.intent_head(store.get_intent(e.con, r.intent_id), store.get_deal(e.con, p.deal_id))
-    assert f"<b>{head.title}</b>" in r.html and "всё" not in head.title, (head.title, r.html)
+    assert f"<b>{head.title}</b>" in fx.render(r) and "всё" not in head.title, (head.title, fx.render(r))
     fx.run_approved(e, r)
     assert _sold(e,x1.intent_id)+_sold(e,r.intent_id)==approved
     assert _state(e,p.deal_id)==DealState.OPEN and e.perp.pos < 0 and e.spot.bal[fx.TOKEN] > 0
@@ -230,7 +230,7 @@ def test_unknown_clip_outcome_refuses_resume(tmp_path, state):
     n, before = _n_intents(e), fx.sends(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
-    assert "неизвестен" in ei.value.html and "сначала «позиции»" in ei.value.html and x1.intent_id in ei.value.html
+    assert "неизвестен" in fx.render(ei.value) and "сначала «позиции»" in fx.render(ei.value) and x1.intent_id in fx.render(ei.value)
     assert _n_intents(e) == n and fx.sends(e) == before
 
 
@@ -243,8 +243,8 @@ def test_intent_without_token_target_refuses_with_hint(tmp_path):
     n, before = _n_intents(e), fx.sends(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
-    assert "остаток не вычислить" in ei.value.html
-    assert f"выход {p.deal_id} &lt;остаток $&gt;" in ei.value.html, "угловые скобки экранированы один раз"
+    assert "остаток не вычислить" in fx.render(ei.value)
+    assert f"выход {p.deal_id} &lt;остаток $&gt;" in fx.render(ei.value), "угловые скобки экранированы один раз"
     assert _n_intents(e) == n and fx.sends(e) == before
 
 
@@ -259,7 +259,7 @@ def test_resume_after_target_already_sold_is_refused(tmp_path):
     n = _n_intents(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
-    assert f"Выход {x.intent_id} выполнен" in ei.value.html     # первая буква отказа — заглавная (views.refused)
+    assert f"Выход {x.intent_id} выполнен" in fx.render(ei.value)     # первая буква отказа — заглавная (views.refused)
     assert _n_intents(e) == n
 
 
@@ -272,7 +272,7 @@ def test_resume_of_partial_exit_refused_while_stopped(tmp_path):
     n = _n_intents(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
-    assert "Пауза («стоп»)" in ei.value.html and _n_intents(e) == n
+    assert "Пауза («стоп»)" in fx.render(ei.value) and _n_intents(e) == n
 
 
 def test_resume_of_partial_exit_refused_when_instrument_unverified(tmp_path):
@@ -285,7 +285,7 @@ def test_resume_of_partial_exit_refused_when_instrument_unverified(tmp_path):
     n, before = _n_intents(e), fx.sends(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
-    assert "не подтверждён" in ei.value.html and f"«выход {p.deal_id}» целиком" in ei.value.html
+    assert "не подтверждён" in fx.render(ei.value) and f"«выход {p.deal_id}» целиком" in fx.render(ei.value)
     assert _n_intents(e) == n and fx.sends(e) == before
     fx.run_approved(e, e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER))
     assert _state(e, p.deal_id) == DealState.PAUSED and fx.sends(e) == before
@@ -359,18 +359,18 @@ def test_resume_plan_text(tmp_path):
     e = fx.live_env(tmp_path, clip="50")
     p = _open(e)
     x1 = _interrupted(e, p.deal_id, 100)
-    assert "Остаток выхода" not in x1.html, "обычный частичный выход — текст прежний"
+    assert "Остаток выхода" not in fx.render(x1), "обычный частичный выход — текст прежний"
     r = e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
     s = _spec(e, r.intent_id)
     rest, root = D(s["units"]) / E18, D(s["root_units"]) / E18
-    assert f"Остаток выхода: {views.tok(rest, step=STEP)} из {views.tok(root, step=STEP)} AIW3" in r.html
-    assert "Остаток выхода: 1 222 из 2 445 AIW3" in r.html.replace(" ", " ").replace("\xa0", " "), r.html
+    assert f"Остаток выхода: {views.tok(rest, step=STEP)} из {views.tok(root, step=STEP)} AIW3" in fx.render(r)
+    assert "Остаток выхода: 1 222 из 2 445 AIW3" in fx.render(r).replace(" ", " ").replace("\xa0", " "), fx.render(r)
     head = views.intent_head(store.get_intent(e.con, r.intent_id), store.get_deal(e.con, p.deal_id))
-    assert f"<b>{head.title}</b>" in r.html, "шапка сообщения = шапка из намерения (кнопка, строка закрытия)"
+    assert f"<b>{head.title}</b>" in fx.render(r), "шапка сообщения = шапка из намерения (кнопка, строка закрытия)"
     assert "Выход AIW3 · 50 из 200" in head.title.replace("\xa0", " "), head.title
     assert head.ok.replace("\xa0", " ") == "✅ Выйти 50 $"
-    assert "Продать спот 1 222 · откупить шорт 1 222" in r.html.replace(" ", " ").replace("\xa0", " ")
-    assert html_ok(r.html) and not fx.RAW_NUM.search(r.html) and not fx.ASCII_MINUS.search(r.html)
+    assert "Продать спот 1 222 · откупить шорт 1 222" in fx.render(r).replace(" ", " ").replace("\xa0", " ")
+    assert html_ok(fx.render(r)) and not fx.RAW_NUM.search(fx.render(r)) and not fx.ASCII_MINUS.search(fx.render(r))
 
 
 # ==== 11. m = 1000: остаток в токенах, откуп в контрактах ============================================================
@@ -383,7 +383,7 @@ def test_resume_m1000_sells_exactly_the_rest_and_stays_even(tmp_path):
     r = e.desk.propose_resume(p.deal_id, chat=fx.OWNER)
     s = _spec(e, r.intent_id)
     assert s["units"] == target - sold1 and s["all"] is False
-    assert "контр. (= 1 000 токенов)" in r.html.replace(" ", " ").replace("\xa0", " ") and "Остаток выхода" in r.html
+    assert "контр. (= 1 000 токенов)" in fx.render(r).replace(" ", " ").replace("\xa0", " ") and "Остаток выхода" in fx.render(r)
     fx.run_approved(e, r)
     assert sold1 + _sold(e, r.intent_id) == target
     assert _state(e, p.deal_id) == DealState.OPEN
@@ -402,7 +402,7 @@ def test_dqa9q_partial_exit_resume_after_update(tmp_path):
     s = _spec(e, r.intent_id)
     assert s["units"] == target - _sold(e, x1.intent_id) and s["root"] == x1.intent_id
     assert s["inst_hash"] == eng.deal_instrument(e.con, store.get_deal(e.con, "DQA9Q")).inst_hash()
-    assert "контр." not in r.html and "не подтверждён" not in r.html
+    assert "контр." not in fx.render(r) and "не подтверждён" not in fx.render(r)
     fx.run_approved(e, r)
     assert _sold(e, x1.intent_id) + _sold(e, r.intent_id) == target
     assert _state(e, "DQA9Q") == DealState.OPEN

@@ -140,12 +140,16 @@ def test_plan_guard_precedes_queue_and_ack_binds_original_intent(tmp_path):
     iid, nonce = store.create_intent(con, deal_id=did, kind='entry', spec={'coin': 'A'}, plan={})
     summary = plan_summary(store.get_intent(con, iid), store.get_deal(con, did))
     out = Outbox(Journal(conns))
+    # AC-07: core hands the interface facts (view_topic/view_facts), not a rendered body — 'fix_plan' is the
+    # smallest of the three proposal-view shapes.
+    facts = dict(intent_id=iid, kind='rehedge', coin='A', deal_id=did, delta=None, qty=None, side=None, usd=None,
+                perp_venue='aster', step=None, ttl_s=60, sim=True, m=None)
     with pytest.raises(Exception, match='plan_guard_missing'):
-        out.plan_proposed(42, iid, nonce, summary, 'legacy body')
+        out.plan_proposed(42, iid, nonce, summary, 'fix_plan', facts)
     assert out.journal.notifications() == []
     checked = []
     out.plan_guard = checked.append
-    out.plan_proposed(42, iid, nonce, summary, 'legacy body')
+    out.plan_proposed(42, iid, nonce, summary, 'fix_plan', facts)
     assert checked == [iid]
     event = out.journal.notifications()[0]
     rendered = present(event)

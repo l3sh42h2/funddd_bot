@@ -65,11 +65,14 @@ class Pause(Exception):
 
 
 class Refused(Exception):
-    """Команда владельца отклонена до плана. html — готовый текст ответа."""
+    """Команда владельца отклонена до плана. Несёт факты (topic, facts), не HTML — рендерит только interface
+    (interface.presenter.render_execution_notice), тем же путём, что и уведомления исполнителя (AC-07).
+    Обычный случай — просто причина: Refused("текст") → topic='refused', facts={'reason': "текст"}."""
 
-    def __init__(self, html: str):
-        super().__init__(html)
-        self.html = html
+    def __init__(self, reason: str | None = None, *, topic: str = 'refused', facts: dict | None = None):
+        self.topic = topic
+        self.facts = facts if facts is not None else {'reason': reason}
+        super().__init__(self.facts.get('reason') or reason or topic)
 
 
 def dget(x: Any) -> D | None:
@@ -222,17 +225,17 @@ def unit_refusal(coin: str, symbol: str, *, m: D | None = None, allow_multiplier
     v = _views()
     norm, fac = _name_units(coin, symbol)
     if norm != coin.upper():
-        raise Refused(v.refused(f"контракт {symbol} — это {norm}, а не {coin}: другой актив, не торгую"))
+        raise Refused(f"контракт {symbol} — это {norm}, а не {coin}: другой актив, не торгую")
     # Gate: имя множителя не несёт (FATCOIN_USDT), m — quanto_multiplier биржи (GateTrade.instrument, авторитетно);
     # множитель, записанный в имени Gate и не равный бирже, — по-прежнему отказ (единицы неоднозначны)
     if m is not None and fac != m and not (venue == "gate" and fac == 1):
-        raise Refused(v.refused(f"контракт {symbol}: имя символа (×{_dn(fac)}) и биржа (×{_dn(m)} {norm} в контракте) "
-                                "расходятся — не торгую"))
+        raise Refused(f"контракт {symbol}: имя символа (×{_dn(fac)}) и биржа (×{_dn(m)} {norm} в контракте) "
+                                "расходятся — не торгую")
     m_eff = fac if m is None else D(m)
     if m_eff != 1 and not allow_multiplier:
-        raise Refused(v.refused(f"контракт {symbol} — {_dn(m_eff)} {norm} в одном контракте, а без разрешения "
+        raise Refused(f"контракт {symbol} — {_dn(m_eff)} {norm} в одном контракте, а без разрешения "
                                 f"владельца исполнитель торгует только 1 контракт = 1 токен {coin}: не торгую. "
-                                f"Разрешение — owner.toml [perp.{venue}] {MULT_KEY} = true"))
+                                f"Разрешение — owner.toml [perp.{venue}] {MULT_KEY} = true")
     return m_eff
 
 
@@ -433,8 +436,8 @@ def _same_identity(coin: str, was: tuple, now: tuple) -> None:
     """Ревью 13.09, Н2: (сеть, токен, …, символ) замороженного инструмента против строки таблицы или плана. Другой
     токен/символ/decimals — это другой актив: одобренный план к нему не относится, нужен новый."""
     if was != now:
-        raise Refused(_views().refused(f"инструмент {coin} в таблице сменился ({was[1]}/{was[-1]} → "
-                                       f"{now[1]}/{now[-1]}) — это другой актив, нужен новый план"))
+        raise Refused(f"инструмент {coin} в таблице сменился ({was[1]}/{was[-1]} → "
+                                       f"{now[1]}/{now[-1]}) — это другой актив, нужен новый план")
 
 
 def deal_book(con, deal_id: str) -> DealBook:
@@ -642,14 +645,26 @@ def build_runtime(cfg: OwnerCfg, conns: Conns, *, holder: CfgHolder | None = Non
 # --- Desk: предпроверки и план с кнопками (поток заданий; только чтение сети) ------------------------------
 @dataclass
 class Proposal:
-    """Предложение владельцу: намерение proposed (истекает через PLAN_TTL_S) и HTML плана для кнопок."""
+    """Предложение владельцу: намерение proposed (истекает через PLAN_TTL_S) и факты плана для кнопок — HTML
+    строит только interface (interface.presenter.render_proposal_view), не Desk (AC-07). view_topic называет,
+    каким рендерером в tg/sol_views это станет текстом ('plan' | 'sol_plan' | 'fix_plan'), view_facts — сырые
+    аргументы этого рендерера (Decimal/str/bool/кортежи скаляров — те же поля, без HTML)."""
     intent_id: str
     nonce: str
     deal_id: str
     kind: str
-    html: str
+    view_topic: str
+    view_facts: dict
     plan: Plan | None = None
     superseded: tuple = ()                      # прежние предложения той же сделки, снятые этим (бот снимет кнопки)
+
+
+@dataclass
+class Notice:
+    """Итог команды без плана и кнопок (например «продолжить» — сделка уже сверена и на паузе): тоже факты, не
+    HTML. Тот же (topic, facts), что и Refused/Hooks.notice — рендерит только interface."""
+    topic: str
+    facts: dict
 
 
 @dataclass
@@ -745,15 +760,15 @@ class Desk:
         v = _views()
         if not is_sol_deal(deal):
             if cmd.profile not in (None, owner_mod.LEGACY_PROFILE) or cmd.tokens is not None or cmd.usdc is not None:
-                raise Refused(v.refused(f"сделка {deal['id']} — связки BSC/Aster, формат: {EXIT_FMT}"))
+                raise Refused(f"сделка {deal['id']} — связки BSC/Aster, формат: {EXIT_FMT}")
             return self.propose_exit(deal["id"], None, False, chat)
         profile = profile_of_deal(deal)
         if cmd.profile not in (None, profile):
-            raise Refused(v.refused(f"сделка {deal['id']} — профиля {profile}, а не {cmd.profile}"))
+            raise Refused(f"сделка {deal['id']} — профиля {profile}, а не {cmd.profile}")
         if cmd.perp_dex and str(deal["symbol"]).split(":", 1)[0] != cmd.perp_dex:
-            raise Refused(v.refused(f"сделка {deal['id']} на {deal['symbol']}, а не на dex {cmd.perp_dex}"))
+            raise Refused(f"сделка {deal['id']} на {deal['symbol']}, а не на dex {cmd.perp_dex}")
         if cmd.tokens is not None or cmd.usdc is not None:
-            raise Refused(v.refused(f"частичный выход в пилоте выключен — только «выход {deal['id']}» целиком"))
+            raise Refused(f"частичный выход в пилоте выключен — только «выход {deal['id']}» целиком")
         return self.sol(profile).propose_exit(deal, None, False, chat)
 
     # --- общее ---
@@ -761,7 +776,7 @@ class Desk:
         try:
             return self.owner_loader()
         except OwnerConfigError as e:
-            raise Refused(_views().owner_config_error(e)) from None
+            raise Refused(topic='owner_config_error', facts={'reason': str(e)}) from None
 
     def mode(self, cfg: OwnerCfg) -> str:
         """Меньший из режима файла и режима загрузки ключей (повышение — только перезапуском)."""
@@ -779,8 +794,8 @@ class Desk:
     def _legs(self, sim: bool) -> Legs:
         lg = self.legs(sim)
         if lg is None:
-            raise Refused(_views().refused("живую сделку в этом режиме не трогаю: ключи live не загружены "
-                                           "(mode в owner.toml и перезапуск службы)"))
+            raise Refused("живую сделку в этом режиме не трогаю: ключи live не загружены "
+                                           "(mode в owner.toml и перезапуск службы)")
         return lg
 
     def _legs_for(self, chain: str, venue: str, sim: bool) -> Legs:
@@ -790,7 +805,7 @@ class Desk:
             return self._legs(sim)
         lg, why = _profile_legs(self.legs, prof, sim)
         if lg is None:
-            raise Refused(_views().refused(f"живую сделку в этом режиме не трогаю: {why}"))
+            raise Refused(f"живую сделку в этом режиме не трогаю: {why}")
         return lg
 
     def _deal_legs(self, deal: Mapping) -> Legs:
@@ -798,18 +813,17 @@ class Desk:
         return self._legs_for(chain, venue, bool(dict(deal)["sim"]))
 
     def _common_checks(self, cfg: OwnerCfg, sim: bool, action: str, chain: str = CHAIN, venue: str = VENUE) -> None:
-        v = _views()
         con = self.conns.get()
         if store.is_paused(con):
-            raise Refused(v.refused("пауза («стоп»): новое не начинаю. Снять — «продолжить»"))
+            raise Refused("пауза («стоп»): новое не начинаю. Снять — «продолжить»")
         if self.busy() or store.busy_intents(con):
             row = con.execute("SELECT id FROM intents WHERE status IN ('approved','running') LIMIT 1").fetchone()
-            raise Refused(v.busy(row[0] if row else None))
+            raise Refused(topic='busy', facts={'intent_id': row[0] if row else None})
         if not sim:
             try:
                 cfg.require_live(venue, chain)
             except OwnerMissing as e:
-                raise Refused(v.owner_missing(e.keys, action)) from None
+                raise Refused(topic='owner_missing', facts={'keys': list(e.keys), 'action': action}) from None
 
     def find_pair(self, coin: str, spot: str, perp: str, *, allow_multiplier: bool = False) -> PairInfo:
         v = _views()
@@ -824,8 +838,8 @@ class Desk:
                            and r.get("perp_ex") == perp})
             ok = [c for c in have if c in chains]
             if have and not ok:
-                raise Refused(v.refused(f"{coin} на OKX DEX есть только в сетях: {', '.join(have)} — в фазе 2 "
-                                        f"торгую только okx·{_chain_tag(chains[0]) if chains else CHAIN}"))
+                raise Refused(f"{coin} на OKX DEX есть только в сетях: {', '.join(have)} — в фазе 2 "
+                                        f"торгую только okx·{_chain_tag(chains[0]) if chains else CHAIN}")
             chain = ok[0] if ok else (chains[0] if chains else CHAIN)   # строк нет — ниже честный «пары нет»
             spot = f"okx·{_chain_tag(chain)}"
         try:
@@ -833,31 +847,31 @@ class Desk:
         except KeyError:
             pass                                # неизвестная сеть — отказ ниже
         if not chains:
-            raise Refused(v.refused(f"перп {perp}: в фазе 2 пока только "
-                                    f"{', '.join(sorted({vn for _c, vn in owner_mod.EVM_PROFILE_OF}))}"))
+            raise Refused(f"перп {perp}: в фазе 2 пока только "
+                                    f"{', '.join(sorted({vn for _c, vn in owner_mod.EVM_PROFILE_OF}))}")
         if dex != "okx" or chain not in chains:
-            raise Refused(v.refused(f"спот {spot}: в фазе 2 пока только "
-                                    f"{', '.join('okx·' + _chain_tag(c) for c in chains)}"))
+            raise Refused(f"спот {spot}: в фазе 2 пока только "
+                                    f"{', '.join('okx·' + _chain_tag(c) for c in chains)}")
         ci = tconfig.chain_index(chain)
         tbl = self.table_loader() or {}
         rows = [r for r in tbl.get("sf_rows") or [] if str(r.get("base") or "").upper() == coin
                 and r.get("spot_ex") == "okxdex" and r.get("perp_ex") == perp
                 and str(r.get("spot") or "").startswith(ci + ":")]
         if not rows:
-            raise Refused(v.refused(f"пары {coin} okx·{_chain_tag(chain)} / {perp} нет в таблице коллектора (table.json)"))
+            raise Refused(f"пары {coin} okx·{_chain_tag(chain)} / {perp} нет в таблице коллектора (table.json)")
         # торгуем только токен, доказанный контрактом для САМОГО перпа: строка, связанная через другую площадку
         # (ident_ev «dex_link:…», 12.09), остаётся на дашборде для просмотра, но не для денег
         proven = [r for r in rows if not r.get("mismatch") and r.get("ident") == "same"
                   and not str(r.get("ident_ev") or "").startswith("dex_link:")]
         if not proven and any(str(r.get("ident_ev") or "").startswith("dex_link:") for r in rows):
-            raise Refused(v.refused(f"токен {coin} на {chain} связан с перпом {perp} только через другую площадку — "
-                                    "для торговли нужно прямое доказательство (контракт в индексе самого перпа)"))
+            raise Refused(f"токен {coin} на {chain} связан с перпом {perp} только через другую площадку — "
+                                    "для торговли нужно прямое доказательство (контракт в индексе самого перпа)")
         if not proven:
-            raise Refused(v.refused(f"токен {coin} на {chain} не доказан identity (состав индекса и контракты) — "
-                                    "не торгую"))
+            raise Refused(f"токен {coin} на {chain} не доказан identity (состав индекса и контракты) — "
+                                    "не торгую")
         plain = [r for r in proven if r.get("spot_label") == f"okx·{_chain_tag(chain)}"] or proven
         if len({r["spot"] for r in plain}) > 1:
-            raise Refused(v.refused(f"у {coin} несколько токенов на {chain} — какой торговать, решает владелец"))
+            raise Refused(f"у {coin} несколько токенов на {chain} — какой торговать, решает владелец")
         r = plain[0]
         token = str(r["spot"]).split(":", 1)[1].lower()
         unit_refusal(coin, str(r["perp"]), allow_multiplier=allow_multiplier, venue=venue)  # ранний отказ; m с биржи —
@@ -874,7 +888,7 @@ class Desk:
         откат и дохедж — verify_table=False: таблицу не читают вовсе. Колонки сделки ≠ её инструменту — отказ всегда."""
         bad = _inst_vs_deal(deal, inst)
         if bad:
-            raise Refused(_views().refused(f"{bad} — не торгую"))
+            raise Refused(f"{bad} — не торгую")
         period = inst.period_h or self._period(dict(deal))
         if verify_table:
             tp = self.find_pair(str(deal["coin"]), str(spot_s), str(perp_s),
@@ -898,7 +912,7 @@ class Desk:
                 return int(q.dec_out)
             if q.token_in.lower() == token:
                 return int(q.dec_in)
-        raise Refused(_views().refused(f"decimals токена {token} не прочитаны"))
+        raise Refused(f"decimals токена {token} не прочитаны")
 
     def _market(self, legs: Legs, pair: PairInfo, token_units_bal: dict, calib, approve_usd: D) -> planner.Market:
         perp = legs.perp
@@ -918,7 +932,7 @@ class Desk:
         except PlanRefused:
             raise
         except Exception as e:                 # NoLiquidity, Unsupported, сеть OKX
-            raise Refused(_views().refused(f"котировки OKX DEX не получены: {redact(e)}")) from None
+            raise Refused(f"котировки OKX DEX не получены: {redact(e)}") from None
 
     # --- вход ---
     def plan_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, *, cfg: OwnerCfg | None = None,
@@ -938,11 +952,11 @@ class Desk:
             mx = cfg.get("limits.max_open_deals")
             n_open = len(store.active_deals(con))
             if mx is not None and n_open >= mx:
-                raise Refused(v.refused(f"открытых сделок {n_open} из {mx} (max_open_deals) — вход запрещён"))
+                raise Refused(f"открытых сделок {n_open} из {mx} (max_open_deals) — вход запрещён")
             self._daily_stop_check(cfg, sim)
         cap = cfg.get("limits.deal_max_usd_per_leg")
         if cap is not None and usd > cap:
-            raise Refused(v.refused(f"{v.leg(usd)} больше лимита сделки на ногу {v.leg(cap)} (deal_max_usd_per_leg)"))
+            raise Refused(f"{v.leg(usd)} больше лимита сделки на ногу {v.leg(cap)} (deal_max_usd_per_leg)")
         # множитель контракта — только с разрешения владельца (cfg: свежий у предложения, замороженный у перекотировки;
         # исполнитель ещё раз читает свежий в _entry_limits)
         allow = _allow_multiplier(cfg, pair.venue if pair is not None else _cmd_cv(spot_s, perp_s)[1])
@@ -952,15 +966,15 @@ class Desk:
             for d in store.active_deals(self.conns.get()):
                 if d["token"] == pair.token or (d["perp_venue"] == pair.venue and d["symbol"] == pair.symbol):
                     st = v.DEAL_STATE_LABEL.get(d["state"], d["state"])
-                    raise Refused(v.refused(f"по {coin} уже есть сделка {d['id']} ({st}) — вход запрещён"))
+                    raise Refused(f"по {coin} уже есть сделка {d['id']} ({st}) — вход запрещён")
         legs = self._legs_for(pair.chain, pair.venue, sim)
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(pair.chain)]
         total = int((usd * D(10) ** sdec).to_integral_value(ROUND_FLOOR))
         quotes = self._quotes(legs.spot, stable, pair.token, total)
         pair.token_dec = self._token_dec(legs.spot, pair.token, quotes)
         if frozen is not None and pair.token_dec != frozen.token_dec:
-            raise Refused(v.refused(f"decimals токена {coin} на цепи ({pair.token_dec}) ≠ сделке ({frozen.token_dec}) — "
-                                    "это другой актив, нужен новый план"))
+            raise Refused(f"decimals токена {coin} на цепи ({pair.token_dec}) ≠ сделке ({frozen.token_dec}) — "
+                                    "это другой актив, нужен новый план")
         try:
             calib = planner.calibrate(quotes, "entry", p_ref=legs.spot.pool_price(pair.token))
             bal = legs.spot.balances(pair.token)
@@ -973,17 +987,17 @@ class Desk:
             if frozen is not None and pair.spec.inst_hash() != frozen.inst_hash():
                 was, now = frozen.m, pair.spec.m     # биржа сменила контракт (m) после входа — старый план не про него
                 ch = f" (m {_dn(was)} → {_dn(now)})" if was != now else ""
-                raise Refused(v.refused(f"контракт {pair.symbol} на бирже изменился{ch} — нужен новый план"))
+                raise Refused(f"контракт {pair.symbol} на бирже изменился{ch} — нужен новый план")
             lim = planner.limits_from_owner(cfg, pair.venue, pair.chain)
             plan = planner.plan(deal_id="", kind="entry", coin=coin, spot=spot_s, perp=perp_s, symbol=pair.symbol,
                                 leg_usd=usd, total_in_units=total, dec_in=sdec, calib=calib, mkt=mkt, lim=lim,
                                 now=self.clock(), units_per_contract=pair.spec.m, carry0=carry0)
         except PlanRefused as e:
-            raise Refused(v.refused(str(e))) from None
+            raise Refused(str(e)) from None
         plan.inputs["inst_hash"] = pair.spec.inst_hash()
         notes = self._entry_live_notes(cfg, legs, pair, bal, total, usd, sdec, plan)
         if notes and not sim:
-            raise Refused(v.refused("; ".join(notes)))
+            raise Refused("; ".join(notes))
         ctx = {"pair": pair, "sim": sim, "cfg": cfg, "stable": stable, "sdec": sdec, "total": total, "bal": bal,
                "mkt": mkt, "notes": notes, "legs": legs, "inst": pair.spec, "m": pair.spec.m}
         return plan, ctx
@@ -1004,16 +1018,16 @@ class Desk:
             except Exception as e:             # noqa — exchangeInfo не прочитан: m не известен, вход не начинаем
                 err = f"exchangeInfo не прочитан: {redact(e)}"
         if pi is None or pi.m is None or pi.base is None:
-            raise Refused(v.refused(f"множитель контракта {pair.symbol} на {venue} не известен ({err}) — не торгую"))
+            raise Refused(f"множитель контракта {pair.symbol} на {venue} не известен ({err}) — не торгую")
         if str(pi.base).upper() != pair.coin.upper():
-            raise Refused(v.refused(f"контракт {pair.symbol} — это {pi.base}, а не {pair.coin}: другой актив, не торгую"))
+            raise Refused(f"контракт {pair.symbol} — это {pi.base}, а не {pair.coin}: другой актив, не торгую")
         m = unit_refusal(pair.coin, pair.symbol, m=pi.m, allow_multiplier=allow, venue=pair.venue)
         if not bid or not p_ref:
-            raise Refused(v.refused(f"цена для сверки единиц {pair.symbol} не получена — не торгую"))
+            raise Refused(f"цена для сверки единиц {pair.symbol} не получена — не торгую")
         ratio = (bid / m) / p_ref
         if not (D(1) / tconfig.UNIT_PX_RATIO_MAX <= ratio <= tconfig.UNIT_PX_RATIO_MAX):
-            raise Refused(v.refused(f"цена {pair.symbol} {v.num(bid / m, 6)} против {v.num(p_ref, 6)} за токен на DEX — "
-                                    f"единицы не сходятся (множитель контракта или не тот токен): не торгую"))
+            raise Refused(f"цена {pair.symbol} {v.num(bid / m, 6)} против {v.num(p_ref, 6)} за токен на DEX — "
+                                    f"единицы не сходятся (множитель контракта или не тот токен): не торгую")
         return InstrumentSpec(chain=pair.chain, token=pair.token.lower(), token_dec=int(pair.token_dec),
                               perp_venue=pair.venue, perp_symbol=pair.symbol, units_per_contract=m,
                               perp_base_asset=pi.base_asset, quote_asset=pi.quote_asset, contract_type=pi.contract_type,
@@ -1075,7 +1089,7 @@ class Desk:
             return
         basis = cfg.get("limits.daily_loss_basis")
         if basis != "realized_costs":
-            raise Refused(_views().refused(f"дневной стоп по «{basis}» пока не считается — вход запрещён"))
+            raise Refused(f"дневной стоп по «{basis}» пока не считается — вход запрещён")
         day0 = math.floor(self.clock() / 86400) * 86400
         used = ZERO
         from . import accounting
@@ -1087,7 +1101,7 @@ class Desk:
                 except Exception:
                     cost = None
                 if cost is None:
-                    raise Refused(_views().refused('дневные издержки не подтверждены для счёта — вход запрещён'))
+                    raise Refused('дневные издержки не подтверждены для счёта — вход запрещён')
                 used += cost
                 continue
             try:
@@ -1096,8 +1110,8 @@ class Desk:
                 continue
         if used >= stop:
             v = _views()
-            raise Refused(v.refused(f"дневной стоп: издержки сегодня {v.money(used, html=False)} ≥ {v.leg(stop)} — "
-                                    "вход запрещён"))
+            raise Refused(f"дневной стоп: издержки сегодня {v.money(used, html=False)} ≥ {v.leg(stop)} — "
+                                    "вход запрещён")
 
     def _root_proposal(self, deal, kind, spec, plan, chat, operation_id=None):
         from .operation_roots import propose
@@ -1135,18 +1149,18 @@ class Desk:
                 except ValueError:
                     was = None
                 if was != inst.inst_hash():
-                    raise Refused(_views().refused(f"инструмент {coin} у кнопки другой ({pair.token}/{pair.symbol}) — "
-                                                   "это новый вход, пришлите команду заново"))
+                    raise Refused(f"инструмент {coin} у кнопки другой ({pair.token}/{pair.symbol}) — "
+                                                   "это новый вход, пришлите команду заново")
         plan.deal_id = deal_id
         spec = {"kind": "entry", "coin": coin, "spot": spot_s, "perp": perp_s, "usd": usd, "token": pair.token,
                 "token_dec": pair.token_dec, "symbol": pair.symbol, "period_h": pair.period_h, "sim": sim,
                 "owner": cfg.frozen_json(), "funding_h": ctx["mkt"].funding_h,
                 "instrument": inst.as_dict(), "inst_hash": inst.inst_hash()}
         iid, nonce = self._root_proposal(store.get_deal(con, deal_id), "entry", spec, plan, chat)
-        html = _views().plan(self.plan_view(iid, plan, ctx))
+        facts = self.plan_view(iid, plan, ctx)
         store.event(con, "proposed", deal_id=deal_id, intent_id=iid, total_usd=plan.est.get("total_usd"),
                     n=plan.est.get("n"), sim=sim)
-        return Proposal(iid, nonce, deal_id, "entry", html, plan)
+        return Proposal(iid, nonce, deal_id, "entry", 'plan', facts, plan)
 
     # --- выход ---
     def resolve_deal(self, target: str) -> dict:
@@ -1161,11 +1175,11 @@ class Desk:
         if d is None:
             act = [x for x in store.active_deals(con) if x["coin"].upper() == t]
             if len(act) > 1:
-                raise Refused(_views().refused(f"по {t} несколько сделок — укажите id: "
-                                               + ", ".join(x["id"] for x in act)))
+                raise Refused(f"по {t} несколько сделок — укажите id: "
+                                               + ", ".join(x["id"] for x in act))
             d = act[0] if act else None
         if d is None:
-            raise Refused(_views().refused(f"сделки «{t}» нет"))
+            raise Refused(f"сделки «{t}» нет")
         return d
 
     def plan_exit(self, deal: dict, usd: D | None, perp_only: bool, *, units: int | None = None,
@@ -1183,31 +1197,31 @@ class Desk:
             self._common_checks(cfg, sim, "выход", *_deal_cv(deal))
         if deal["state"] not in (DealState.OPEN, DealState.PAUSED):
             st = v.DEAL_STATE_LABEL.get(deal["state"], deal["state"])
-            raise Refused(v.refused(f"сделка {deal['id']} {st} — выход не начинаю"))
+            raise Refused(f"сделка {deal['id']} {st} — выход не начинаю")
         legs = self._deal_legs(deal)
         con = self.conns.get()
         dec = int(deal["token_dec"])
         bk = deal_book(con, deal["id"])
         if not bk.known:
-            raise Refused(v.refused(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»"))
+            raise Refused(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»")
         inst = deal_instrument(con, deal)
         pair = self.pair_from(inst, deal, verify_table=False)     # инструмент сделки, таблица не нужна (Н2)
         if not bk.inst_ok and (usd is not None or units is not None) and not perp_only:
             # m не подтверждён (ревью 13.09, R6): частичный выход с неверным m снял бы шорт больше хеджа; целиком —
             # весь шорт при любом m
-            raise Refused(v.refused(f"инструмент сделки {deal['id']} не подтверждён ({bk.inst_why}) — частичный выход "
-                                    f"не посчитать, только «выход {deal['id']}» целиком"))
+            raise Refused(f"инструмент сделки {deal['id']} не подтверждён ({bk.inst_why}) — частичный выход "
+                                    f"не посчитать, только «выход {deal['id']}» целиком")
         f = legs.perp.filters(deal["symbol"])
         delta, ts = bk.delta(dec), bk.tstep(f.step)            # дельта и шаг — в токенах (m токенов в контракте)
         if bk.m_known and not (ZERO <= delta < ts) and not perp_only:
-            raise Refused(v.refused(f"ноги не ровно: без хеджа {v.tok(delta, True, ts)} {deal['coin']} — сначала "
-                                    f"«дохедж {deal['id']}» или «откат {deal['id']}»"))
+            raise Refused(f"ноги не ровно: без хеджа {v.tok(delta, True, ts)} {deal['coin']} — сначала "
+                                    f"«дохедж {deal['id']}» или «откат {deal['id']}»")
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
         wallet_units = bk.tokens_raw
         if not sim:
             wal = legs.spot.balances(deal["token"]).get("token")
             if wal is None:
-                raise Refused(v.refused("баланс токена в кошельке не прочитан — выход не начинаю"))
+                raise Refused("баланс токена в кошельке не прочитан — выход не начинаю")
             wallet_units = min(wallet_units, int(wal))
         ctx = {"pair": pair, "sim": sim, "cfg": cfg, "stable": stable, "sdec": sdec, "deal": deal, "book": bk,
                "legs": legs, "notes": [], "perp_only": perp_only, "usd": usd, "inst": inst, "m": bk.m_view}
@@ -1227,7 +1241,7 @@ class Desk:
         elif not full:
             p = legs.spot.pool_price(deal["token"])
             if p is None or p <= 0:
-                raise Refused(v.refused("цена токена на DEX не получена — сумму в токены не перевести"))
+                raise Refused("цена токена на DEX не получена — сумму в токены не перевести")
             units = min(units, int((usd / p * D(10) ** dec).to_integral_value(ROUND_FLOOR)))
             full = units >= bk.tokens_raw
         if not full and bk.m != 1 and units > 0 and _partial_closes_short(bk, units, dec, f.step):
@@ -1235,14 +1249,14 @@ class Desk:
             # ложным итогом) — это полный выход; одобренный частичный у кнопки в полный не превращается
             left = D(bk.tokens_raw - units) / D(10) ** dec
             if not to_full:
-                raise Refused(v.refused(f"частичный выход теперь откупил бы весь шорт (осталось бы {v.tok(left, step=ts)} "
-                                        f"{deal['coin']}) — нужен новый план: «выход {deal['id']}»"))
+                raise Refused(f"частичный выход теперь откупил бы весь шорт (осталось бы {v.tok(left, step=ts)} "
+                                        f"{deal['coin']}) — нужен новый план: «выход {deal['id']}»")
             full, units = True, wallet_units
             ctx["m2_full"] = True              # «продолжить» берёт отсюда all=True (полный выход, а не частичный)
             ctx["notes"].append(f"остаток {v.tok(left, step=ts)} {deal['coin']} меньше "
                                 f"{v.contracts(f.step, bk.m, step=f.step)} — выход всей сделки")
         if units <= 0:
-            raise Refused(v.refused("продавать нечего: токенов сделки в кошельке 0"))
+            raise Refused("продавать нечего: токенов сделки в кошельке 0")
         quotes = self._quotes(legs.spot, deal["token"], stable, units)
         try:
             calib = planner.calibrate(quotes, "exit", p_ref=legs.spot.pool_price(deal["token"]))
@@ -1255,7 +1269,7 @@ class Desk:
                                 calib.p_ref, total_in_units=units, dec_in=dec, calib=calib, mkt=mkt, lim=lim,
                                 now=self.clock(), units_per_contract=bk.m, carry0=delta)
         except PlanRefused as e:
-            raise Refused(v.refused(str(e))) from None
+            raise Refused(str(e)) from None
         plan.inputs["inst_hash"] = inst.inst_hash()           # перекотировка у кнопки сверит с намерением
         ctx.update(units=units, full=full, bal=bal, mkt=mkt)
         return plan, ctx
@@ -1271,7 +1285,7 @@ class Desk:
         try:
             pk = planner.pick_perp(book, "BUY", bk.short, f, fee, lim, reduce_only=True)
         except PlanRefused as e:
-            raise Refused(_views().refused(str(e))) from None
+            raise Refused(str(e)) from None
         ch, pc = pk.children, pk.cost
         mid = planner.mid(book)
         est = {"n": 1, "clip_usd": pc.notional, "m": len(ch), "children": len(ch),
@@ -1305,7 +1319,7 @@ class Desk:
             quotes = self._quotes(legs.spot, deal["token"], stable, units) if units > 0 else []
             calib = planner.calibrate(quotes, "exit", p_ref=legs.spot.pool_price(deal["token"])) if quotes else None
         except PlanRefused as e:
-            raise Refused(v.refused(str(e))) from None
+            raise Refused(str(e)) from None
         toks = D(units) / D(10) ** dec
         S = toks * calib.p_ref if calib is not None else ZERO
         dex = planner.dex_cost(1, S, calib.k, calib.g, tconfig.R_PRIOR, calib.c0) if calib is not None else None
@@ -1351,10 +1365,10 @@ class Desk:
             iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="exit", spec=spec, plan=plan, chat=chat)
         else:
             iid, nonce = self._root_proposal(deal, "exit", spec, plan, chat)
-        html = _views().plan(self.plan_view(iid, plan, ctx))
+        facts = self.plan_view(iid, plan, ctx)
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"),
                     sim=bool(deal["sim"]))
-        return Proposal(iid, nonce, deal["id"], "exit", html, plan)
+        return Proposal(iid, nonce, deal["id"], "exit", 'plan', facts, plan)
 
     # --- дохедж / откат / продолжить ---
     def _deficit(self, deal: dict) -> tuple[Legs, DealBook, Any, D]:
@@ -1362,7 +1376,7 @@ class Desk:
         legs = self._deal_legs(deal)
         bk = deal_book(self.conns.get(), deal["id"])
         if not bk.known:
-            raise Refused(v.refused(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»"))
+            raise Refused(f"книга сделки неизвестна ({bk.why}) — сначала «позиции»")
         f = legs.perp.filters(deal["symbol"])
         return legs, bk, f, bk.delta(int(deal["token_dec"]))
 
@@ -1376,10 +1390,10 @@ class Desk:
             return self.sol(profile_of_deal(deal)).propose_fix(kind, deal, chat)
         self._common_checks(cfg, bool(deal["sim"]), "дохедж" if kind == "rehedge" else "откат", *_deal_cv(deal))
         if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
-            raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
+            raise Refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}")
         legs, bk, f, delta = self._deficit(deal)
         if not bk.m_known:                     # ревью 13.09, M3: дельта по m = 1 продала бы захеджированные токены
-            raise Refused(v.refused(f"{v.m_unknown_text(deal['id'])} ({bk.inst_why}): дохедж и откат не посчитать"))
+            raise Refused(f"{v.m_unknown_text(deal['id'])} ({bk.inst_why}): дохедж и откат не посчитать")
         dec = int(deal["token_dec"])
         inst = deal_instrument(self.conns.get(), deal)
         spec = {"kind": kind, "coin": deal["coin"], "token": deal["token"], "token_dec": dec, "symbol": deal["symbol"],
@@ -1395,11 +1409,11 @@ class Desk:
             elif delta < 0:
                 side, qty = "BUY", min(ceil_step(-delta / bk.m, f.step), bk.short)
             else:
-                raise Refused(v.refused(f"ноги ровно (дельта {v.tok(delta, True, ts)} меньше шага) — дохеджировать "
-                                        "нечего"))
+                raise Refused(f"ноги ровно (дельта {v.tok(delta, True, ts)} меньше шага) — дохеджировать "
+                                        "нечего")
             if side == "SELL" and not bk.inst_ok:      # наращивать шорт при неизвестном m нельзя (ревью 13.09, R6)
-                raise Refused(v.refused(f"инструмент сделки {deal['id']} не подтверждён ({bk.inst_why}) — дохедж "
-                                        f"продажей запрещён; «откат {deal['id']}» или «выход {deal['id']}»"))
+                raise Refused(f"инструмент сделки {deal['id']} не подтверждён ({bk.inst_why}) — дохедж "
+                                        f"продажей запрещён; «откат {deal['id']}» или «выход {deal['id']}»")
             if side == "SELL" and bk.m != 1:           # продажа контрактов с множителем — только с разрешения (R8)
                 vn = _deal_cv(deal)[1]
                 unit_refusal(deal["coin"], deal["symbol"], m=bk.m, venue=vn, allow_multiplier=_allow_multiplier(cfg, vn))
@@ -1407,7 +1421,7 @@ class Desk:
             ab = self._fix_ab(legs, deal, f, side, qty, cfg)
         else:
             if delta < ts:
-                raise Refused(v.refused("откат — только для голого лонга (дельта ≥ шага); голый шорт — «дохедж»"))
+                raise Refused("откат — только для голого лонга (дельта ≥ шага); голый шорт — «дохедж»")
             qty = delta - (delta % ts)                 # токены: кратно шагу·m — остаток остаётся захеджированным
             units = int((qty * D(10) ** dec).to_integral_value(ROUND_FLOOR))
             spec.update(units=units)
@@ -1417,10 +1431,10 @@ class Desk:
                     missing_owner_keys=_live_miss(cfg, deal), expires=self.clock() + tconfig.PLAN_TTL_S)
         con = self.conns.get()
         iid, nonce = store.create_intent(con, deal_id=deal["id"], kind=kind, spec=spec, plan=plan, chat=chat)
-        text = v.fix_plan(v.FixPlanView(intent_id=iid, kind=kind, coin=deal["coin"], deal_id=deal["id"], delta=delta,
-                                        qty=qty, side=side, usd=plan.leg_usd, perp_venue=deal["perp_venue"],
-                                        step=f.step, sim=bool(deal["sim"]), m=bk.m))
-        return Proposal(iid, nonce, deal["id"], kind, text, plan)
+        facts = dict(intent_id=iid, kind=kind, coin=deal["coin"], deal_id=deal["id"], delta=delta,
+                    qty=qty, side=side, usd=plan.leg_usd, perp_venue=deal["perp_venue"],
+                    step=f.step, ttl_s=tconfig.PLAN_TTL_S, sim=bool(deal["sim"]), m=bk.m)
+        return Proposal(iid, nonce, deal["id"], kind, 'fix_plan', facts, plan)
 
     def _fix_ab(self, legs: Legs, deal: dict, f, side: str, qty: D, cfg: OwnerCfg) -> dict:
         """α/β дохеджа — в план: исполнитель берёт их оттуда. Числа владельца — как есть (стакан проверит исполнитель,
@@ -1434,9 +1448,9 @@ class Desk:
         try:
             return planner.pick_perp(book, side, qty, f, fee, lim, reduce_only=side == "BUY").est()
         except PlanRefused as e:
-            raise Refused(_views().refused(str(e))) from None
+            raise Refused(str(e)) from None
 
-    def propose_resume(self, target: str, chat: int | None) -> Proposal | str:
+    def propose_resume(self, target: str, chat: int | None) -> Proposal | Notice:
         """«продолжить <id>»: HALTED_MISMATCH — сверка и (если сошлось) PAUSED; иначе свежий план на остаток
         прерванного входа или выхода. Сам исполнитель ничего не продолжает."""
         v = _views()
@@ -1450,17 +1464,18 @@ class Desk:
         from .adapters.obligations import unresolved
         if unresolved(con, deal):
             intent = f" ({last['id']})" if last is not None else ""
-            raise Refused(v.refused(f'исход прошлой отправки{intent} неизвестен — сначала «позиции»'))
+            raise Refused(f'исход прошлой отправки{intent} неизвестен — сначала «позиции»')
         if deal["state"] == DealState.HALTED_MISMATCH:
             from . import reconcile
             legs = self._deal_legs(deal)
             chk = reconcile.check_deal(con, deal, legs)
             if chk.matched:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
-                return v.resume_checked(deal["id"], sim=bool(deal["sim"]))
-            return v.resume_mismatch(deal["id"], chk.detail, sim=bool(deal["sim"]))
+                return Notice('resume_checked', {'deal_id': deal["id"], 'sim': bool(deal["sim"])})
+            detail = chk.detail if chk.detail is None or type(chk.detail) is str else str(chk.detail)
+            return Notice('resume_mismatch', {'deal_id': deal["id"], 'detail': detail, 'sim': bool(deal["sim"])})
         if last is None:
-            raise Refused(v.refused("у сделки нет входа — продолжать нечего"))
+            raise Refused("у сделки нет входа — продолжать нечего")
         spec = json.loads(last["spec_json"])
         op = None
         if not spec.get('perp_only'):
@@ -1469,21 +1484,21 @@ class Desk:
                 oid = adopt_legacy(con, deal)
                 op = store.get_operation(con, oid) if oid else None
             except (store.StoreError, ValueError) as e:
-                raise Refused(v.refused(f'цель операции не подтверждена: {e}')) from None
+                raise Refused(f'цель операции не подтверждена: {e}') from None
             if op and int(op['reserved_raw']):
-                raise Refused(v.refused('исход прошлой отправки неизвестен — сначала «позиции»'))
+                raise Refused('исход прошлой отправки неизвестен — сначала «позиции»')
             if op and op['state'] == store.OpState.PAUSED_UNKNOWN:
                 store.set_operation_state(con, op['id'], store.OpState.STOPPED, reason='reservation resolved')
         if last["kind"] == "entry" and last["status"] in (IntentStatus.PARTIAL, IntentStatus.INTERRUPTED,
                                                           IntentStatus.FAILED):
             if not op:
-                raise Refused(v.refused('нет подтверждённой корневой цели входа'))
+                raise Refused('нет подтверждённой корневой цели входа')
             stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
             rest = D(store.operation_remaining(op)) / D(10) ** sdec
             if rest <= 0:
-                raise Refused(v.refused("вход уже набран полностью"))
+                raise Refused("вход уже набран полностью")
             if deal["state"] not in (DealState.PAUSED, DealState.OPEN):
-                raise Refused(v.refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}"))
+                raise Refused(f"сделка {deal['id']} {v.DEAL_STATE_LABEL.get(deal['state'], deal['state'])}")
             return self._propose_entry_more(deal, rest, spec, chat, operation_id=op["id"])
         if last["kind"] == "exit" and last["status"] in (IntentStatus.PARTIAL, IntentStatus.INTERRUPTED,
                                                          IntentStatus.FAILED):
@@ -1493,7 +1508,7 @@ class Desk:
                 return self._propose_exit_more(deal, dict(last), spec, chat, operation_id=op["id"])
             return self.propose_exit(deal["id"], None if spec.get("all") else dget(spec.get("usd")),
                                      bool(spec.get("perp_only")), chat)          # весь спот / весь шорт — повтор верен
-        raise Refused(v.refused(f"последнее намерение {last['id']} — {last['status']}: продолжать нечего"))
+        raise Refused(f"последнее намерение {last['id']} — {last['status']}: продолжать нечего")
 
     @staticmethod
     def _sold_units(clips) -> int:
@@ -1514,27 +1529,27 @@ class Desk:
         clips = store.clips_of(con, last["id"])
         for c in clips:
             if c["state"] in (ClipState.DEX_SENT, ClipState.DEX_UNKNOWN):
-                raise Refused(v.refused(f"исход клипа {c['seq']} выхода {last['id']} неизвестен — сначала «позиции»"))
+                raise Refused(f"исход клипа {c['seq']} выхода {last['id']} неизвестен — сначала «позиции»")
         sold = self._sold_units(clips)
         try:
             target = int(spec0["units"])
         except (KeyError, TypeError, ValueError):
             target = 0
         if target <= 0:                        # намерение без цели в токенах (план прежнего кода)
-            raise Refused(v.refused(f"частичный выход {last['id']} прерван: продано {v.num(D(sold) / D(10) ** dec)} "
-                                    f"{deal['coin']} — остаток не вычислить; «выход {deal['id']} <остаток $>»"))
+            raise Refused(f"частичный выход {last['id']} прерван: продано {v.num(D(sold) / D(10) ** dec)} "
+                                    f"{deal['coin']} — остаток не вычислить; «выход {deal['id']} <остаток $>»")
         root = spec0.get("root") or last["id"]
         root_units = int(spec0.get("root_units") or target)
         op = store.get_operation(con, operation_id) if operation_id else None
         if op and int(op['reserved_raw']):
-            raise Refused(v.refused('резерв операции ещё не разрешён'))
+            raise Refused('резерв операции ещё не разрешён')
         rest = store.operation_remaining(op) if op else target - sold
         if op:
             root_units = int(op['target_raw'])
         if rest <= 0:
             ts = D(10) ** dec
-            raise Refused(v.refused(f"выход {root} выполнен: продано {v.tok(D(root_units - rest) / ts)} из "
-                                    f"{v.tok(D(root_units) / ts)} {deal['coin']}"))
+            raise Refused(f"выход {root} выполнен: продано {v.tok(D(root_units - rest) / ts)} из "
+                                    f"{v.tok(D(root_units) / ts)} {deal['coin']}")
         plan, ctx = self.plan_exit(deal, None, False, units=rest, cfg=cfg, write_checks=False)
         inst = ctx["inst"]
         full = bool(spec0.get("all")) or bool(ctx.get("m2_full"))        # m ≠ 1: остаток меньше шага·m — выход всей сделки (ревью 13.09, M2)
@@ -1547,13 +1562,13 @@ class Desk:
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"), sim=sim)
         if not full:
             ctx.update(resume=True, exit_root_units=root_units, usd=usd, full=False)  # «Остаток выхода: 1 222 из 2 445»
-        return Proposal(iid, nonce, deal["id"], "exit", v.plan(self.plan_view(iid, plan, ctx)), plan)
+        return Proposal(iid, nonce, deal["id"], "exit", 'plan', self.plan_view(iid, plan, ctx), plan)
 
     def _propose_entry_more(self, deal: dict, usd: D, spec0: dict, chat: int | None, *, operation_id=None) -> Proposal:
         inst = deal_instrument(self.conns.get(), deal)
         if not inst.verified:                  # m не подтверждён (ревью 13.09, R6): наращивать нельзя, закрывать можно
-            raise Refused(_views().refused(f"инструмент сделки {deal['id']} не подтверждён ({inst.why}) — добор "
-                                           f"запрещён; закрыть: «выход {deal['id']}»"))
+            raise Refused(f"инструмент сделки {deal['id']} не подтверждён ({inst.why}) — добор "
+                                           f"запрещён; закрыть: «выход {deal['id']}»")
         cfg = self.cfg()
         self._common_checks(cfg, bool(deal["sim"]), "вход", *_deal_cv(deal))
         # инструмент — замороженный сделки (Н2): таблица только подтверждает, что он не сменился и не отозван
@@ -1568,7 +1583,7 @@ class Desk:
         con = self.conns.get()
         iid, nonce = self._root_proposal(deal, "entry", spec, plan, chat, operation_id=operation_id)
         ctx.update(resume=True, deal_leg_usd=dget(deal["leg_usd"]))      # «Остаток входа: 250 из 500 $»
-        return Proposal(iid, nonce, deal["id"], "entry", _views().plan(self.plan_view(iid, plan, ctx)), plan)
+        return Proposal(iid, nonce, deal["id"], "entry", 'plan', self.plan_view(iid, plan, ctx), plan)
 
     def _carry(self, deal: dict) -> D:
         """Дельта сделки в токенах сейчас — перенос для плана добора (ревью 13.09, M1); неизвестна — 0."""
@@ -1601,10 +1616,11 @@ class Desk:
                               cfg=cfg, write_checks=False)[0]
 
     # --- вид плана ---
-    def plan_view(self, iid: str, plan: Plan, ctx: dict):
-        """Данные сообщения плана (вариант C): видимый каркас + всё, по чему views решает, выносить ли строку ⚠️.
-        Техника исполнения (α/β, риск голой ноги, предел времени) заморожена в плане, но в сообщение не идёт."""
-        v = _views()
+    def plan_view(self, iid: str, plan: Plan, ctx: dict) -> dict:
+        """Факты сообщения плана (вариант C): видимый каркас + всё, по чему views решает, выносить ли строку ⚠️.
+        Техника исполнения (α/β, риск голой ноги, предел времени) заморожена в плане, но в сообщение не идёт.
+        Форма — как у tg.views.PlanView (те же имена полей), но словарь: Desk не импортирует tg (AC-07), рендерит
+        только interface.presenter.render_proposal_view (topic='plan') из Proposal.view_facts."""
         e, inp = plan.est, plan.inputs
         cfg, pair, sim = ctx["cfg"], ctx["pair"], ctx["sim"]
         entry = plan.kind == "entry"
@@ -1642,10 +1658,11 @@ class Desk:
             perp_qty = dget(e.get("tokens"))
         else:                                  # m ≠ 1: контракты откупа по плану (дочерние, вниз к шагу), не токены / m
             perp_qty = dget(e.get("contracts"))
-        return v.PlanView(
+        return dict(
             intent_id=iid, kind=plan.kind, coin=plan.coin, chain=pair.chain, perp_venue=plan.perp, symbol=plan.symbol,
             leg_usd=plan.leg_usd, clips_usd=clips_usd, token_qty=token_qty, m=m, perp_qty=perp_qty,
-            deal_id=plan.deal_id, perp_only=perp_only, sim=sim, exit_all=entry or bool(ctx.get("full")),
+            deal_id=plan.deal_id, perp_only=perp_only, ttl_s=tconfig.PLAN_TTL_S, sim=sim,
+            exit_all=entry or bool(ctx.get("full")),
             req_usd=ctx.get("usd"), deal_leg_usd=dget(deal["leg_usd"]) if deal is not None else ctx.get("deal_leg_usd"),
             resume=bool(ctx.get("resume")), step=dget((inp.get("filters") or {}).get("step")),
             leverage=cfg.get(f"perp.{pair.venue}.leverage"), margin_type=cfg.get(f"perp.{pair.venue}.margin_type"),
@@ -2009,7 +2026,7 @@ class Engine:
         except Refused as e:
             store.set_intent_status(con, run.iid, IntentStatus.FAILED, err="перекотировка не удалась")
             self._abort_draft(run)
-            self.hooks.report(e.html)
+            self.hooks.notice(e.topic, e.facts)
             return None
         if fresh.inputs.get("inst_hash") != run.spec.get("inst_hash"):
             # второй слой (Н2): свежий план — по другому инструменту. Новый план по нему бот сам не предлагает
@@ -2017,8 +2034,8 @@ class Engine:
             store.set_intent_status(con, run.iid, IntentStatus.FAILED, err=why)
             store.event(con, "inst_mismatch", deal_id=run.did, intent_id=run.iid, why=why)
             self._abort_draft(run)
-            self.hooks.report(_views().refused(f"перекотировка: инструмент {run.deal['coin']} сменился — ничего не "
-                                               "отправлено, нужен новый план"))
+            self.hooks.notice('refused', {'reason': f"перекотировка: инструмент {run.deal['coin']} сменился — "
+                                          "ничего не отправлено, нужен новый план"})
             return None
         v = _views()
         reasons = []
@@ -3147,11 +3164,14 @@ class Engine:
 def plan_cli(coin: str, spot: str, perp: str, usd: D, *, owner_path=None, db_path=None, table_loader=None,
              runtime: Runtime | None = None) -> str:
     """План входа в симуляции (dry) — тем же кодом, что у кнопок, без записи намерения и без ключей: для сверки
-    плана с живым стаканом с Мака или сервера. Возвращает простой текст сообщения плана."""
+    плана с живым стаканом с Мака или сервера. Возвращает простой текст сообщения плана.
+    Единственное место в этом модуле, где рендер плана в текст остаётся рядом с Desk: это не путь исполнителя —
+    отдельная команда `funding_bot plan` в один процесс, без core/interface IPC (AC-07 — про границу процессов)."""
+    from types import SimpleNamespace
     from ..tg.sender import to_plain
     cfg = owner_mod.load(owner_path)
     conns = Conns(db_path)
     rt = runtime or build_runtime(cfg, conns, mode="dry")
     desk = Desk(conns, lambda sim: rt.sim if sim else None, owner_loader=lambda: cfg, table_loader=table_loader)
     plan, ctx = desk.plan_entry(coin, spot, perp, usd, cfg=cfg, sim=True, write_checks=False)
-    return to_plain(_views().plan(desk.plan_view("—", plan, ctx)))
+    return to_plain(_views().plan(SimpleNamespace(**desk.plan_view("—", plan, ctx))))

@@ -77,7 +77,7 @@ def test_contract_with_multiplier_is_refused_before_any_send(tmp_path, coin, sym
     e.desk.table_loader = lambda: _table(base=coin, perp=symbol)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry(coin, "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "1 контракт = 1 токен" in ei.value.html
+    assert "1 контракт = 1 токен" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0) and e.spot.approvals == []
 
 
@@ -88,7 +88,7 @@ def test_hidden_multiplier_caught_by_price_ratio(tmp_path):
     e.perp.b = Book(tuple((p * 1000, q) for p, q in b.bids), tuple((p * 1000, q) for p, q in b.asks), 0.0)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "единицы не сходятся" in ei.value.html
+    assert "единицы не сходятся" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0)
 
 

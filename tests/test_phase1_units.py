@@ -164,7 +164,7 @@ def test_entry_m1000_without_key_is_refused_before_any_send(tmp_path, value):
         e.path.write_text(with_key(fx.live_toml(), value))
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert KEY in ei.value.html and "1 контракт = 1 токен" in ei.value.html
+    assert KEY in fx.render(ei.value) and "1 контракт = 1 токен" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0) and e.spot.approvals == []
     assert e.con.execute("SELECT count(*) FROM deals").fetchone()[0] == 0
 
@@ -179,7 +179,7 @@ def test_other_asset_is_refused_even_with_key(tmp_path, how):
         e.desk.table_loader = lambda: dict(fx.TABLE, sf_rows=[dict(fx.TABLE["sf_rows"][0], perp="1000BTCUSDT")])
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "другой актив" in ei.value.html
+    assert "другой актив" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0)
 
 
@@ -189,7 +189,7 @@ def test_margin_check_refuses_before_swap_and_passes_when_enough(tmp_path):
     e = mult_env(tmp_path / "a", margin=D(50))
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "Маржа Aster 50.00 — меньше 100.00 USDT" in flat(ei.value.html)
+    assert "Маржа Aster 50.00 — меньше 100.00 USDT" in flat(fx.render(ei.value))
     assert fx.sends(e) == (0, 0) and e.spot.approvals == []
     (tmp_path / "b").mkdir()
     ok = mult_env(tmp_path / "b", margin=D(100))
@@ -222,7 +222,7 @@ def test_partial_exit_m1000_buys_contracts_and_stays_even(tmp_path):
     p = enter(e)
     tok0 = book(e, p.deal_id).tokens(18)
     x = e.desk.propose_exit(p.deal_id, D(50), False, chat=fx.OWNER)
-    assert "Продать спот 1 222 · откупить шорт 1 контр. (= 1 000 токенов)" in flat(x.html), flat(x.html)
+    assert "Продать спот 1 222 · откупить шорт 1 контр. (= 1 000 токенов)" in flat(fx.render(x)), flat(fx.render(x))
     n0 = len(e.perp.calls)
     fx.run_approved(e, x)
     buys = e.perp.calls[n0:]
@@ -239,7 +239,7 @@ def test_full_exit_m1000_closes(tmp_path):
     e = mult_env(tmp_path)
     p = enter(e)
     x = e.desk.propose_exit(p.deal_id, None, False, chat=fx.OWNER)
-    assert "откупить шорт 2 контр. (= 2 000 токенов)" in flat(x.html)
+    assert "откупить шорт 2 контр. (= 2 000 токенов)" in flat(fx.render(x))
     fx.run_approved(e, x)
     bk = book(e, p.deal_id)
     assert store.get_deal(e.con, p.deal_id)["state"] == DealState.CLOSED
@@ -303,17 +303,17 @@ def test_rehedge_and_undo_m1000(tmp_path):
     # δ ≈ 444.6 токена < шага·m: ноги ровно — дохеджировать и откатывать нечего, выход разрешён
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_fix("rehedge", did, chat=fx.OWNER)
-    assert "Ноги ровно (дельта +445 меньше шага)" in ei.value.html
+    assert "Ноги ровно (дельта +445 меньше шага)" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_fix("undo", did, chat=fx.OWNER)
-    assert "только для голого лонга" in ei.value.html
+    assert "только для голого лонга" in fx.render(ei.value)
     e.desk.propose_exit(did, None, False, chat=fx.OWNER)
     # шорт 1 контракт: δ ≈ 1 444.6 — дохедж продаёт 1 КОНТРАКТ (а не 1 444)
     _short_by(e, did, 1)
     fix = e.desk.propose_fix("rehedge", did, chat=fx.OWNER)
     sp = t11._spec_of(e.con, fix.intent_id)
     assert (sp["side"], D(sp["qty"])) == ("SELL", D(1))
-    t = flat(fix.html)
+    t = flat(fx.render(fix))
     assert "Без хеджа +1 445 AIW3 ≈ 59.10 $ спота" in t and "Продать 1 контр. (= 1 000 токенов) на перпе Aster" in t, t
     n0 = len(e.perp.calls)
     fx.run_approved(e, fix)
@@ -324,7 +324,7 @@ def test_rehedge_and_undo_m1000(tmp_path):
     _short_by(e, did, 1)
     und = e.desk.propose_fix("undo", did, chat=fx.OWNER)
     assert t11._spec_of(e.con, und.intent_id)["units"] == M * fx.E18
-    assert "Продать 1 000 AIW3 на DEX" in flat(und.html)
+    assert "Продать 1 000 AIW3 на DEX" in flat(fx.render(und))
     tok0, n0 = book(e, did).tokens(18), len(e.perp.calls)
     fx.run_approved(e, und)
     assert tok0 - book(e, did).tokens(18) == M and len(e.perp.calls) == n0
@@ -349,7 +349,7 @@ def test_sell_needs_fresh_key_buy_and_exit_do_not(tmp_path):
     before = fx.sends(e)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_fix("rehedge", did, chat=fx.OWNER)
-    assert KEY in ei.value.html
+    assert KEY in fx.render(ei.value)
     fx.run_approved(e, fix)
     assert fx.sends(e) == before, "одобренная раньше продажа контрактов без ключа не отправлена"
     assert store.get_intent(e.con, fix.intent_id)["status"] == IntentStatus.FAILED
@@ -429,7 +429,7 @@ def test_perp_only_exit_then_undo_m1000(tmp_path):
     e = mult_env(tmp_path)
     p = enter(e)
     x = e.desk.propose_exit(p.deal_id, None, True, chat=fx.OWNER)
-    assert "Откупить шорт 2 контр. (= 2 000 токенов) на Aster" in flat(x.html)
+    assert "Откупить шорт 2 контр. (= 2 000 токенов) на Aster" in flat(fx.render(x))
     fx.run_approved(e, x)
     assert e.perp.pos == 0 and store.get_deal(e.con, p.deal_id)["state"] == DealState.PAUSED
     t = flat(e.hooks.reports[-1])
@@ -648,8 +648,8 @@ def test_dqa9q_m1_texts_and_numbers_unchanged(tmp_path):
     mk = marks.mark_deal(e.con, deal, e.legs_live, now=time.time())
     assert "m" not in mk.flags, "флаги m = 1 прежние"
     x = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
-    assert "Продать спот 4 902 · откупить шорт 4 902" in flat(x.html)
-    assert "контр." not in x.html
+    assert "Продать спот 4 902 · откупить шорт 4 902" in flat(fx.render(x))
+    assert "контр." not in fx.render(x)
     fx.run_approved(e, x)
     assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.CLOSED and "контр." not in e.hooks.reports[-1]
 

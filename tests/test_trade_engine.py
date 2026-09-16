@@ -29,6 +29,16 @@ ROOT = Path(__file__).resolve().parents[1]
 RAW_NUM = re.compile(r"\d\.\d{10,}")                 # сырой Decimal (18 знаков) в тексте владельцу
 ASCII_MINUS = re.compile(r"(?:^|[\s(])-\d", re.M)    # минус в числах — только «−»
 flat = lambda s: s.replace(views.NBSP, " ")         # noqa: E731 — неразрывные пробелы обычными
+
+
+def render(obj):
+    """AC-07: Proposal/Refused/Notice больше не хранят готовый HTML — только факты (view_topic/view_facts или
+    topic/facts). Рендерит их ровно так же, как interface.presenter — старые проверки текста (что раньше читали
+    из .html) продолжают проверять тот же самый финальный текст, только через явный рендер факта."""
+    from funding_bot.interface.presenter import render_execution_notice, render_proposal_view
+    if hasattr(obj, "view_topic"):
+        return render_proposal_view(obj.view_topic, obj.view_facts)
+    return render_execution_notice(obj.topic, obj.facts)
 EXAMPLE = (ROOT / "deploy" / "owner.toml.example").read_text()
 WALLET = "0x" + "b2" * 20  # synthetic fixture identity, independent of any configured account
 STABLE = "0x55d398326f99059ff775485246999027b3197955"
@@ -461,7 +471,7 @@ def sends(e) -> tuple[int, int]:
 def test_dry_run_entry_and_exit_full_flow(tmp_path):
     e = sim_env(tmp_path)
     p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(500), chat=OWNER)
-    assert p.html.startswith(views.SIM_PREFIX) and "📝 <b>Вход AIW3" in p.html
+    assert render(p).startswith(views.SIM_PREFIX) and "📝 <b>Вход AIW3" in render(p)
     assert p.plan.missing_owner_keys, "dry строит план и перечисляет, что заблокировало бы live"
     run_approved(e, p)
     deal = store.get_deal(e.con, p.deal_id)
@@ -475,7 +485,7 @@ def test_dry_run_entry_and_exit_full_flow(tmp_path):
     assert e.legs_sim.perp.setups == [(SYMBOL, 1, "ISOLATED")]
 
     x = e.desk.propose_exit(p.deal_id, None, False, chat=OWNER)
-    assert "📝 <b>Выход AIW3 · всё</b>" in x.html
+    assert "📝 <b>Выход AIW3 · всё</b>" in render(x)
     run_approved(e, x)
     deal = store.get_deal(e.con, p.deal_id)
     bk = deal_book(e.con, p.deal_id)
@@ -489,7 +499,7 @@ def test_dry_run_entry_and_exit_full_flow(tmp_path):
     # симуляция в заявках на биржу не превращается: ни одной строки dex_txs
     assert e.con.execute("SELECT count(*) FROM dex_txs").fetchone()[0] == 0
     # все тексты владельцу: HTML безопасен, без сырых Decimal и ASCII-минуса; в симуляции ссылок на tx нет
-    for t in [p.html, x.html, *e.hooks.reports, *(h for _i, h in e.hooks.progresses)]:
+    for t in [render(p), render(x), *e.hooks.reports, *(h for _i, h in e.hooks.progresses)]:
         assert html_ok(t) and not RAW_NUM.search(t) and not ASCII_MINUS.search(t) and "<a " not in t, t
         assert t.startswith(views.SIM_MARK), t               # 🧪 — первым символом в КАЖДОМ сообщении симуляции
 
@@ -655,13 +665,13 @@ def test_okx_dex_without_chain_resolves_chain_from_table(tmp_path):
     только в другой сети — честный отказ с перечнем сетей, а не догадка."""
     e = sim_env(tmp_path)
     p = e.desk.propose_entry("AIW3", "okx", "aster", D(450), chat=OWNER)
-    assert "📝 <b>Вход AIW3" in p.html and "OKX DEX·BSC" in p.html
+    assert "📝 <b>Вход AIW3" in render(p) and "OKX DEX·BSC" in render(p)
     sol = {"ts": 0, "sf_rows": [dict(TABLE["sf_rows"][0], spot="501:So11111111111111111111111111111111111111112",
                                      spot_label="okx·sol")]}
     d2 = Desk(e.conns, e.legs, owner_loader=e.loader, table_loader=lambda: sol)
     with pytest.raises(eng.Refused) as ei:
         d2.plan_entry("AIW3", "okx", "aster", D(450), sim=True)
-    assert "только okx·bsc" in ei.value.html
+    assert "только okx·bsc" in render(ei.value)
 
 
 # ==== 4. рестарт посреди клипа в каждом состоянии ====================================================================
@@ -761,7 +771,7 @@ def test_after_restart_rehedge_restores_the_pair(tmp_path):
     assert D(0) <= bk.delta(18) < FILT.step and e.perp.pos == -bk.short
     assert e.perp.calls[-1]["side"] == "SELL"
     assert store.get_deal(e.con, p.deal_id)["state"] == DealState.PAUSED   # вход прерван — дальше решает владелец
-    for t in [fix.html, *e.hooks.reports]:                      # план и итог дохеджа — без сырых Decimal
+    for t in [render(fix), *e.hooks.reports]:                      # план и итог дохеджа — без сырых Decimal
         assert html_ok(t) and not RAW_NUM.search(t) and not ASCII_MINUS.search(t), t
 
 
@@ -953,7 +963,9 @@ def test_sim_replies_to_resume_and_requote_carry_sim_mark(tmp_path):
     run_approved(e, p)
     store.set_deal_state(e.con, p.deal_id, DealState.HALTED_MISMATCH, reason="position_mismatch")
     t = e.desk.propose_resume(p.deal_id, chat=OWNER)
-    assert isinstance(t, str) and t.startswith(views.SIM_PREFIX + "\n") and "сверена" in t, t
+    assert isinstance(t, eng.Notice) and t.topic == 'resume_checked' and t.facts['sim'] is True
+    text = render(t)
+    assert text.startswith(views.SIM_PREFIX + "\n") and "сверена" in text, text
     assert store.get_deal(e.con, p.deal_id)["state"] == DealState.PAUSED
 
 
@@ -1168,7 +1180,7 @@ def test_live_ioc_children_use_the_plans_alpha_beta_after_requote(tmp_path, monk
     p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(500), chat=OWNER)
     a0, b0 = p.plan.est["alpha"], p.plan.est["beta_bps"]
     assert p.plan.est["alpha_auto"] and a0 == D("0.1") and b0 == P.beta_candidates(make_book(), "SELL", FILT)[0]
-    assert "α" not in p.html and "β" not in p.html                 # C: числа в плане, в сообщение не идут
+    assert "α" not in render(p) and "β" not in render(p)                 # C: числа в плане, в сообщение не идут
     e.perp.b = thin_bid_book()                                  # до кнопки лучший бид поредел
     run_approved(e, p)
     assert store.get_deal(e.con, p.deal_id)["state"] == DealState.OPEN
@@ -1208,8 +1220,8 @@ def test_plan_message_hides_auto_numbers_and_missing_skips_auto_keys(tmp_path):
     p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(500), chat=OWNER)
     est = p.plan.est
     assert (est.get("alpha_auto") or est.get("beta_auto")) and est.get("exec_time_max_s") is not None   # в плане
-    assert not any(w in p.html for w in ("α", "β", "риск голой ноги", "тревога ликвидации"))
-    miss = next(ln for ln in p.html.splitlines() if "Для live не задано" in ln)
+    assert not any(w in render(p) for w in ("α", "β", "риск голой ноги", "тревога ликвидации"))
+    miss = next(ln for ln in render(p).splitlines() if "Для live не задано" in ln)
     assert miss == f"⚠️ Для live не задано: {len(p.plan.missing_owner_keys)} · <code>статус</code>"
     labels = [views.key_label(k) for k in p.plan.missing_owner_keys]
     assert "id владельца в Telegram" in labels
@@ -1232,10 +1244,10 @@ def test_rehedge_auto_freezes_alpha_beta_in_its_plan(tmp_path):
     fix = e.desk.propose_fix("rehedge", p.deal_id, chat=OWNER)
     assert fix.plan.est["alpha_auto"] and fix.plan.est["alpha"] == D("0.1")
     assert D(str(fix.plan.est["beta_bps"])).quantize(D("0.1")) == D("7.3")          # подобраны под AIW3, в плане
-    lines = flat(fix.html).splitlines()
+    lines = flat(render(fix)).splitlines()
     assert lines[0] == "📝 <b>Дохедж AIW3</b>" and lines[1].startswith("Без хеджа +") and lines[1].endswith(" спота")
     assert lines[2].startswith("Продать ") and lines[2].endswith(" AIW3 на перпе Aster") and lines[3] == "⏱ 60 с"
-    assert "α" not in fix.html and html_ok(fix.html) and not RAW_NUM.search(fix.html)
+    assert "α" not in render(fix) and html_ok(render(fix)) and not RAW_NUM.search(render(fix))
     run_approved(e, fix)
     cap = P.beta_px(PX, "SELL", FILT, fix.plan.est["beta_bps"])
     assert e.perp.calls and all(c["cap"] == cap for c in e.perp.calls)
@@ -1295,5 +1307,5 @@ def test_dex_link_rows_are_view_only_not_tradable(tmp_path):
     d2 = Desk(e.conns, e.legs, owner_loader=e.loader, table_loader=lambda: linked)
     with pytest.raises(eng.Refused) as ei:
         d2.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=True)
-    assert "прямое доказательство" in ei.value.html
+    assert "прямое доказательство" in render(ei.value)
     assert e.desk.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=True) is not None   # свой контракт — как раньше

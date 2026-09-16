@@ -10,6 +10,7 @@ from funding_bot.trade.engine import Refused, deal_book
 from funding_bot.trade.solana import ANSEM_MINT
 from funding_bot.trade.store import ClipState, DealState, IntentStatus, OpState, PerpOrderState
 import sol_c2_world as W
+import test_trade_engine as fx
 from sol_c2_world import Crash, approve_run, enter, entry_cmd, make_world, restart
 
 pytest.importorskip("solders")
@@ -44,8 +45,8 @@ def exit_deal(w, did):
 def test_entry_150_one_clip_hedge_only_after_finalized_receipt(tmp_path):
     w = make_world(tmp_path)
     prop = w.desk.propose_profile_entry(entry_cmd(), chat=None)
-    assert "Вход ANSEM" in prop.html and "para:ANSEM" in prop.html and "Jupiter" in prop.html
-    assert "только показ" in prop.html                        # Order виден, но не исполним
+    assert "Вход ANSEM" in fx.render(prop) and "para:ANSEM" in fx.render(prop) and "Jupiter" in fx.render(prop)
+    assert "только показ" in fx.render(prop)                        # Order виден, но не исполним
     approve_run(w, prop)
     d = deal_of(w, prop)
     assert d["state"] == DealState.OPEN, w.hooks.reports
