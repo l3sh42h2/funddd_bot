@@ -6,7 +6,7 @@ import json, logging, os, queue, signal, threading, time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from ..trade import marks, owner as owner_mod, reconcile, store, tconfig
-from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Refused, build_runtime, dget
+from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Notice, Refused, build_runtime, dget
 from ..trade.keys import KeysError, effective_mode, install_log_redaction, redact
 from ..trade.owner import OwnerConfigError
 from ..trade.store import DealState
@@ -300,11 +300,12 @@ class Bot:
 
     # --- планы (поток заданий) ---
     def propose(self, chat: int, fn: Callable[[], Any]):
-        """Предложение с кнопками. Отказ предпроверок — готовый текст (Refused); сбой — «⚠️» с причиной."""
+        """Предложение с кнопками. Отказ предпроверок и итоги без плана (Refused/Notice) — факты, не готовый
+        HTML: interface рендерит их через execution_notice (AC-07); сбой — «⚠️» с причиной."""
         try:
             p = fn()
         except Refused as e:
-            self.sender.send(chat, e.html)
+            self.sender.execution_notice(chat, e.topic, e.facts)
             return None
         except OwnerConfigError as e:
             self.sender.notice(chat, 'configuration_error', reason=redact(e))
@@ -313,10 +314,11 @@ class Bot:
             log.exception("план не построен")
             self.sender.notice(chat, 'error', reason=f'план не построен: {type(e).__name__}: {redact(e)}')
             return None
-        if isinstance(p, str):
-            self.sender.send(chat, p)
+        if isinstance(p, Notice):
+            self.sender.execution_notice(chat, p.topic, p.facts)
             return None
-        self.sender.plan_proposed(chat, p.intent_id, p.nonce, self._plan_summary(p.intent_id), p.html,
+        self.sender.plan_proposed(chat, p.intent_id, p.nonce, self._plan_summary(p.intent_id),
+                                  p.view_topic, p.view_facts,
                                   on_done=lambda m, iid=p.intent_id: self._plan_sent(iid, chat, m))
         for old in getattr(p, "superseded", ()) or ():     # новый план сделки — у прежних снимаются кнопки
             self._close_plan(old, "expired")

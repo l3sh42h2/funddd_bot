@@ -139,7 +139,8 @@ def main(argv=None):
         try:
             print(plan_cli(coin, spot, perp, usd))
         except Refused as e:
-            print(to_plain(e.html), file=sys.stderr)
+            from .interface.presenter import render_execution_notice
+            print(to_plain(render_execution_notice(e.topic, e.facts)), file=sys.stderr)
             return 1
     elif a.cmd == "sol-hl":
         from . import sol_doctor

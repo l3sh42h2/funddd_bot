@@ -168,7 +168,7 @@ def _open(e, usd=D(400)):
 def test_rh_gate_entry_400_and_full_exit(tmp_path):
     e = rh_env(tmp_path)
     p = e.desk.propose_entry("FATCOIN", "okx·rh", "gate", D(400), chat=fx.OWNER)
-    assert not p.html.startswith(views.SIM_PREFIX), "связка в live, ключи live — план живой"
+    assert not fx.render(p).startswith(views.SIM_PREFIX), "связка в live, ключи live — план живой"
     assert not p.plan.missing_owner_keys, p.plan.missing_owner_keys
     fx.run_approved(e, p)
     deal = store.get_deal(e.con, p.deal_id)
@@ -193,7 +193,7 @@ def test_rh_gate_entry_400_and_full_exit(tmp_path):
     rows = e.con.execute("SELECT venue, reduce_only, side FROM perp_orders ORDER BY id").fetchall()
     assert {r[0] for r in rows} == {"gate"}
     assert [r[2] for r in rows if r[1]] and all(r[2] == "BUY" for r in rows if r[1])
-    _texts_clean([p.html, x.html, *e.hooks.reports, *(h for _i, h in e.hooks.progresses)])
+    _texts_clean([fx.render(p), fx.render(x), *e.hooks.reports, *(h for _i, h in e.hooks.progresses)])
     assert e.built and set(e.built) == {False}, "ноги — из реестра связки RH; симуляционные не собирались"
 
 
@@ -204,7 +204,7 @@ def test_rh_plan_is_simulation_unless_profile_is_live(tmp_path):
         (tmp_path / str(i)).mkdir()
         e = rh_env(tmp_path / str(i), toml)
         p = e.desk.propose_entry("FATCOIN", "okx·rh", "gate", D(400), chat=fx.OWNER)
-        assert p.html.startswith(views.SIM_PREFIX), toml
+        assert fx.render(p).startswith(views.SIM_PREFIX), toml
         assert e.built == [True]
 
 
@@ -212,20 +212,20 @@ def test_rh_refused_when_profile_legs_not_connected(tmp_path):
     e = rh_env(tmp_path, factory=False)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("FATCOIN", "okx·rh", "gate", D(400), chat=fx.OWNER)
-    assert "rh_okx_gate" in ei.value.html and "не подключена" in ei.value.html
+    assert "rh_okx_gate" in fx.render(ei.value) and "не подключена" in fx.render(ei.value)
 
 
 def test_pairs_outside_evm_profiles_refused(tmp_path):
     e = rh_env(tmp_path)
     with pytest.raises(eng.Refused) as ei:
         e.desk.find_pair("FATCOIN", "okx·bsc", "gate")
-    assert "okx·rh" in ei.value.html
+    assert "okx·rh" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.find_pair("FATCOIN", "okx·rh", "aster")
-    assert "okx·bsc" in ei.value.html
+    assert "okx·bsc" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.find_pair("FATCOIN", "okx·rh", "binance")
-    assert "пока только" in ei.value.html
+    assert "пока только" in fx.render(ei.value)
     pi = e.desk.find_pair("FATCOIN", "okx", "gate")                    # «okx dex» без сети — сеть из таблицы
     assert (pi.chain, pi.venue, pi.token, pi.spot_label) == ("robinhood", "gate", FAT, "okx·rh")
 

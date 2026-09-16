@@ -25,8 +25,8 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from typing import Any, Mapping
 from . import hl_rules as R, instruments as I, planner, store, tconfig
-from .engine import (HedgeResult, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book, deal_instrument,
-                     dget)
+from .engine import (HedgeResult, Notice, PERP_ATTEMPTS_MAX, Pause, Proposal, Refused, _views, deal_book,
+                     deal_instrument, dget)
 from .exposure import Exposure
 from .operations import ClipLifecycle, OperationController, SpotSettlement
 from .coordinator import HedgeAction, HedgeProgram, LifecycleCoordinator
@@ -460,7 +460,7 @@ class SolDesk:
         return self.d.conns.get()
 
     def refuse(self, text: str) -> Refused:
-        return Refused(_views().refused(text))
+        return Refused(text)
 
     def profile_venue(self) -> str:
         return SOL_PROFILE_VENUES[self.profile]
@@ -497,18 +497,17 @@ class SolDesk:
         return lg
 
     def common(self, cfg: OwnerCfg, sim: bool, action: str) -> None:
-        v = _views()
         con = self.con
         if store.is_paused(con):
             raise self.refuse("пауза («стоп»): новое не начинаю. Снять — «продолжить»")
         if self.d.busy() or store.busy_intents(con):
             row = con.execute("SELECT id FROM intents WHERE status IN ('approved','running') LIMIT 1").fetchone()
-            raise Refused(v.busy(row[0] if row else None))
+            raise Refused(topic='busy', facts={'intent_id': row[0] if row else None})
         if not sim:
             try:
                 cfg.require_profile_live(self.profile)
             except OwnerMissing as e:
-                raise Refused(v.owner_missing(e.keys, action)) from None
+                raise Refused(topic='owner_missing', facts={'keys': list(e.keys), 'action': action}) from None
             except OwnerUnsupported as e:
                 raise self.refuse(str(e)) from None
 
@@ -786,11 +785,13 @@ class SolDesk:
                    margin_avail=avail)
         return plan, ctx
 
-    def plan_view(self, iid: str, plan: Plan, ctx: dict, deal_id: str | None = None):
-        sv, rc, inst = _sv(), ctx["rc"], ctx["inst"]
+    def plan_view(self, iid: str, plan: Plan, ctx: dict, deal_id: str | None = None) -> dict:
+        """Факты плана связки Solana × HL — форма tg.sol_views.SolPlanView, но словарь: SolEngine не импортирует tg
+        (AC-07), рендерит только interface.presenter.render_proposal_view (topic='sol_plan')."""
+        rc, inst = ctx["rc"], ctx["inst"]
         entry = plan.kind == "entry"
         f = ctx.get("funding_h")
-        return sv.SolPlanView(
+        return dict(
             intent_id=iid, kind=plan.kind, coin=plan.coin, fullcoin=inst.perp_symbol, deal_id=deal_id,
             usdc=rc.stable, usdc_min=rc.stable_min, tokens=rc.tokens, tokens_min=rc.tokens_min, perp_qty=rc.qty,
             perp_px=rc.perp_vwap, path=ctx["winner"].path, others=self.others(ctx["dec"], ctx["winner"]),
@@ -798,7 +799,7 @@ class SolDesk:
             perp_fee_usd=rc.perp_fee, funding_pct_h=(f * 100) if (f is not None and entry) else None,
             leverage=ctx["cfg"].get(f"perp.{inst.perp_venue}.leverage") if entry else None,
             identity=self.identity_line(inst) if entry else None, notes=tuple(dict.fromkeys(ctx["notes"])),
-            missing=tuple(plan.missing_owner_keys) if ctx["sim"] else (), sim=ctx["sim"],
+            missing=tuple(plan.missing_owner_keys) if ctx["sim"] else (), sim=ctx["sim"], ttl_s=tconfig.PLAN_TTL_S,
             margin_need=ctx.get("margin_need") if entry else None, margin_avail=ctx.get("margin_avail") if entry else None)
 
     def propose_entry(self, cmd, chat: int | None) -> Proposal:
@@ -847,7 +848,7 @@ class SolDesk:
         store.link_intent(con, op_id, iid)
         store.event(con, "proposed", deal_id=did, intent_id=iid, total_usd=plan.est.get("total_usd"), n=1, sim=sim,
                     path=winner.path, operation_id=op_id)
-        return Proposal(iid, nonce, did, "entry", _sv().plan(self.plan_view(iid, plan, ctx, did)), plan,
+        return Proposal(iid, nonce, did, "entry", 'sol_plan', self.plan_view(iid, plan, ctx, did), plan,
                         superseded=tuple(superseded))
 
     # --- выход ---
@@ -997,7 +998,7 @@ class SolDesk:
         superseded = store.supersede_intents(con, deal["id"], keep=iid)     # старые кнопки этой сделки — не исполняются
         store.event(con, "proposed", deal_id=deal["id"], intent_id=iid, total_usd=plan.est.get("total_usd"), sim=sim,
                     path=winner.path, operation_id=op_id)
-        return Proposal(iid, nonce, deal["id"], "exit", _sv().plan(self.plan_view(iid, plan, ctx, deal["id"])), plan,
+        return Proposal(iid, nonce, deal["id"], "exit", 'sol_plan', self.plan_view(iid, plan, ctx, deal["id"]), plan,
                         superseded=tuple(superseded))
 
     # --- дохедж / откат / продолжить ---
@@ -1051,12 +1052,12 @@ class SolDesk:
                     expires=self.d.clock() + tconfig.PLAN_TTL_S)
         iid, nonce = store.create_intent(con, deal_id=deal["id"], kind="rehedge", spec=spec, plan=plan, chat=chat)
         superseded = store.supersede_intents(con, deal["id"], keep=iid)
-        text = v.fix_plan(v.FixPlanView(intent_id=iid, kind="rehedge", coin=deal["coin"], deal_id=deal["id"], delta=d,
-                                        qty=qty, side=side, usd=plan.leg_usd, perp_venue=inst.perp_venue, step=step,
-                                        sim=sim, m=inst.m))
-        return Proposal(iid, nonce, deal["id"], "rehedge", text, plan, superseded=tuple(superseded))
+        facts = dict(intent_id=iid, kind="rehedge", coin=deal["coin"], deal_id=deal["id"], delta=d,
+                    qty=qty, side=side, usd=plan.leg_usd, perp_venue=inst.perp_venue, step=step,
+                    ttl_s=tconfig.PLAN_TTL_S, sim=sim, m=inst.m)
+        return Proposal(iid, nonce, deal["id"], "rehedge", 'fix_plan', facts, plan, superseded=tuple(superseded))
 
-    def propose_resume(self, deal: Mapping, chat: int | None) -> Proposal | str:
+    def propose_resume(self, deal: Mapping, chat: int | None) -> Proposal | Notice:
         v = _views()
         con = self.con
         if deal["state"] in (DealState.ABORTED, DealState.CLOSED):
@@ -1070,8 +1071,9 @@ class SolDesk:
             chk = check_deal(con, deal, legs)
             if chk.matched:
                 store.set_deal_state(con, deal["id"], DealState.PAUSED, reason="сверено владельцем")
-                return v.resume_checked(deal["id"], sim=bool(deal["sim"]))
-            return v.resume_mismatch(deal["id"], chk.detail, sim=bool(deal["sim"]))
+                return Notice('resume_checked', {'deal_id': deal["id"], 'sim': bool(deal["sim"])})
+            detail = chk.detail if chk.detail is None or type(chk.detail) is str else str(chk.detail)
+            return Notice('resume_mismatch', {'deal_id': deal["id"], 'detail': detail, 'sim': bool(deal["sim"])})
         last = con.execute("SELECT * FROM intents WHERE deal_id=? AND kind IN ('entry','exit') "
                            "AND status NOT IN ('proposed','rejected','expired') ORDER BY created DESC "
                            "LIMIT 1", (deal["id"],)).fetchone()
@@ -1655,7 +1657,7 @@ class SolEngine:
 
     def _settle_fix(self, run: SolRun, *, qty: D | None = None, usd: D | None = None, side: str | None = None,
                     noop: str | None = None) -> None:
-        con, v = self.con, _views()
+        con = self.con
         bk = deal_book(con, run.did)
         last = con.execute("SELECT status FROM intents WHERE deal_id=? AND kind IN ('entry','exit') ORDER BY created "
                            "DESC LIMIT 1", (run.did,)).fetchone()
@@ -1677,9 +1679,9 @@ class SolEngine:
             reason="сбалансировано" if new == DealState.PAUSED else None), now=self.e.clock())
         store.event(con, "fixed", deal_id=run.did, intent_id=run.iid, intent_kind=run.kind,
                     what=noop or f"{side} {qty} = {usd}", state=str(new))
-        self.e.hooks.report(v.fix_done(v.FixDoneView(
+        self.e.hooks.notice('fix_done', dict(
             kind="rehedge", coin=run.deal["coin"], deal_id=run.did, state=str(new), qty=qty, usd=usd, side=side,
-            noop=noop, delta=dl, step=_tokens_per_step(run.inst, run.step), sim=run.legs.sim, m=run.inst.m)))
+            noop=noop, delta=dl, step=_tokens_per_step(run.inst, run.step), sim=run.legs.sim, m=run.inst.m))
 
     # --- итог ---
     def _basis(self, run: SolRun, clip_id: int) -> None:
@@ -1747,10 +1749,9 @@ class SolEngine:
                   qty: D | None = None) -> None:
         """Прогресс клипа владельцу (одно сообщение, правится): своп отправлен → спот получен, иду на перп."""
         try:
-            sv = _sv()
-            self.e.hooks.progress(run.iid, sv.progress(sv.SolProgressView(
-                kind=run.kind, coin=run.deal["coin"], fullcoin=run.symbol, stage=stage, path=path, tokens=tokens,
-                perp_qty=qty, sim=run.legs.sim)))
+            self.e.hooks.notice('sol_progress', dict(
+                intent_id=run.iid, kind=run.kind, coin=run.deal["coin"], fullcoin=run.symbol, stage=stage, path=path,
+                tokens=tokens, perp_qty=qty, sim=run.legs.sim))
         except Exception as e:        # noqa — текст не мешает исполнению
             log.warning("прогресс %s: %s", run.iid, type(e).__name__)
 
@@ -1854,12 +1855,11 @@ class SolEngine:
         else:
             u = run.legs.spot.token_balance(run.inst.token, run.inst.token_program)
             wal = _h(u, run.dec)
-        sv = _sv()
-        self.e.hooks.report(sv.halt(sv.SolHaltView(
+        self.e.hooks.notice('sol_halt', dict(
             kind=run.kind, coin=run.deal["coin"], deal_id=run.did, intent_id=run.iid, reason=p.text, state=str(target),
             wallet_tokens=wal, perp_pos=pos, delta=dl,
             delta_usd=(abs(dl) * px * run.inst.fs / run.inst.fp) if (dl and px) else None, need_qty=need,
-            sim=run.legs.sim)))
+            sim=run.legs.sim))
 
 
 def _plan(it: dict) -> Plan:

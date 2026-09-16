@@ -151,7 +151,7 @@ def test_dqa9q_after_migration_exits_as_before(tmp_path, monkeypatch):
         executedQty=row['executed_qty'], cumQuote=row['cum_quote'])
     bind_legacy(e.con, store.get_deal(e.con, 'DQA9Q'), e.perp)
     x = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
-    assert "не подтверждён" not in x.html
+    assert "не подтверждён" not in fx.render(x)
     assert json.loads(store.get_intent(e.con, x.intent_id)["spec_json"])["inst_hash"] == DQA9Q_HASH
     fx.run_approved(e, x)
     assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.CLOSED and e.perp.pos == 0, e.hooks.reports

@@ -224,7 +224,7 @@ def test_dqa9q_is_picked_up_without_manual_steps_full_exit(tmp_path):
     m = marks.mark_deal(e.con, deal, e.legs_live, now=time.time())
     assert m.pnl_now is not None and "errors" not in m.flags
     x = e.desk.propose_exit("DQA9Q", None, False, chat=fx.OWNER)
-    assert "не подтверждён" not in x.html, "текст плана подтверждённой m = 1 сделки прежний"
+    assert "не подтверждён" not in fx.render(x), "текст плана подтверждённой m = 1 сделки прежний"
     assert _spec_of(e.con, x.intent_id)["inst_hash"] == _deal_inst(e.con, "DQA9Q").inst_hash()
     fx.run_approved(e, x)
     assert store.get_deal(e.con, "DQA9Q")["state"] == DealState.CLOSED
@@ -301,14 +301,14 @@ def test_corrupted_bound_deal_cannot_close_or_grow(tmp_path, variant, why):
     n_intents = e.con.execute("SELECT count(*) FROM intents").fetchone()[0]
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_resume(did, chat=fx.OWNER)
-    assert "не подтверждён" in ei.value.html and "добор запрещён" in ei.value.html
+    assert "не подтверждён" in fx.render(ei.value) and "добор запрещён" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_exit(did, D(50), False, chat=fx.OWNER)
-    assert "частичный выход не посчитать" in ei.value.html and f"«выход {did}» целиком" in ei.value.html
+    assert "частичный выход не посчитать" in fx.render(ei.value) and f"«выход {did}» целиком" in fx.render(ei.value)
     if variant == "naked":
         with pytest.raises(eng.Refused) as ei:
             e.desk.propose_fix("rehedge", did, chat=fx.OWNER)
-        assert "дохедж продажей запрещён" in ei.value.html
+        assert "дохедж продажей запрещён" in fx.render(ei.value)
     assert fx.sends(e) == before and e.con.execute("SELECT count(*) FROM intents").fetchone()[0] == n_intents
     # сверка и «позиции» работают
     chk = reconcile.check_deal(e.con, store.get_deal(e.con, did), e.legs_live)
@@ -321,8 +321,8 @@ def test_corrupted_bound_deal_cannot_close_or_grow(tmp_path, variant, why):
         prop = e.desk.propose_fix("undo", did, chat=fx.OWNER)
     else:
         prop = e.desk.propose_exit(did, None, False, chat=fx.OWNER)
-        assert "⚠️ Инструмент сделки не подтверждён: " in fx.flat(prop.html), "⚠️ в плане неподтверждённой сделки"
-        assert fx.html_ok(prop.html) and not fx.RAW_NUM.search(prop.html)
+        assert "⚠️ Инструмент сделки не подтверждён: " in fx.flat(fx.render(prop)), "⚠️ в плане неподтверждённой сделки"
+        assert fx.html_ok(fx.render(prop)) and not fx.RAW_NUM.search(fx.render(prop))
     fx.run_approved(e, prop)
     assert fx.sends(e) == before
     assert store.get_intent(e.con, prop.intent_id)['status'] == IntentStatus.FAILED
@@ -436,7 +436,7 @@ def test_requote_of_draft_keeps_instrument_or_refuses(tmp_path):
     e.con.execute("UPDATE deals SET inst_json=? WHERE id=?", (other, p.deal_id))
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER, deal_id=p.deal_id)
-    assert "у кнопки другой" in ei.value.html
+    assert "у кнопки другой" in fx.render(ei.value)
     d = store.get_deal(e.con, p.deal_id)
     assert d["state"] == DealState.DRAFT and d["inst_json"] == other, "черновик не тронут"
     e.con.execute("UPDATE deals SET inst_json=NULL WHERE id=?", (p.deal_id,))
@@ -457,7 +457,7 @@ def test_unknown_multiplier_is_refused_before_any_send(tmp_path, fn):
     e.perp.instrument = fn
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "Множитель контракта AIW3USDT на Aster не известен" in ei.value.html
+    assert "Множитель контракта AIW3USDT на Aster не известен" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0) and e.spot.approvals == []
     assert e.con.execute("SELECT count(*) FROM deals").fetchone()[0] == 0
 
@@ -468,7 +468,7 @@ def test_multiplier_by_name_is_still_refused(tmp_path):
     e.desk.table_loader = lambda: dict(fx.TABLE, sf_rows=[dict(fx.TABLE["sf_rows"][0], perp="1000AIW3USDT")])
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert "1 контракт = 1 токен" in ei.value.html
+    assert "1 контракт = 1 токен" in fx.render(ei.value)
     assert fx.sends(e) == (0, 0)
 
 
@@ -480,7 +480,7 @@ def test_exchange_contradicting_the_name_is_refused(tmp_path, pi, text):
     e.perp.instrument = lambda s: pi
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=fx.OWNER)
-    assert text in ei.value.html
+    assert text in fx.render(ei.value)
     assert fx.sends(e) == (0, 0)
 
 
@@ -490,10 +490,10 @@ def test_unit_refusal_returns_m_and_keeps_other_asset_always_refused():
     for coin, sym in (("BONK", "1000BONKUSDT"), ("PEPE", "KPEPEUSDT"), ("BABYDOGE", "1MBABYDOGEUSDT")):
         with pytest.raises(eng.Refused) as ei:
             eng.unit_refusal(coin, sym)
-        assert "1 контракт = 1 токен" in ei.value.html
+        assert "1 контракт = 1 токен" in fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         eng.unit_refusal("AIW3", "BTCUSDT", allow_multiplier=True)
-    assert "другой актив" in ei.value.html, "разрешение на множитель чужую базу не снимает"
+    assert "другой актив" in fx.render(ei.value), "разрешение на множитель чужую базу не снимает"
     with pytest.raises(eng.Refused) as ei:
         eng.unit_refusal("AIW3", "AIW3USDT", m=D(1000), allow_multiplier=True)
-    assert "расходятся" in ei.value.html
+    assert "расходятся" in fx.render(ei.value)

@@ -310,7 +310,10 @@ def test_config_change_while_quoting_invalidates_plan(conns):
     def plan(*a):
         entered.set();release.wait(3)
         iid,nonce=store.create_intent(conns.get(),deal_id='DQ',kind='entry',spec={'coin':'AIW3'},plan={},now=time.time())
-        return SimpleNamespace(intent_id=iid,nonce=nonce,html='plan',superseded=())
+        # AC-07: Desk hands core facts (view_topic/view_facts), not rendered HTML — 'fix_plan' is the smallest shape.
+        facts=dict(intent_id=iid,kind='rehedge',coin='AIW3',deal_id='DQ',delta=None,qty=None,side=None,usd=None,
+                  perp_venue='aster',step=None,ttl_s=60,sim=True,m=None)
+        return SimpleNamespace(intent_id=iid,nonce=nonce,view_topic='fix_plan',view_facts=facts,superseded=())
     s=service(conns,SimpleNamespace(propose_entry=plan));s.bot.owner_loader=lambda:cfg
     s.start(reconcile=False)
     try:

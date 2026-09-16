@@ -1,5 +1,6 @@
 """Render durable domain notifications at the interface boundary."""
-from ..ipc.notifications import DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_POSITION_VERSION, EXECUTION_NOTICE_VERSION, APPROVAL_REASONS
+from ..ipc.notifications import (DTO_VERSION, EXECUTION_REPORT_VERSION, GENERIC_POSITION_VERSION,
+                                 EXECUTION_NOTICE_VERSION, PROPOSAL_VIEW_VERSION, APPROVAL_REASONS)
 from ..ipc.protocol import RpcError
 
 
@@ -10,6 +11,8 @@ def present(event, *, transport_health=None):
     expected = EXECUTION_REPORT_VERSION if kind == 'final_report' else DTO_VERSION
     if kind == 'execution_notice':
         expected = EXECUTION_NOTICE_VERSION
+    if kind == 'plan_proposed':
+        expected = PROPOSAL_VIEW_VERSION
     if kind == 'positions_report' and event.get('dto_version') == GENERIC_POSITION_VERSION:
         expected = GENERIC_POSITION_VERSION
     if type(event.get('dto_version')) is not int or event['dto_version'] != expected:
@@ -17,7 +20,7 @@ def present(event, *, transport_health=None):
     from ..tg import views
     if kind == 'execution_notice':
         return dict(kind='send', chat_id=event['chat_id'], text=render_execution_notice(event['topic'], event['facts']), html=True,
-                    silent=event['topic'] == 'progress')
+                    silent=event['topic'] in ('progress', 'sol_progress'))
     if kind == 'final_report':
         from ..ipc.reports import decode, FinalView, SolFinalView
         if type(event.get('solana', False)) is not bool:
@@ -90,7 +93,8 @@ def present(event, *, transport_health=None):
         else:
             head = views.intent_head(summary['intent'], summary['deal'])
         if kind == 'plan_proposed':
-            return dict(kind='send', chat_id=event['chat_id'], text=event['legacy_body'], html=True,
+            text = render_proposal_view(event['view_topic'], event['view_facts'])
+            return dict(kind='send', chat_id=event['chat_id'], text=text, html=True,
                         reply_markup=views.plan_keyboard(event['plan_id'], event['nonce'], head.ok))
         return dict(kind='edit', chat_id=event['chat_id'], message_id=event['message_id'],
                     text=views.plan_closed(event['action'], head.title, event['at'], head.sim),
@@ -110,7 +114,43 @@ def render_execution_notice(topic, encoded_facts):
         return views.executor_crash(facts['intent_id'], facts['error'])
     if topic == 'refused':
         return views.refused(facts['reason'])
+    if topic == 'busy':
+        return views.busy(facts['intent_id'])
+    if topic == 'owner_missing':
+        return views.owner_missing(facts['keys'], facts['action'])
+    if topic == 'owner_config_error':
+        return views.owner_config_error(facts['reason'])
+    if topic == 'resume_checked':
+        return views.resume_checked(facts['deal_id'], sim=facts['sim'])
+    if topic == 'resume_mismatch':
+        return views.resume_mismatch(facts['deal_id'], facts['detail'], sim=facts['sim'])
     if topic == 'auto_unwind':
         return views.auto_unwind(facts['coin'], facts['qty'], facts['usd'], facts['sim'])
+    if topic == 'sol_halt':
+        from ..tg import sol_views
+        return sol_views.halt(SimpleNamespace(**facts))
+    if topic == 'sol_progress':
+        from ..tg import sol_views
+        return sol_views.progress(SimpleNamespace(**facts))
     renderers = {'halt': views.halt, 'progress': views.progress, 'perp_closed': views.perp_closed, 'fix_done': views.fix_done}
     return renderers[topic](SimpleNamespace(**facts))
+
+
+def render_proposal_view(topic, encoded_facts):
+    """Renderer used only by interface and the legacy Telegram compatibility bot: turns the facts a
+    Desk.propose_* call handed back (Proposal.view_topic/view_facts) into the same button-plan text
+    tg/views.plan · tg/sol_views.plan · tg/views.fix_plan produced when the engine rendered it directly."""
+    from ..ipc.notifications import validate_proposal_view
+    from ..ipc.reports import decode
+    from types import SimpleNamespace
+    facts = decode(encoded_facts)
+    validate_proposal_view(topic, facts)
+    from ..tg import views
+    if topic == 'plan':
+        return views.plan(SimpleNamespace(**facts))
+    if topic == 'fix_plan':
+        return views.fix_plan(SimpleNamespace(**facts))
+    if topic == 'sol_plan':
+        from ..tg import sol_views
+        return sol_views.plan(SimpleNamespace(**facts))
+    raise RpcError('unsupported_notification')

@@ -269,13 +269,16 @@ class Outbox:
         return self._emit(dict(kind='plan_closed', dto_version=DTO_VERSION, chat_id=chat_id,
                                message_id=message_id, summary=summary, action=action, at=at))
 
-    def plan_proposed(self, chat_id, intent_id, nonce, summary, legacy_body, on_done=None):
-        from ..ipc.notifications import DTO_VERSION
+    def plan_proposed(self, chat_id, intent_id, nonce, summary, view_topic, view_facts, on_done=None):
+        from ..ipc.notifications import PROPOSAL_VIEW_VERSION, validate_proposal_view
+        from ..ipc.reports import encode
         if self.plan_guard is None:
             raise RpcError('plan_guard_missing')
+        validate_proposal_view(view_topic, view_facts)
         self.plan_guard(intent_id)
-        return self._emit(dict(kind='plan_proposed', dto_version=DTO_VERSION, chat_id=chat_id,
-                               plan_id=intent_id, nonce=nonce, summary=summary, legacy_body=legacy_body), on_done)
+        return self._emit(dict(kind='plan_proposed', dto_version=PROPOSAL_VIEW_VERSION, chat_id=chat_id,
+                               plan_id=intent_id, nonce=nonce, summary=summary, view_topic=view_topic,
+                               view_facts=encode(view_facts)), on_done)
 
     def ack(self, eid, result):
         with self.lock:

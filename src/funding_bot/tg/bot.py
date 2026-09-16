@@ -23,7 +23,7 @@ import json, logging, os, queue, signal, threading, time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from ..trade import marks, owner as owner_mod, reconcile, store, tconfig
-from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Refused, build_runtime, dget
+from ..trade.engine import CfgHolder, Conns, Desk, Engine, Hooks, Notice, Refused, build_runtime, dget
 from ..trade.keys import KeysError, effective_mode, install_log_redaction, redact
 from ..trade.owner import OwnerConfigError
 from ..trade.store import DealState
@@ -111,7 +111,7 @@ class BotHooks(Hooks):
     def notice(self, topic: str, facts: dict) -> None:
         from ..interface.presenter import render_execution_notice
         text = render_execution_notice(topic, facts)
-        if topic == 'progress':
+        if topic in ('progress', 'sol_progress'):
             self.bot.progress(facts['intent_id'], text)
         else:
             self.bot.say(text)
@@ -321,23 +321,29 @@ class Bot:
 
     # --- планы (поток заданий) ---
     def propose(self, chat: int, fn: Callable[[], Any]):
-        """Предложение с кнопками. Отказ предпроверок — готовый текст (Refused); сбой — «⚠️» с причиной."""
+        """Предложение с кнопками. Отказ предпроверок и итоги без плана (Refused/Notice) — факты; текст строит
+        только render_execution_notice/render_proposal_view (interface.presenter), как и в core/commands.py
+        (AC-07: движок этого процесса тоже не хранит готовый HTML). Сбой — «⚠️» с причиной."""
         try:
             p = fn()
         except Refused as e:
-            self.sender.send(chat, e.html)
+            from ..interface.presenter import render_execution_notice
+            self.sender.send(chat, render_execution_notice(e.topic, e.facts))
             return None
         except OwnerConfigError as e:
-            self.sender.send(chat, views.owner_config_error(e))
+            self.sender.send(chat, views.owner_config_error(str(e)))
             return None
         except Exception as e:                 # noqa
             log.exception("план не построен")
             self.sender.send(chat, views.error(f"план не построен: {type(e).__name__}: {redact(e)}"))
             return None
-        if isinstance(p, str):
-            self.sender.send(chat, p)
+        if isinstance(p, Notice):
+            from ..interface.presenter import render_execution_notice
+            self.sender.send(chat, render_execution_notice(p.topic, p.facts))
             return None
-        self.sender.send(chat, p.html, reply_markup=views.plan_keyboard(p.intent_id, p.nonce, self._head(p.intent_id).ok),
+        from ..interface.presenter import render_proposal_view
+        text = render_proposal_view(p.view_topic, p.view_facts)
+        self.sender.send(chat, text, reply_markup=views.plan_keyboard(p.intent_id, p.nonce, self._head(p.intent_id).ok),
                          on_done=lambda m, iid=p.intent_id: self._plan_sent(iid, chat, m))
         for old in getattr(p, "superseded", ()) or ():     # новый план сделки — у прежних снимаются кнопки
             self._close_plan(old, "expired")

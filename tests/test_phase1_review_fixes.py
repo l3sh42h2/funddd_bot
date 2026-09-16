@@ -53,10 +53,10 @@ def test_tampered_bound_inst_m1000_blocks_all_execution(tmp_path):
     for kind in ("rehedge", "undo"):
         with pytest.raises(eng.Refused) as ei:
             e.desk.propose_fix(kind, did, chat=fx.OWNER)
-        assert f"только «выход {did}» целиком" in flat(ei.value.html), ei.value.html
+        assert f"только «выход {did}» целиком" in flat(fx.render(ei.value)), fx.render(ei.value)
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_exit(did, D(50), False, chat=fx.OWNER)
-    assert f"«выход {did}» целиком" in ei.value.html
+    assert f"«выход {did}» целиком" in fx.render(ei.value)
     assert fx.sends(e) == before and _n_intents(e) == n
     # сверка: совпало с правдой, без советов «дохедж»/«откат» и без ложной голой ноги
     chk = reconcile.check_deal(e.con, store.get_deal(e.con, did), e.legs_live)
@@ -70,7 +70,7 @@ def test_tampered_bound_inst_m1000_blocks_all_execution(tmp_path):
     assert "без хеджа" not in txt
     # Old planning presentation remains readable, but execution binding rejects tampering.
     x = e.desk.propose_exit(did, None, False, chat=fx.OWNER)
-    t = flat(x.html)
+    t = flat(fx.render(x))
     assert "Выход AIW3 · всё" in t and "Продать спот 2 445 · откупить шорт 2 контр." in t and "(= " not in t, t
     assert "Множитель контракта не известен — продаю весь спот и откупаю весь шорт" in t
     before = fx.sends(e)
@@ -109,7 +109,7 @@ def test_legacy_fallback_that_found_a_multiplier_does_not_give_m1(tmp_path, vari
     if not known:
         with pytest.raises(eng.Refused) as ei:
             e.desk.propose_fix("undo", p.deal_id, chat=fx.OWNER)
-        assert "множитель контракта не известен" in flat(ei.value.html).lower()
+        assert "множитель контракта не известен" in flat(fx.render(ei.value)).lower()
 
 
 def test_approved_undo_and_auto_unwind_send_nothing_when_m_becomes_unknown(tmp_path):
@@ -176,7 +176,7 @@ def test_multiclip_m1000_margin_check_counts_contracts_like_the_executor(tmp_pat
     _scaled(e, D("1.03"))
     with pytest.raises(eng.Refused) as ei:
         e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(250), chat=fx.OWNER)
-    assert "Маржа Aster 251.00 — меньше 252.00 USDT" in flat(ei.value.html), ei.value.html
+    assert "Маржа Aster 251.00 — меньше 252.00 USDT" in flat(fx.render(ei.value)), fx.render(ei.value)
     assert fx.sends(e) == (0, 0) and e.spot.approvals == []
     (tmp_path / "b").mkdir()
     ok = t12.mult_env(tmp_path / "b", margin=D(255), clip="80")
@@ -229,7 +229,7 @@ def test_partial_exit_that_would_buy_the_whole_short_is_a_full_exit(tmp_path):
     x = e.desk.propose_exit(did, D(60), False, chat=fx.OWNER)
     sp = t11._spec_of(e.con, x.intent_id)
     assert sp["all"] is True and sp["units"] == eng.deal_book(e.con, did).tokens_raw
-    t = flat(x.html)
+    t = flat(fx.render(x))
     assert "Выход AIW3 · всё" in t and "Продать спот 2 445 · откупить шорт 2 контр. (= 2 000 токенов)" in t, t
     assert "меньше 1 контр. (= 1 000 токенов) — выход всей сделки" in t
     fx.run_approved(e, x)
@@ -244,7 +244,7 @@ def test_partial_exit_plan_shows_the_contracts_the_executor_buys(tmp_path):
     e = t12.mult_env(tmp_path)
     did = t12.enter(e, 140).deal_id
     x = e.desk.propose_exit(did, D(60), False, chat=fx.OWNER)
-    assert "откупить шорт 2 контр. (= 2 000 токенов)" in flat(x.html) and x.plan.est["contracts"] == 2
+    assert "откупить шорт 2 контр. (= 2 000 токенов)" in flat(fx.render(x)) and x.plan.est["contracts"] == 2
     assert t11._spec_of(e.con, x.intent_id)["all"] is False
     n0 = len(e.perp.calls)
     fx.run_approved(e, x)
