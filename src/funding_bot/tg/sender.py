@@ -249,7 +249,17 @@ class Sender:
                 self._edit_waiters.setdefault(key, []).append(superseded.on_done)
             if throttle:
                 return True
-        return self._put(job)
+        ok = self._put(job)
+        if not ok:
+            # _put() can refuse this job (queue full / abort) after it has already evicted a waiting
+            # throttled edit above. That evicted job's on_done must not be left to fire only "whenever
+            # something else next touches this key" — nothing delivered for this key right now, so
+            # every accumulated waiter gets the same outcome (None) as this job's own caller does.
+            with self._lock:
+                waiters = self._edit_waiters.pop(key, ())
+            for on_done in waiters:
+                on_done(None)
+        return ok
 
     def alarm(self, chat_id: int, text: str, kind: str) -> bool:
         """Тревога инфраструктуры: первая за окно уходит, повторы того же вида считаются и приходят сводкой."""
@@ -323,7 +333,10 @@ class Sender:
             if t.is_alive():
                 self._abort.set()
                 t.join(2.0)
-        left = self._q.qsize() + len(self._edits)
+        # Waiters for a key still in _edits will fire when that job is delivered above — only count the
+        # ones with no surviving job for their key, orphaned by the queue-full/abort edge case in edit().
+        orphaned_waiters = sum(len(v) for k, v in self._edit_waiters.items() if k not in self._edits)
+        left = self._q.qsize() + len(self._edits) + orphaned_waiters
         if left:
             log.error("tg: при закрытии не доставлено %d сообщений", left)
         return left

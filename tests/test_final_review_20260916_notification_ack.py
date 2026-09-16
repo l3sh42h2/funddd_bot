@@ -289,6 +289,24 @@ def test_normal_edit_evicts_waiting_throttled_edit_but_still_acks_both(tmp_path)
     assert snd._edits == {} and snd._edit_waiters == {}
 
 
+def test_evicting_edit_rejected_by_a_full_or_aborted_queue_still_acks_the_evicted_waiter(tmp_path):
+    """Edge case named but left open by the independent review's remediation (16.09.2026): edit()
+    queues the evicted job's on_done into _edit_waiters *before* calling _put() for the new job. If
+    _put() itself then refuses (queue full, or Sender aborting) — no job for this key is delivered at
+    all this time — the evicted waiter must not be left to fire only whenever some later, unrelated
+    edit happens to touch the same (chat_id, message_id) again."""
+    snd, s, clk = _real_sender()
+    got_progress, got_closed = [], []
+    snd.edit(1, 5, 'progress', throttle=True, on_done=got_progress.append)
+    snd._abort.set()                                    # force _put() to return False for the next edit
+    ok = snd.edit(1, 5, 'закрыто', reply_markup=None, on_done=got_closed.append)
+    assert ok is False
+    assert got_progress == [None], got_progress         # evicted waiter fired immediately, not left hanging
+    assert got_closed == []                              # the rejected job's own on_done is the caller's job
+    assert snd._edit_waiters == {}
+    assert s.posts == []                                 # nothing was ever sent to Telegram
+
+
 def test_throttle_coalescing_on_delivery_failure_acks_all_waiters_with_none_not_silently_delivered(tmp_path):
     """Consistent retry semantics on the failure path (review's explicit requirement): when the
     surviving coalesced edit ultimately fails, every waiter — superseded and surviving alike — sees
