@@ -207,6 +207,11 @@ class Sender:
         self._lock = threading.Lock()
         self._edits: dict[tuple[int, int], Job] = {}
         self._last_edit: dict[tuple[int, int], float] = {}
+        # on_done of a job superseded at the same (chat_id, message_id) key — by a later throttled edit
+        # replacing it, or by a normal edit evicting a waiting throttled one — queued here so it still
+        # fires, with the same result, once whatever job ends up actually delivered for that key resolves
+        # (FINAL-02 / external review 16.09.2026: coalescing must never silently drop a durable ACK).
+        self._edit_waiters: dict[tuple[int, int], list[Callable[[dict | None], None]]] = {}
         self._alarms: dict[str, list] = {}       # вид → [t0, повторов, chat_id]
         self._last_call: float | None = None
         self._thread: threading.Thread | None = None
@@ -226,14 +231,24 @@ class Sender:
     def edit(self, chat_id: int, message_id: int, text: str, *, reply_markup: dict | None = None, html: bool = True,
              throttle: bool = False, on_done: Callable[[dict | None], None] | None = None) -> bool:
         """Правка сообщения. reply_markup=None снимает кнопки. throttle=True — прогресс: не чаще edit_min_s,
-        ждущий текст заменяется более новым. Обычная правка (закрыть план) вытесняет ждущий прогресс."""
+        ждущий текст заменяется более новым. Обычная правка (закрыть план) вытесняет ждущий прогресс.
+
+        Coalescing never drops a waiting on_done: a job replaced here (throttled by a newer throttled
+        edit, or evicted by a normal one) has its on_done queued in _edit_waiters and fired — with the
+        same result, success or failure — alongside whichever job for this (chat_id, message_id) key is
+        actually delivered next, in _deliver() (FINAL-02)."""
         job = Job("edit", int(chat_id), text, html, reply_markup, False, int(message_id), on_done)
         key = (job.chat_id, job.message_id)
         with self._lock:
+            superseded = self._edits.get(key)
             if throttle:
                 self._edits[key] = job
+            else:
+                self._edits.pop(key, None)
+            if superseded is not None and superseded.on_done is not None:
+                self._edit_waiters.setdefault(key, []).append(superseded.on_done)
+            if throttle:
                 return True
-            self._edits.pop(key, None)
         return self._put(job)
 
     def alarm(self, chat_id: int, text: str, kind: str) -> bool:
@@ -343,10 +358,19 @@ class Sender:
                              fit_one(job.text), job.html)
             with self._lock:
                 self._last_edit[(job.chat_id, job.message_id)] = self._clock()
-        if job.on_done is not None:
+        # успех без объекта Message («not modified», True у правки) — пустой dict, а не None (= не доставлено)
+        result = None if res is _FAILED else (res if isinstance(res, dict) else {})
+        callbacks = [job.on_done] if job.on_done is not None else []
+        if job.kind == "edit":
+            # Everyone coalesced out of this (chat_id, message_id) key gets the SAME result as the job
+            # that actually got delivered: success -> all ACK the one message_id that really exists;
+            # failure -> all see None, same as any other undelivered notification, so each is retried
+            # independently by its own caller instead of one being silently declared delivered (FINAL-02).
+            with self._lock:
+                callbacks.extend(self._edit_waiters.pop((job.chat_id, job.message_id), ()))
+        for cb in callbacks:
             try:
-                # успех без объекта Message («not modified», True у правки) — пустой dict, а не None (= не доставлено)
-                job.on_done(None if res is _FAILED else (res if isinstance(res, dict) else {}))
+                cb(result)
             except Exception as e:
                 log.error("tg: on_done: %s", redact(e))
 

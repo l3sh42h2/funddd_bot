@@ -155,13 +155,24 @@ class Interface:
                 # next stage's 'edit' and returns any newer text queued (as 'wait') while this was in flight,
                 # which we flush right away as one throttled edit instead of waiting for another notice.
                 track_iid = ev.get('progress_intent_id')
-                def on_sent(res, iid=track_iid):
+                # `done` must be pinned as a default argument too, exactly like `iid` — it is a name from
+                # the enclosing deliver_once() loop, rebound to a new function object (closed over a new
+                # `eid`) on every iteration. Without `done=done`, Sender calling this callback later (it is
+                # always async: on_done fires from the sender thread, not from this call) would resolve
+                # `done` by late binding to whatever the *next* event's `done` happened to be by then and
+                # ACK that event's id with this event's result (FINAL-01 / external review 16.09.2026).
+                def on_sent(res, iid=track_iid, done=done):
                     if iid is not None:
                         message_id = res.get('message_id') if res else None
-                        pending = self.progress.resolved(iid, message_id)
-                        if pending is not None and message_id is not None:
-                            chat_id, text = pending
-                            self.sender.edit(chat_id, message_id, text, html=True, throttle=True)
+                        try:
+                            pending = self.progress.resolved(iid, message_id)
+                            if pending is not None and message_id is not None:
+                                chat_id, text = pending
+                                self.sender.edit(chat_id, message_id, text, html=True, throttle=True)
+                        except Exception:
+                            # Best-effort follow-up edit for a coalesced progress stage must never cost
+                            # the primary event (this send) its own ACK (FINAL-01 remediation #2).
+                            log.error('interface: pending progress edit failed for intent %s', iid, exc_info=True)
                     done(res)
                 ok = self.sender.send(ev['chat_id'], ev['text'], html=ev.get('html', True),
                                       reply_markup=ev.get('reply_markup'), silent=ev.get('silent',False), on_done=on_sent)
