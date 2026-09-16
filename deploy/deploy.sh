@@ -16,7 +16,7 @@ need_file() { [ -f "$1" ] || die "missing file: $1"; }
 usage() {
   cat <<'EOF'
 Usage:
-  deploy/deploy.sh build --output ARTIFACT.tar --patchnote PATCHNOTES/name.md [--python /linux/python]
+  deploy/deploy.sh build --output ARTIFACT.tar --patchnote PATCHNOTES/name.md [--python /linux/python] [--profile deploy/migration/test-profile-linux.json]
   deploy/deploy.sh inspect-base --output expected-base.json
   deploy/deploy.sh install --artifact ARTIFACT.tar --receipt ARTIFACT.tar.receipt.json --expected-base expected-base.json
   deploy/deploy.sh status RELEASE_ID
@@ -32,18 +32,19 @@ cmd="${1:-}"; [ -n "$cmd" ] || { usage; exit 2; }; shift
 
 case "$cmd" in
   build)
-    output= patchnote= python="${PYTHON:-python3}"
+    output= patchnote= python="${PYTHON:-python3}" profile="$M5/test-profile-linux.json"
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --output) output="${2:-}"; shift 2;;
         --patchnote) patchnote="${2:-}"; shift 2;;
         --python) python="${2:-}"; shift 2;;
+        --profile) profile="${2:-}"; shift 2;;
         *) die "unknown build argument: $1";;
       esac
     done
     [ -n "$output" ] && [ -n "$patchnote" ] || die "--output and --patchnote are required"
     exec "$python" "$M5/build_verified.py" --root "$ROOT" --output "$output" \
-      --profile "$M5/test-profile-linux.json" --compatibility "$M5/compatibility.json" \
+      --profile "$profile" --compatibility "$M5/compatibility.json" \
       --patchnote "$patchnote" --python "$python"
     ;;
   inspect-base)

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "platform": "linux",
+  "argv": [
+    "-m", "pytest", "-q", "-p", "no:cacheprovider",
+    "tests/test_migration_m1.py",
+    "tests/test_m4_core_approvals.py",
+    "tests/test_phase1_exit_resume.py",
+    "tests/test_trade_engine.py",
+    "tests/test_m4_execution_scope.py",
+    "tests/test_generic_operations.py"
+  ],
+  "paths": [
+    "tests/test_migration_m1.py",
+    "tests/test_m4_core_approvals.py",
+    "tests/test_phase1_exit_resume.py",
+    "tests/test_trade_engine.py",
+    "tests/test_m4_execution_scope.py",
+    "tests/test_generic_operations.py"
+  ],
+  "environment": {"PYTHONDONTWRITEBYTECODE": "1"}
+}
