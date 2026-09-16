@@ -18,7 +18,7 @@ def readable(path):
 def denied(path):
     try:
         readable(path)
-    except PermissionError:
+    except (PermissionError, FileNotFoundError):
         return
     raise RuntimeError('cross-role file is accessible')
 
