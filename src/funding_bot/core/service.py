@@ -271,7 +271,16 @@ class CoreService:
         row = con.execute("SELECT i.spec_json,i.plan_json,i.nonce,d.state,d.updated FROM intents i JOIN deals d ON d.id=i.deal_id WHERE i.id=?", (iid,)).fetchone()
         if row is None:
             raise RpcError('plan_missing')
-        body = json.dumps({'intent':list(row), 'config':cfg.frozen() if config is None else config}, sort_keys=True, default=str)
+        # OwnerCfg.frozen() records `loaded` for the audit trail of a deal.  It is
+        # the wall-clock time of this read, not an input to the approved plan.
+        # Including it here made a just-delivered button stale on its first press:
+        # _check_plan_guard reads owner.toml again and therefore gets another value.
+        # Keep the file hash and all frozen values in the guard; omit only this
+        # volatile timestamp.
+        frozen = cfg.frozen() if config is None else config
+        if isinstance(frozen, dict):
+            frozen = {k: v for k, v in frozen.items() if k != 'loaded'}
+        body = json.dumps({'intent':list(row), 'config':frozen}, sort_keys=True, default=str)
         return hashlib.sha256(body.encode()).hexdigest()
 
     def _save_plan_guard(self, iid):

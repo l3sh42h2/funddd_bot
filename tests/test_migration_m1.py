@@ -327,6 +327,33 @@ def test_config_change_while_quoting_invalidates_plan(conns):
     finally:release.set();s.shutdown()
 
 
+def test_plan_guard_ignores_owner_load_time_but_keeps_owner_values(conns):
+    """A button must survive the harmless owner.toml reload performed before approval."""
+    from decimal import Decimal
+    stamp = {'value': 1.0}
+    values = {'limit': 200}
+    cfg = SimpleNamespace(
+        owner_id=OWNER,
+        profile_enabled=lambda _: False,
+        frozen=lambda: {'sha256': 'same-owner-file', 'loaded': stamp['value'], 'values': dict(values)},
+    )
+    con = conns.get()
+    store.create_deal(con, coin='AIW3', chain='bsc', token='0x'+'b'*40, token_dec=18,
+                      perp_venue='aster', symbol='AIW3USDT', leg_usd=Decimal(200), owner_json='{}', sim=True,
+                      deal_id='DQLOAD')
+    iid, _ = store.create_intent(con, deal_id='DQLOAD', kind='exit', spec={'coin': 'AIW3'}, plan={}, now=100)
+    s = service(conns)
+    s.bot.owner_loader = lambda: cfg
+    try:
+        before = s._plan_fingerprint(iid)
+        stamp['value'] = 2.0
+        assert s._plan_fingerprint(iid) == before
+        values['limit'] = 100
+        assert s._plan_fingerprint(iid) != before
+    finally:
+        s.shutdown()
+
+
 def test_end_drain_rpc_lost_response_retries_without_new_recovery(conns):
     s = service(conns); s.ready = True; s.release = {'release_id':'R2'}
     first = s.dispatch('begin_drain', {'release_id':'R2','expected_state_revision':0}, None, 0)
