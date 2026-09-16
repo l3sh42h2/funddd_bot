@@ -425,7 +425,7 @@ DEPLOY_BUSY только по коду), 4 (прогнан вживую, обе 
 
 ## Коммит и очистка
 
-commit `<будет здесь после финального коммита>` на ветке `claude/m4-m5-staging-fault-injection`
+commit `7457050` (и один последующий, см. итоговый ответ координатору)  на ветке `claude/m4-m5-staging-fault-injection`
 поверх HEAD `db050cdd51cabadbcdb26130c7a4daa875c5ab3d`, НЕ запушен.
 Контейнер `m5-staging-test` остановлен и удалён (`docker ps -a` по этому имени — пусто) последним
 шагом; образ `m5-staging-test:debian12-systemd` оставлен нетронутым.
