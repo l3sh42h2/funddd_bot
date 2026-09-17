@@ -245,7 +245,8 @@ class Bot:
         # accepted after the market moved.  Previously an owner who pressed an expired exit button
         # had to type the command again. Rebuild a new proposal through the normal Desk path; never
         # revive or submit the expired intent itself.
-        if r.closed == "expired" and r.intent_id and d.chat_id is not None:
+        if (r.closed == "expired" and r.intent_id and d.chat_id is not None
+                and not store.has_newer_active_exit(con, r.intent_id)):
             it = store.get_intent(con, r.intent_id)
             if it is not None and it["kind"] == "exit":
                 self._job(d.chat_id, "refresh-expired-exit", lambda iid=r.intent_id: self.requote(iid, "план истёк"))
@@ -279,8 +280,15 @@ class Bot:
                 self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_resume(t, chat)))
         elif name == "entry":
             self.sender.send(chat, views.planning(cmd.coin, "entry"))
+            def entry_plan():
+                args = (cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat)
+                # Preserve the legacy adapter contract unless the owner explicitly
+                # used the new SL syntax.
+                if hasattr(cmd, "stop_price"):
+                    return self.desk.propose_entry(*args, stop_price=cmd.stop_price)
+                return self.desk.propose_entry(*args)
             self._job(chat, name, lambda: self.propose(
-                chat, lambda: self.desk.propose_entry(cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat, stop_price=getattr(cmd, "stop_price", None))))
+                chat, entry_plan))
         elif name == "exit":
             self.sender.send(chat, views.planning(cmd.target, "exit"))
             self._job(chat, name, lambda: self.propose(

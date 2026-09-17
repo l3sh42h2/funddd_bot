@@ -966,6 +966,24 @@ def expire_intents(con, now: float | None = None) -> list[str]:
     return ids
 
 
+def has_newer_active_exit(con, intent_id: str) -> bool:
+    """Whether an expired exit already has a newer actionable proposal.
+
+    A late tap on the old message must never invalidate the replacement plan that
+    made it old in the first place.  The caller may safely requote only when this
+    returns False.
+    """
+    current = get_intent(con, intent_id)
+    if current is None or current["kind"] != "exit" or not current["deal_id"]:
+        return False
+    return con.execute(
+        "SELECT 1 FROM intents WHERE deal_id=? AND kind='exit' AND id<>? "
+        "AND created>? AND status IN (?,?,?) LIMIT 1",
+        (current["deal_id"], intent_id, current["created"],
+         str(IntentStatus.PROPOSED), str(IntentStatus.APPROVED), str(IntentStatus.RUNNING)),
+    ).fetchone() is not None
+
+
 def set_intent_status(con, intent_id: str, new: str, *, expect=None, err: str | None = None) -> bool:
     fields = {} if err is None else {"err": err}
     return _transition(con, "intents", "id", intent_id, "status", new, INTENT_NEXT, expect, fields, None)

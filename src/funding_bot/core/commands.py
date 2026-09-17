@@ -226,7 +226,8 @@ class Bot:
             # An expired exit is never revived: quote and reduce-only size are stale.
             # Build a fresh proposal through the regular path so one late tap cannot trap
             # the owner in a dead plan or submit an old order.
-            if r.closed == "expired" and r.intent_id and d.chat_id is not None:
+            if (r.closed == "expired" and r.intent_id and d.chat_id is not None
+                    and not store.has_newer_active_exit(con, r.intent_id)):
                 it = store.get_intent(con, r.intent_id)
                 if it is not None and it["kind"] == "exit":
                     self._job(d.chat_id, "refresh-expired-exit",
@@ -261,8 +262,15 @@ class Bot:
                 self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_resume(t, chat)))
         elif name == "entry":
             self.sender.notice(chat, 'planning_started', coin=cmd.coin, side='entry')
+            def entry_plan():
+                args = (cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat)
+                # Legacy Desk implementations intentionally keep the five-argument
+                # contract.  The optional SL argument belongs only to the new command.
+                if hasattr(cmd, "stop_price"):
+                    return self.desk.propose_entry(*args, stop_price=cmd.stop_price)
+                return self.desk.propose_entry(*args)
             self._job(chat, name, lambda: self.propose(
-                chat, lambda: self.desk.propose_entry(cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat, stop_price=getattr(cmd, "stop_price", None))))
+                chat, entry_plan))
         elif name == "exit":
             self.sender.notice(chat, 'planning_started', coin=cmd.target, side='exit')
             self._job(chat, name, lambda: self.propose(

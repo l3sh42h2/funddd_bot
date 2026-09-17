@@ -73,6 +73,10 @@ def _collector(tmp_path, world, now=None, background=False):
     t = [now or time.time()]
     col = Collector(clients=world, db_path=tmp_path / "c.db", table_path=tmp_path / "table.json",
                     now=lambda: t[0], sleep=lambda s: None, background=background)
+    # Snapshot persistence is under test; its normal disk-space safety gate is a
+    # host property and must not make this fixture depend on the runner's free disk.
+    # The dedicated low-disk test below replaces this with a constrained value.
+    col.disk_free_gb = lambda: config.DISK_MIN_FREE_GB + 1
     return col, t
 
 
@@ -391,7 +395,7 @@ def test_page_script_signed_sort_nulls_last_and_modes(tmp_path):
     assert "со спотом" not in html and '"hyperliquid", "Hyperliquid"' in html
     stub = """
 var __els = {};
-function __el(){ return {innerHTML:'', textContent:'', hidden:false, value:'', checked:false, dataset:{},
+    function __el(){ let h=''; return {get innerHTML(){return h;}, set innerHTML(v){h=v; this.textContent=String(v).replace(/<[^>]*>/g,'');}, textContent:'', hidden:false, value:'', checked:false, dataset:{}, querySelectorAll(){return [];},
                          classList:{toggle(){}, add(){}, remove(){}}}; }
 var document = {hidden:false, querySelector(s){ if(!__els[s]) __els[s] = __el(); return __els[s]; }, querySelectorAll(s){ return []; },
                 addEventListener(){}};
