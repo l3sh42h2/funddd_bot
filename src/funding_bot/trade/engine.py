@@ -1132,7 +1132,11 @@ class Desk:
                        profile_id=profile, chat=chat, operation_id=operation_id)
 
     def propose_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, chat: int | None,
-                      deal_id: str | None = None) -> Proposal:
+                      deal_id: str | None = None, stop_price: D | None = None) -> Proposal:
+        # Never accept an SL field and silently ignore it. Native-order persistence
+        # and recovery are required before an entry can claim stop protection.
+        if stop_price is not None:
+            raise Refused("SL пока не подключён: нативный ордер и восстановление ещё не подтверждены")
         plan, ctx = self.plan_entry(coin, spot_s, perp_s, usd, existing_deal=store.get_deal(self.conns.get(), deal_id)
                                     if deal_id is not None else None)
         con = self.conns.get()
