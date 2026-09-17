@@ -53,6 +53,16 @@ CREATE TABLE IF NOT EXISTS dex_txs(id INTEGER PRIMARY KEY, clip_id INT, kind TEX
 CREATE TABLE IF NOT EXISTS perp_orders(id INTEGER PRIMARY KEY, clip_id INT, client_id TEXT UNIQUE, venue TEXT,
   symbol TEXT, side TEXT, reduce_only INT, tif TEXT, price TEXT, qty TEXT, sign_nonce INT, state TEXT, order_id INT,
   executed_qty TEXT, avg_price TEXT, cum_quote TEXT, err_code INT, err TEXT, sent_ts REAL, resolved_ts REAL);
+-- Нативный SL хранится отдельно от IOC: до исполнения условная заявка не является ни позицией, ни неизвестным исходом.
+-- client_id связан с perp_orders, где после trigger появляется доказанный BUY reduce-only fill.
+CREATE TABLE IF NOT EXISTS native_stops(
+  deal_id TEXT PRIMARY KEY REFERENCES deals(id), client_id TEXT UNIQUE NOT NULL REFERENCES perp_orders(client_id),
+  venue TEXT NOT NULL, symbol TEXT NOT NULL, trigger_price TEXT NOT NULL, working_type TEXT NOT NULL,
+  qty TEXT NOT NULL, state TEXT NOT NULL, order_id INT, filled_qty TEXT NOT NULL DEFAULT '0',
+  created REAL NOT NULL, updated REAL NOT NULL, triggered REAL, err TEXT
+);
+CREATE INDEX IF NOT EXISTS native_stops_active ON native_stops(state, updated)
+  WHERE state IN ('INTENT','SENT','OPEN','UNKNOWN','TRIGGERED');
 CREATE TABLE IF NOT EXISTS perp_fills(venue TEXT, trade_id INT, order_id INT, price TEXT, qty TEXT, quote_qty TEXT,
   commission_abs TEXT, commission_asset TEXT, maker INT, realized_pnl TEXT, ts INT, PRIMARY KEY(venue, trade_id));
 CREATE TABLE IF NOT EXISTS funding_income(venue TEXT, tran_id INT, symbol TEXT, income TEXT, ts INT,
@@ -90,7 +100,7 @@ CREATE TRIGGER IF NOT EXISTS deal_marks_no_update BEFORE UPDATE ON deal_marks BE
 # --- схема 2: версия, ворота, журналы SOL×HL ---------------------------------------------------------------------
 # Версия схемы и ворота (M06): код откажется стартовать, если min_reader БД больше его SCHEMA_VERSION — старый код на
 # БД со сделками, которых он не понимает, выбрал бы не те ноги. min_reader только растёт (require_reader).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MIN_READER = 2
 
 # состояния trade/solana/journal.AttemptState для частичных индексов (журнал сверяет их с собой при открытии)
@@ -361,6 +371,7 @@ class PerpOrderState(StrEnum):
     REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"          # 503/-1006/-1007/таймаут: не повторять, выяснять запросом
     NOT_PLACED = "NOT_PLACED"    # -2013 трижды за ~5 с и userTrades/positionRisk не менялись — решает движок
+    OPEN = "OPEN"                # принятая нативная условная заявка; сама по себе не меняет позицию
 
 
 _ACTIVE_DEAL = frozenset({DealState.ENTERING, DealState.PAUSED, DealState.OPEN, DealState.EXITING,
@@ -405,10 +416,12 @@ DEX_TX_NEXT: dict[str, frozenset] = {
 _PERP_RESULT = frozenset({PerpOrderState.FILLED, PerpOrderState.PARTIALLY_FILLED, PerpOrderState.EXPIRED,
                           PerpOrderState.REJECTED})
 PERP_ORDER_NEXT: dict[str, frozenset] = {
-    PerpOrderState.INTENT: frozenset({PerpOrderState.SENT, PerpOrderState.UNKNOWN, PerpOrderState.NOT_PLACED})
+    PerpOrderState.INTENT: frozenset({PerpOrderState.SENT, PerpOrderState.UNKNOWN, PerpOrderState.NOT_PLACED,
+                                      PerpOrderState.OPEN})
                            | _PERP_RESULT,
-    PerpOrderState.SENT: frozenset({PerpOrderState.UNKNOWN}) | _PERP_RESULT,
+    PerpOrderState.SENT: frozenset({PerpOrderState.UNKNOWN, PerpOrderState.OPEN}) | _PERP_RESULT,
     PerpOrderState.UNKNOWN: frozenset({PerpOrderState.NOT_PLACED}) | _PERP_RESULT,
+    PerpOrderState.OPEN: frozenset({PerpOrderState.UNKNOWN}) | _PERP_RESULT,
 }
 
 
@@ -1086,6 +1099,57 @@ def record_perp_fill(con, fill: PerpFill, err: str | None = None, now: float | N
     return perp_order_result(con, fill.client_id, fill.status, order_id=fill.order_id, executed_qty=fill.qty,
                              avg_price=fill.avg_px, cum_quote=fill.quote, sign_nonce=fill.sign_nonce or None,
                              err_code=fill.err_code, err=err, now=now)
+
+
+# --- native stop-loss: durable conditional perp order + later spot-only unwind ------------------------------
+_STOP_STATES = frozenset({"INTENT", "SENT", "OPEN", "UNKNOWN", "TRIGGERED", "REJECTED", "FAILED", "DONE"})
+
+
+def create_native_stop(con, *, deal_id: str, client_id: str, venue: str, symbol: str, trigger_price: Decimal,
+                       working_type: str, qty: Decimal, now: float | None = None) -> None:
+    """Persist the stop before its signed HTTP request.  Creating one raises the reader gate to schema 6: an old
+    executable must never start while an armed order can later change the hedge outside its view."""
+    if working_type not in ("MARK_PRICE", "CONTRACT_PRICE"):
+        raise ValueError("working_type")
+    if trigger_price <= 0 or qty <= 0:
+        raise ValueError("native stop trigger/qty must be positive")
+    ts = time.time() if now is None else now
+    with tx(con):
+        require_reader(con, 6, now=ts)
+        if get_perp_order(con, client_id) is None:
+            raise LookupError("native stop needs a durable perp order intent")
+        con.execute("INSERT INTO native_stops(deal_id, client_id, venue, symbol, trigger_price, working_type, qty, "
+                    "state, created, updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (deal_id, client_id, venue, symbol, amt(trigger_price), working_type, amt(qty), "INTENT", ts, ts))
+
+
+def get_native_stop(con, deal_id: str) -> dict | None:
+    return _row(con, "SELECT * FROM native_stops WHERE deal_id=?", (deal_id,))
+
+
+def active_native_stops(con) -> list[dict]:
+    return _rows(con, "SELECT * FROM native_stops WHERE state IN ('INTENT','SENT','OPEN','UNKNOWN','TRIGGERED') "
+                      "ORDER BY updated, deal_id")
+
+
+def set_native_stop_state(con, deal_id: str, state: str, *, order_id: int | None = None,
+                          filled_qty: Decimal | None = None, err: str | None = None,
+                          now: float | None = None) -> bool:
+    if state not in _STOP_STATES:
+        raise ValueError(f"native stop state {state!r}")
+    ts = time.time() if now is None else now
+    fields = ["state=?", "updated=?"]
+    vals: list[Any] = [state, ts]
+    if order_id is not None:
+        fields.append("order_id=?"); vals.append(int(order_id))
+    if filled_qty is not None:
+        fields.append("filled_qty=?"); vals.append(amt(filled_qty))
+    if err is not None:
+        fields.append("err=?"); vals.append(redact_secrets(err))
+    if state == "TRIGGERED":
+        fields.append("triggered=COALESCE(triggered, ?)"); vals.append(ts)
+    vals.extend([deal_id])
+    return con.execute("UPDATE native_stops SET " + ", ".join(fields) + " WHERE deal_id=?", vals).rowcount == 1
 
 
 def get_perp_order(con, client_id: str) -> dict | None:

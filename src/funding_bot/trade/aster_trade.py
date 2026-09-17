@@ -297,6 +297,15 @@ def order_to_fill(cid: str, body: dict, nonce: int) -> PerpFill:
     return _pf(cid, out, order_id=oid, qty=qty, avg=avg, quote=quote, nonce=nonce)
 
 
+def conditional_to_fill(cid: str, body: dict, nonce: int) -> PerpFill:
+    """Aster conditional order response.  Unlike IOC, NEW is a proven armed order, not UNKNOWN.  It has no
+    execution yet and therefore carries quantity zero until a later query says FILLED/PARTIALLY_FILLED."""
+    f = order_to_fill(cid, body, nonce)
+    if f.order_id is not None and str(body.get("status") or "") in ("NEW", "PENDING_NEW"):
+        return _pf(cid, "OPEN", order_id=f.order_id, nonce=nonce)
+    return f
+
+
 def _trade_row(t: dict) -> dict:
     """userTrades → строка для store.add_perp_fills. commission — модулем: в примере документации она со знаком «−»."""
     return {"trade_id": int(t["id"]), "order_id": int(t["orderId"]) if t.get("orderId") is not None else None,
@@ -676,6 +685,57 @@ class AsterTrade(JournalBoundIoc):
         f = order_to_fill(client_id, body, n)
         log.info("aster ioc %s %s %s@≤%s → %s %s avg %s", client_id, side, qty, px_cap, f.status, f.qty, f.avg_px)
         return f
+
+    def take_profit_on_fall(self, symbol: str, qty: Decimal, stop_price: Decimal, client_id: str, *,
+                            working_type: str, on_signed: Callable[[int], None] | None = None) -> PerpFill:
+        """Arm the protective BUY reduce-only conditional for a spot-long / perp-short deal.
+
+        At a falling price, the short is closed by TAKE_PROFIT_MARKET BUY.  STOP_MARKET would mean the opposite
+        trigger direction for a short and is deliberately not used.  ``quantity`` is exact and frozen; closePosition
+        is avoided because it could close a manual/foreign position on the same symbol.
+        """
+        if working_type not in ("MARK_PRICE", "CONTRACT_PRICE"):
+            raise ValueError("working_type MARK_PRICE|CONTRACT_PRICE")
+        self._check_order(symbol, "BUY", qty, stop_price, client_id)
+        params = {"symbol": symbol, "side": "BUY", "type": "TAKE_PROFIT_MARKET", "quantity": qty,
+                  "stopPrice": stop_price, "newClientOrderId": client_id, "reduceOnly": True,
+                  "workingType": working_type, "newOrderRespType": "RESULT"}
+        self.last_error = None
+        try:
+            st, body, n = self.call("POST", "/fapi/v3/order", params, critical=True, on_signed=on_signed)
+        except AsterNetError as e:
+            self.last_error = str(e)
+            return _pf(client_id, "UNKNOWN", nonce=e.nonce)
+        code = _code(body)
+        if code in UNKNOWN_CODES or st >= 500 or st == 408:
+            self.last_error = f"HTTP {st} code {code} {_msg(body)}"
+            return _pf(client_id, "UNKNOWN", nonce=n, code=code)
+        if _is_error(st, body):
+            self.last_error = f"HTTP {st} code {code} {_msg(body)}"
+            return _pf(client_id, "REJECTED", nonce=n, code=code)
+        if not isinstance(body, dict):
+            return _pf(client_id, "UNKNOWN", nonce=n)
+        return conditional_to_fill(client_id, body, n)
+
+    def query_conditional(self, symbol: str, client_id: str) -> PerpFill:
+        """Read an armed conditional order without treating its NEW state as a missing outcome."""
+        if not _CID_RE.match(client_id or ""):
+            raise ValueError(f"client_id не проходит шаблон Aster: {client_id!r}")
+        try:
+            st, body, _ = self.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id},
+                                    critical=True)
+        except ModeForbidden:
+            raise
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"[:200]
+            return _pf(client_id, "UNKNOWN")
+        code = _code(body)
+        if code == NO_SUCH_ORDER:
+            return _pf(client_id, "NOT_FOUND", code=code)
+        if _is_error(st, body) or not isinstance(body, dict):
+            self.last_error = f"HTTP {st} code {code} {_msg(body)}"
+            return _pf(client_id, "UNKNOWN", code=code)
+        return conditional_to_fill(client_id, body, 0)
 
     def query(self, symbol: str, client_id: str) -> PerpFill:
         """GET /order?origClientOrderId. Один -2013 → NOT_FOUND, но это ОДНО наблюдение, не доказательство

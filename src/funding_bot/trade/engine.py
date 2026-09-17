@@ -1133,14 +1133,28 @@ class Desk:
 
     def propose_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, chat: int | None,
                       deal_id: str | None = None, stop_price: D | None = None) -> Proposal:
-        # Never accept an SL field and silently ignore it. Native-order persistence
-        # and recovery are required before an entry can claim stop protection.
-        if stop_price is not None:
-            raise Refused("SL пока не подключён: нативный ордер и восстановление ещё не подтверждены")
         plan, ctx = self.plan_entry(coin, spot_s, perp_s, usd, existing_deal=store.get_deal(self.conns.get(), deal_id)
                                     if deal_id is not None else None)
         con = self.conns.get()
         pair, cfg, sim, inst = ctx["pair"], ctx["cfg"], ctx["sim"], ctx["inst"]
+        stop = None
+        if stop_price is not None:
+            if stop_price <= 0:
+                raise Refused("SL должен быть положительной ценой")
+            if pair.venue != "aster":
+                raise Refused("SL пока поддержан только для EVM-спота × Aster: для этой фьючерсной ноги нет нативного адаптера")
+            if cfg.get("stop_loss.enabled") is not True:
+                raise Refused("SL выключен владельцем (stop_loss.enabled = true)")
+            working_type = cfg.get("stop_loss.working_type")
+            if working_type not in ("MARK_PRICE", "CONTRACT_PRICE"):
+                raise Refused("для SL не задан stop_loss.working_type")
+            # Команда принимает цену токена. Aster принимает цену контракта; множитель замороженного инструмента
+            # переводит её до отправки, а фильтр биржи проверяется при arm.
+            mark = planner.mid(ctx["mkt"].book) / inst.m
+            if stop_price >= mark:
+                raise Refused("SL должен быть ниже текущей цены токена")
+            stop = {"token_price": stop_price, "perp_price": stop_price * inst.m,
+                    "working_type": working_type, "interval_s": cfg.get("stop_loss.check_interval_s")}
         if deal_id is None:
             deal_id = store.create_deal(con, coin=coin, chain=pair.chain, token=pair.token, token_dec=pair.token_dec,
                                         perp_venue=perp_s, symbol=pair.symbol, leg_usd=usd,
@@ -1164,6 +1178,8 @@ class Desk:
                 "token_dec": pair.token_dec, "symbol": pair.symbol, "period_h": pair.period_h, "sim": sim,
                 "owner": cfg.frozen_json(), "funding_h": ctx["mkt"].funding_h,
                 "instrument": inst.as_dict(), "inst_hash": inst.inst_hash()}
+        if stop is not None:
+            spec["stop_loss"] = stop
         iid, nonce = self._root_proposal(store.get_deal(con, deal_id), "entry", spec, plan, chat)
         facts = self.plan_view(iid, plan, ctx)
         store.event(con, "proposed", deal_id=deal_id, intent_id=iid, total_usd=plan.est.get("total_usd"),
@@ -1664,6 +1680,10 @@ class Desk:
         замороженный сделки (pair_from): меняются только цены; сменилась идентичность — отказ, это новый план."""
         spec = json.loads(it["spec_json"])
         cfg = OwnerCfg.from_frozen(spec["owner"])
+        if spec.get("stop_unwind"):
+            # Native Aster BUY has already closed the full owned short.  This plan is only a fresh DEX quote for
+            # exactly the journal-owned tokens; it must never reintroduce a second perpetual BUY.
+            return self._stop_unwind_plan(deal, int(spec["units"]), cfg)
         if it["kind"] == "entry":
             inst = deal_instrument(self.conns.get(), deal)
             pair = self.pair_from(inst, deal, verify_table=True, spot_s=spec["spot"], perp_s=spec["perp"], cfg=cfg)
@@ -1678,6 +1698,63 @@ class Desk:
                                   to_full=False)[0]
         return self.plan_exit(deal, None if spec.get("all") else dget(spec.get("usd")), bool(spec.get("perp_only")),
                               cfg=cfg, write_checks=False)[0]
+
+    def propose_stop_unwind(self, deal: dict, stop: dict) -> Proposal:
+        """Build and atomically approve the spot-only half of a proven, fully filled native stop.
+
+        There is intentionally no Telegram approval and no dollar re-sizing here: the native BUY receipt fixes the
+        exact already-closed short and the journal fixes the exact spot amount.  Partial/unknown trigger outcomes are
+        never routed here.
+        """
+        con = self.conns.get()
+        bk = deal_book(con, deal["id"])
+        if not bk.known or not bk.m_known or bk.short != ZERO or bk.tokens_raw is None:
+            raise Refused("после SL состояние ног не подтверждено — автопродажу не отправляю")
+        units = int(bk.tokens_raw)
+        if units <= 0:
+            raise Refused("после SL в журнале нет токенов для продажи")
+        cfg = OwnerCfg.from_frozen(deal["owner_json"])
+        plan = self._stop_unwind_plan(deal, units, cfg)
+        inst = deal_instrument(con, deal)
+        spec = {"kind": "exit", "coin": deal["coin"], "usd": plan.leg_usd, "units": units, "all": True,
+                "perp_only": False, "stop_unwind": True, "stop_client_id": stop["client_id"],
+                "token": deal["token"], "token_dec": int(deal["token_dec"]), "symbol": deal["symbol"],
+                "sim": bool(deal["sim"]), "owner": cfg.frozen_json(),
+                "instrument": inst.as_dict(), "inst_hash": inst.inst_hash()}
+        iid, nonce = self._root_proposal(deal, "exit", spec, plan, None)
+        if not store.approve_intent(con, iid, nonce, now=self.clock()):
+            raise Refused("не удалось атомарно начать автопродажу после SL")
+        store.event(con, "stop_unwind_approved", deal_id=deal["id"], intent_id=iid,
+                    client_id=stop["client_id"], units=units)
+        return Proposal(iid, nonce, deal["id"], "exit", "stop_unwind", {}, plan)
+
+    def _stop_unwind_plan(self, deal: dict, units: int, cfg: OwnerCfg) -> Plan:
+        """Fresh DEX-only quote after the native stop has already proven the short flat.
+
+        Deliberately does not call ``plan_exit``: that method correctly rejects a temporary unhedged journal during a
+        regular exit, while this exact state is the proof required for the second half of a stop-loss.
+        """
+        if units <= 0:
+            raise Refused("SL: нулевое число токенов")
+        legs = self._deal_legs(deal)
+        stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(deal["chain"])]
+        try:
+            quotes = self._quotes(legs.spot, deal["token"], stable, units)
+            calib = planner.calibrate(quotes, "exit", p_ref=legs.spot.pool_price(deal["token"]))
+        except PlanRefused as e:
+            raise Refused(str(e)) from None
+        except Exception as e:
+            raise Refused(f"SL: DEX-котировка не получена: {redact(e)}") from None
+        usd = D(units) / D(10) ** int(deal["token_dec"]) * calib.p_ref
+        dex = planner.dex_cost(1, usd, calib.k, calib.g, tconfig.R_PRIOR, calib.c0)
+        inst = deal_instrument(self.conns.get(), deal)
+        return Plan(deal_id=deal["id"], kind="exit", coin=deal["coin"], spot=f"okx·{deal['chain']}",
+                    perp=deal["perp_venue"], symbol=deal["symbol"], leg_usd=usd,
+                    clips=[ClipPlan(seq=1, dex_in_units=units, children=[])],
+                    est={"n": 1, "dex_fee_usd": dex.fee, "dex_impact_usd": dex.impact, "gas_usd": dex.gas,
+                         "total_usd": dex.total, "total_pct": (dex.total / usd * 100) if usd else None,
+                         "stop_unwind": True}, inputs={"inst_hash": inst.inst_hash()},
+                    missing_owner_keys=(), expires=self.clock() + tconfig.PLAN_TTL_S)
 
     # --- вид плана ---
     def plan_view(self, iid: str, plan: Plan, ctx: dict) -> dict:
@@ -1838,6 +1915,7 @@ class Engine:
         self._thread: threading.Thread | None = None
         self.current: tuple[str, int, int] | None = None      # (намерение, клип, клипов) — для ответа на «стоп»
         self._unwind_due: dict[str, float] = {}
+        self._stop_checked_at: dict[str, float] = {}
         self._sol_engine = None
         # Generic plans are opt-in and receive a freshly scoped context after
         # the immutable intent is loaded.  There is deliberately no default
@@ -1877,6 +1955,7 @@ class Engine:
                 iid = self.q.get(timeout=0.5)
             except queue.Empty:
                 self._check_unwinds()
+                self._check_stops()
                 continue
             self.execute(iid)
 
@@ -2049,7 +2128,14 @@ class Engine:
         run.op_id = op['id'] if op else None
         run.inst = inst                        # единицы сделки (ревью 13.09, С1): токены ↔ контракты через m
         run.m, run.m_known = inst.m, m_known(inst)
-        if run.kind in MAIN_KINDS and not spec.get("perp_only"):
+        if spec.get("stop_unwind"):
+            # A protective order may have filled while the process was down.  Quote the frozen quantity again, but
+            # do not apply normal plan-cost rejection: delaying a risk-reducing sale would be the worse outcome.
+            try:
+                run.plan = self.desk.replan(it, deal)
+            except Refused as e:
+                raise Pause("stop_quote", f"SL сработал, но автопродажа не спланирована: {e}") from None
+        elif run.kind in MAIN_KINDS and not spec.get("perp_only"):
             fresh = self._requote(run)
             if fresh is None:
                 return
@@ -2324,6 +2410,83 @@ class Engine:
         except Exception:                      # noqa
             u = None
         return None if u is None else D(u) / D(10) ** run.dec
+
+    # --- native stop watcher ------------------------------------------------------------------------------
+    def _check_stops(self) -> None:
+        """Poll every armed Aster order at its owner-selected cadence (minimum one minute).
+
+        Only a fully proven fill may create the automatic spot sale.  A missing response, a missing order, or a
+        partial fill pauses the deal for reconciliation; guessing here could sell spot while a residual short remains.
+        """
+        con, now = self.conns.get(), self.clock()
+        if self.busy() or self.drain_evt.is_set() or self.term.is_set():
+            return
+        for stop in store.active_native_stops(con):
+            deal = store.get_deal(con, stop["deal_id"])
+            if deal is None or deal["state"] in (DealState.CLOSED, DealState.ABORTED):
+                continue
+            try:
+                cfg = OwnerCfg.from_frozen(deal["owner_json"])
+                interval = float(cfg.get("stop_loss.check_interval_s") or 60)
+            except Exception:
+                interval = 60.0
+            if now - self._stop_checked_at.get(deal["id"], 0.0) < max(60.0, interval):
+                continue
+            self._stop_checked_at[deal["id"]] = now
+            if stop["state"] == "TRIGGERED":
+                self._start_stop_unwind(deal, stop)
+                continue
+            try:
+                legs = self.desk._deal_legs(deal)
+                query = getattr(legs.perp, "query_conditional", None)
+                if not callable(query):
+                    raise RuntimeError("адаптер не умеет читать нативный SL")
+                fill = query(deal["symbol"], stop["client_id"])
+            except Exception as e:  # a read failure proves nothing; leave the native order armed/unknown
+                store.set_native_stop_state(con, deal["id"], "UNKNOWN", err=redact(e), now=now)
+                self._set_deal(deal["id"], DealState.PAUSED, reason="SL не прочитан")
+                self.hooks.notice("refused", {"reason": "SL не прочитан; автопродажа не отправлена"})
+                continue
+            if fill.status == "OPEN":
+                store.set_native_stop_state(con, deal["id"], "OPEN", order_id=fill.order_id, now=now)
+                continue
+            if fill.status == "NOT_FOUND" or fill.status == "UNKNOWN":
+                # One -2013 is not proof that an order was never accepted after a timeout; never recreate it.
+                store.set_native_stop_state(con, deal["id"], "UNKNOWN", err="SL outcome not proven", now=now)
+                self._set_deal(deal["id"], DealState.PAUSED, reason="SL outcome unknown")
+                self.hooks.notice("refused", {"reason": "исход SL не подтверждён; автопродажа не отправлена"})
+                continue
+            if fill.status != "FILLED" or fill.qty != D(str(stop["qty"])):
+                store.record_perp_fill(con, fill, err=getattr(legs.perp, "last_error", None))
+                store.set_native_stop_state(con, deal["id"], "UNKNOWN", order_id=fill.order_id,
+                                            filled_qty=fill.qty, err="partial/rejected SL", now=now)
+                self._set_deal(deal["id"], DealState.PAUSED, reason="SL filled partially or rejected")
+                self.hooks.notice("refused", {"reason": "SL исполнился не полностью; автопродажа остановлена"})
+                continue
+            store.record_perp_fill(con, fill)
+            store.set_native_stop_state(con, deal["id"], "TRIGGERED", order_id=fill.order_id,
+                                        filled_qty=fill.qty, now=now)
+            store.event(con, "stop_triggered", deal_id=deal["id"], client_id=stop["client_id"], qty=fill.qty)
+            self._start_stop_unwind(deal, store.get_native_stop(con, deal["id"]))
+
+    def _start_stop_unwind(self, deal: dict, stop: dict) -> None:
+        con = self.conns.get()
+        # Restart/tick is idempotent: do not create two automatic sales for one native order.
+        for row in con.execute("SELECT id, status, spec_json FROM intents WHERE deal_id=? AND kind='exit' "
+                               "AND status IN ('proposed','approved','running','partial','interrupted')", (deal["id"],)):
+            try:
+                if json.loads(row["spec_json"]).get("stop_unwind"):
+                    return
+            except Exception:
+                self._set_deal(deal["id"], DealState.PAUSED, reason="stop unwind intent corrupted")
+                return
+        try:
+            proposal = self.desk.propose_stop_unwind(deal, stop)
+        except Exception as e:
+            self._set_deal(deal["id"], DealState.PAUSED, reason="SL spot unwind not planned")
+            self.hooks.notice("refused", {"reason": "SL сработал, но автопродажа не спланирована: " + redact(e)})
+            return
+        self.submit(proposal.intent_id)
 
     def _check_unwinds(self) -> None:
         """Авто-откат голой ноги — только если владелец задал auto_unwind_naked_after_s (пусто = никогда)."""
@@ -2811,6 +2974,72 @@ class Engine:
         self._approve(run, run.stable, sum(queue_))
         self._run_spot_clips(run, queue_, entry=True)
 
+    def _arm_stop(self, run: Run, bk: DealBook) -> None:
+        """Create the Aster protective conditional after the entry is proven hedged and before it is reported OPEN."""
+        spec = run.spec.get("stop_loss")
+        if not spec:
+            return
+        if run.legs.sim:
+            store.event(self.conns.get(), "stop_simulated", deal_id=run.did, intent_id=run.iid,
+                        token_price=spec.get("token_price"))
+            return
+        if run.legs.perp.venue != "aster" or not callable(getattr(run.legs.perp, "take_profit_on_fall", None)):
+            raise Pause("stop_unsupported", "SL для этой фьючерсной ноги не поддержан")
+        if not bk.known or bk.short <= 0:
+            raise Pause("stop_book", "книга сделки не подтверждает шорт для SL")
+        con = self.conns.get()
+        if store.get_native_stop(con, run.did) is not None:
+            raise Pause("stop_duplicate", "у сделки уже есть журнал SL")
+        try:
+            trigger = D(str(spec["perp_price"]))
+            working_type = str(spec["working_type"])
+        except Exception as e:
+            raise Pause("stop_spec", "SL в одобренном плане повреждён") from e
+        cid = store.client_order_id(run.did, "stop", 0, 1, 1)
+        with store.tx(con):
+            store.perp_order_intent(con, clip_id=None, client_id=cid, venue="aster", symbol=run.symbol, side="BUY",
+                                    reduce_only=True, tif="TAKE_PROFIT_MARKET", price=trigger, qty=bk.short)
+            store.create_native_stop(con, deal_id=run.did, client_id=cid, venue="aster", symbol=run.symbol,
+                                     trigger_price=trigger, working_type=working_type, qty=bk.short, now=self.clock())
+        try:
+            fill = run.legs.perp.take_profit_on_fall(
+                run.symbol, bk.short, trigger, cid, working_type=working_type,
+                on_signed=lambda nonce: (store.perp_order_sent(con, cid, nonce, now=self.clock()),
+                                         store.set_native_stop_state(con, run.did, "SENT", now=self.clock())))
+        except Exception as e:
+            row = store.get_perp_order(con, cid)
+            if row is not None and row["state"] == PerpOrderState.INTENT:
+                store.perp_order_result(con, cid, PerpOrderState.NOT_PLACED, err=redact(e))
+                store.set_native_stop_state(con, run.did, "FAILED", err=redact(e), now=self.clock())
+                raise Pause("stop_refused", "SL не отправлен: " + redact(e)) from e
+            store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=redact(e))
+            store.set_native_stop_state(con, run.did, "UNKNOWN", err=redact(e), now=self.clock())
+            raise Pause("stop_unknown", "исход отправки SL неизвестен — сделка на паузе") from e
+        if fill.status == "OPEN":
+            store.perp_order_result(con, cid, PerpOrderState.OPEN, order_id=fill.order_id, executed_qty=ZERO,
+                                    avg_price=ZERO, cum_quote=ZERO, sign_nonce=fill.sign_nonce or None)
+            store.set_native_stop_state(con, run.did, "OPEN", order_id=fill.order_id, now=self.clock())
+            store.event(con, "stop_armed", deal_id=run.did, intent_id=run.iid, client_id=cid,
+                        trigger_price=trigger, qty=bk.short, working_type=working_type)
+            return
+        if fill.status == "UNKNOWN":
+            store.perp_order_result(con, cid, PerpOrderState.UNKNOWN, err=getattr(run.legs.perp, "last_error", None))
+            store.set_native_stop_state(con, run.did, "UNKNOWN", err=getattr(run.legs.perp, "last_error", None),
+                                        now=self.clock())
+            raise Pause("stop_unknown", "исход отправки SL неизвестен — сделка на паузе")
+        if fill.status == "FILLED" and fill.qty == bk.short:
+            # A price may cross while the conditional request is in flight.  The BUY receipt is already enough to
+            # start the separate spot-only path on the next idle tick; do not mislabel this as a rejected stop.
+            store.record_perp_fill(con, fill)
+            store.set_native_stop_state(con, run.did, "TRIGGERED", order_id=fill.order_id, filled_qty=fill.qty,
+                                        now=self.clock())
+            store.event(con, "stop_triggered", deal_id=run.did, intent_id=run.iid, client_id=cid, qty=fill.qty)
+            raise Pause("stop_triggered", "SL сработал при постановке; ожидаю отдельную автопродажу спота")
+        store.record_perp_fill(con, fill, err=getattr(run.legs.perp, "last_error", None))
+        store.set_native_stop_state(con, run.did, "FAILED", order_id=fill.order_id, filled_qty=fill.qty,
+                                    err=getattr(run.legs.perp, "last_error", None), now=self.clock())
+        raise Pause("stop_rejected", "SL не принят биржей — сделка на паузе")
+
     def _run_spot_clips(self, run: Run, amounts: list[int], *, entry: bool, full: bool = False) -> None:
         r = dget(run.plan.inputs.get("r")) or ZERO
 
@@ -2862,6 +3091,8 @@ class Engine:
 
     def _exit(self, run: Run) -> None:
         con = self.conns.get()
+        if run.spec.get("stop_unwind"):
+            return self._stop_spot_exit(run)
         if run.spec.get("perp_only"):
             return self._exit_perp_only(run)
         bk0 = deal_book(con, run.did)
@@ -2883,6 +3114,30 @@ class Engine:
         run.n_total = len(queue_)
         self._approve(run, run.token, self._all_units(run) if full else sum(queue_))
         self._run_spot_clips(run, queue_, entry=False, full=full)
+
+    def _stop_spot_exit(self, run: Run) -> None:
+        """Second half of a fully proven SL: sell only the journal-owned spot after the native short BUY is final."""
+        con = self.conns.get()
+        stop = store.get_native_stop(con, run.did)
+        if stop is None or stop["state"] != "TRIGGERED" or stop["client_id"] != run.spec.get("stop_client_id"):
+            raise Pause("stop_proof", "для автопродажи нет доказанного срабатывания SL")
+        bk = deal_book(con, run.did)
+        if not bk.known or bk.short != ZERO or bk.tokens_raw is None:
+            raise Pause("stop_book", "после SL ноги не подтверждены — автопродажу не отправляю")
+        units = int(run.spec.get("units") or 0)
+        if units <= 0 or units != int(bk.tokens_raw):
+            raise Pause("stop_units", "SL: число токенов для автопродажи расходится с журналом")
+        self._deal_to(run, DealState.EXITING)
+        run.seq = run.n_total = 1
+        self.current = (run.iid, 1, 1)
+        self.guard(run, invariant=False)
+        self._approve(run, run.token, units)
+        clip_id = store.create_clip(con, run.iid, 1, units)
+        self._dex(run, clip_id, run.token, run.stable, units)
+        after = deal_book(con, run.did)
+        store.set_clip_state(con, clip_id, ClipState.BALANCED, perp_qty=ZERO, perp_quote=ZERO,
+                             carry_in=bk.delta(run.dec), carry_out=after.delta(run.dec) if after.known else None)
+        self._finish_main(run)
 
     def _exit_blind(self, run: Run) -> None:
         """Полный выход сделки с неизвестным m (ревью 13.09, M3; план — Desk._plan_blind_exit). Дельту ног в токенах не
@@ -3074,6 +3329,10 @@ class Engine:
                 raise Pause("position_mismatch", f"в кошельке {v.tok(D(int(wal)) / D(10) ** run.dec, step=ts)} "
                                                  f"— меньше, чем по журналу сделки "
                                                  f"{v.tok(bk.tokens(run.dec), step=ts)} {run.deal['coin']}")
+        if run.kind == "entry":
+            # A requested SL is part of the entry acceptance contract: no OPEN/final report until its native order
+            # has a durable, queryable acknowledgement.
+            self._arm_stop(run, bk)
         self._backfill(run)
         finished = self.clock()
         if run.kind == "entry":
@@ -3098,6 +3357,8 @@ class Engine:
         from .operations import EndDecision
         OperationController(con).commit_end(run, EndDecision(
             new, IntentStatus.PARTIAL if partial else IntentStatus.DONE, root_states, fields))
+        if run.spec.get("stop_unwind") and new == DealState.CLOSED:
+            store.set_native_stop_state(con, run.did, "DONE", now=self.clock())
         snapshot, cost, liq = self._final(run, finished, closed=new == DealState.CLOSED)
         store.event(con, "final", deal_id=run.did, intent_id=run.iid, cost_usd=cost, state=str(new), sim=run.legs.sim,
                     **liq)                     # порог тревоги ликвидации замораживается на входе («позиции» его читают)

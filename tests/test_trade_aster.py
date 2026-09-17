@@ -194,6 +194,15 @@ class FakeAster(requests.Session):
         return 404, {"code": -1, "msg": f"нет пути {method} {path}"}
 
     def _order(self, p):
+        if p.get("type") == "TAKE_PROFIT_MARKET":
+            cid = p["newClientOrderId"]
+            self.next_oid += 1
+            o = {"orderId": self.next_oid, "symbol": p["symbol"], "status": "NEW", "clientOrderId": cid,
+                 "price": "0", "avgPrice": "0", "origQty": p["quantity"], "executedQty": "0",
+                 "cumQuote": "0", "type": p["type"], "reduceOnly": p["reduceOnly"] == "true",
+                 "side": p["side"], "workingType": p["workingType"], "updateTime": self.clock_ms}
+            self.orders[cid] = o
+            return 200, o
         qty, px, cid = D(p["quantity"]), D(p["price"]), p["newClientOrderId"]
         ex = qty if self.fill_cap is None else min(qty, self.fill_cap)
         self.next_oid += 1
@@ -763,3 +772,29 @@ def test_write_ahead_with_store_rows(fake, tmp_path):
                     "time": fake.clock_ms, "tranId": 31, "info": ""}]
     t2 = mk(fake, now=lambda: (fake.clock_ms + 1000) / 1000)
     assert store.add_funding_income(con, "aster", t2.funding_income(SYM, fake.clock_ms - 1000)) == 1
+
+
+def test_native_stop_is_buy_take_profit_reduce_only_and_new_is_proven_open(fake):
+    t = mk(fake)
+    cid = "fb-D7K2-s00-c1-a1"
+    seen = []
+    f = t.take_profit_on_fall(SYM, D(100), D("0.03"), cid, working_type="MARK_PRICE",
+                              on_signed=seen.append)
+    assert f.status == "OPEN" and f.order_id is not None and seen == [f.sign_nonce]
+    p = [p for m, path, p in fake.log if m == "POST" and path == "/fapi/v3/order"][-1]
+    assert (p["side"], p["type"], p["reduceOnly"], p["workingType"], p["stopPrice"]) == (
+        "BUY", "TAKE_PROFIT_MARKET", "true", "MARK_PRICE", "0.03")
+    assert t.query_conditional(SYM, cid).status == "OPEN"
+
+
+def test_native_stop_is_durable_and_raises_reader_gate(tmp_path):
+    con = store.connect(tmp_path / "trade.db")
+    did = store.create_deal(con, coin="AIW3", chain="bsc", token="0x" + "a1" * 20, token_dec=18,
+                            perp_venue="aster", symbol=SYM, leg_usd=D(10), owner_json="{}", sim=True)
+    cid = store.client_order_id(did, "stop", 0, 1, 1)
+    store.perp_order_intent(con, clip_id=None, client_id=cid, venue="aster", symbol=SYM, side="BUY",
+                            reduce_only=True, tif="TAKE_PROFIT_MARKET", price=D("0.03"), qty=D(100))
+    store.create_native_stop(con, deal_id=did, client_id=cid, venue="aster", symbol=SYM, trigger_price=D("0.03"),
+                             working_type="MARK_PRICE", qty=D(100), now=1)
+    assert store.get_native_stop(con, did)["state"] == "INTENT"
+    assert store.schema_info(con)["min_reader"] == 6

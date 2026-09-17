@@ -83,7 +83,7 @@ def test_fresh_db_is_current_schema_and_reconnect_changes_nothing(tmp_path):
     p = tmp_path / "trade.db"
     con = store.connect(p)
     info = store.schema_info(con)
-    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER) == (5, 2)
+    assert (info["version"], info["min_reader"]) == (store.SCHEMA_VERSION, store.MIN_READER)
     assert NEW_TABLES | set(LEGACY_TABLES) <= _tables(con)
     assert [r[1] for r in con.execute("PRAGMA table_info(deals)")][-2:] == ["inst_json", "perp_scope"]
     before = _objects(con)

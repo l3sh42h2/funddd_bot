@@ -60,8 +60,13 @@ class Entry:
     spot: str               # «okx·bsc»
     perp: str               # «aster»
     usd: Decimal            # на ногу
-    stop_price: Decimal | None = None  # native perp SL, set only after a proven entry
     name: str = "entry"
+
+
+@dataclass(frozen=True)
+class EntryWithStop(Entry):
+    """New syntax only.  Keeping legacy ``Entry`` structurally unchanged preserves old command snapshots."""
+    stop_price: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -328,7 +333,9 @@ def _entry(raw: str, args: list[str]) -> Command:
     usd = amount_of(amount_toks)
     if usd is None:
         return Unknown(raw, f"сумма «{' '.join(amount_toks)[:20]}» не понята — число USDT на ногу, например 500")
-    return Entry(coin=coin, spot=spot, perp=perp, usd=usd, stop_price=stop_price)
+    if stop_price is not None:
+        return EntryWithStop(coin=coin, spot=spot, perp=perp, usd=usd, stop_price=stop_price)
+    return Entry(coin=coin, spot=spot, perp=perp, usd=usd)
 
 
 def _exit(raw: str, args: list[str]) -> Command:

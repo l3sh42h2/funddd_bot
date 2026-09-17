@@ -356,6 +356,7 @@ class LivePerp(JournalBoundIoc):
         self.http = Klines()
         self.last_error = None
         self.seq = 500
+        self.stops: dict[str, PerpFill] = {}
 
     def filters(self, s):
         return FILT
@@ -427,6 +428,25 @@ class LivePerp(JournalBoundIoc):
 
     def query(self, symbol, cid):
         return self.orders.get(cid) or PerpFill(cid, None, "NOT_FOUND", D(0), D(0), D(0), 0, -2013)
+
+    def take_profit_on_fall(self, symbol, qty, stop_price, client_id, *, working_type, on_signed=None):
+        n = len(self.calls) + 1
+        if on_signed is not None:
+            on_signed(n)
+        self.seq += 1
+        f = PerpFill(client_id, self.seq, "OPEN", D(0), D(0), D(0), n)
+        self.stops[client_id] = f
+        return f
+
+    def query_conditional(self, symbol, client_id):
+        return self.stops.get(client_id) or PerpFill(client_id, None, "NOT_FOUND", D(0), D(0), D(0), 0, -2013)
+
+    def trigger_stop(self, client_id, qty):
+        self.seq += 1
+        self.pos += qty
+        f = PerpFill(client_id, self.seq, "FILLED", qty, PX, qty * PX, 0)
+        self.stops[client_id] = f
+        return f
 
     def settle_unknown(self, symbol, cid, *, pos_before, since_ms, known_order_ids=frozenset()):
         self.settles.append(cid)
@@ -1359,3 +1379,37 @@ def test_resize_is_refused_without_explicit_owner_opt_in(tmp_path):
     run_approved(e, first)
     with pytest.raises(eng.Refused, match='resize.enabled'):
         e.desk.propose_resize(first.deal_id, D(100), OWNER)
+
+
+def test_native_stop_full_fill_creates_spot_only_exit(tmp_path):
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\ncheck_interval_s = 60\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    stop = store.get_native_stop(e.con, p.deal_id)
+    assert stop and stop['state'] == 'OPEN'
+    e.perp.trigger_stop(stop['client_id'], D(str(stop['qty'])))
+    e.engine._check_stops()
+    assert store.get_native_stop(e.con, p.deal_id)['state'] == 'TRIGGERED', store.events(e.con, p.deal_id)
+    assert e.engine.q.qsize() == 1, ([(r['id'], r['status'], r['err']) for r in e.con.execute('SELECT id,status,err FROM intents')], e.hooks.reports)
+    iid = e.engine.q.get_nowait()
+    it = store.get_intent(e.con, iid)
+    assert eng.json.loads(it['spec_json'])['stop_unwind'] is True
+    before = len(e.perp.calls)
+    e.engine.execute(iid)
+    assert len(e.perp.calls) == before                    # no second BUY after native stop
+    assert store.get_deal(e.con, p.deal_id)['state'] == DealState.CLOSED
+    assert store.get_native_stop(e.con, p.deal_id)['state'] == 'DONE'
+
+
+def test_native_stop_partial_fill_never_autosells_spot(tmp_path):
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\ncheck_interval_s = 60\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    stop = store.get_native_stop(e.con, p.deal_id)
+    e.perp.trigger_stop(stop['client_id'], D(str(stop['qty'])) - 1)
+    before = len(e.spot.swaps)
+    e.engine._check_stops()
+    assert len(e.spot.swaps) == before and e.engine.q.empty()
+    assert store.get_deal(e.con, p.deal_id)['state'] == DealState.PAUSED

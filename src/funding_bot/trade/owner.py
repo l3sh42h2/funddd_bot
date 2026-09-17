@@ -127,20 +127,14 @@ _SECTIONS: dict[str, dict[str, _Spec]] = {
         "plan_cost_drift_pct": _Spec("num", **_NONNEG),
         "auto_unwind_naked_after_s": _Spec("num", **_POS),
     },
-    # Disabled until the owner opts in. Both ceilings are required before a live
-    # increase: a one-off amount and total current notional must be bounded.
-    "resize": {
-        "enabled": _Spec("bool"),
-        "max_increase_usd_per_leg": _Spec("num", **_POS),
-        "max_total_usd_per_leg": _Spec("num", **_POS),
-    },
-    # A native stop is intentionally a separate opt-in. The engine refuses a
-    # requested live SL unless its adapter can durably create and later query it.
-    "stop_loss": {
-        "enabled": _Spec("bool"),
-        "working_type": _Spec("enum", words=("MARK_PRICE", "CONTRACT_PRICE")),
-        "check_interval_s": _Spec("int", lo=Decimal(60)),
-    },
+}
+# Post-migration opt-ins.  They must not alter frozen copies of legacy owner files; an old executable must still read
+# a deal frozen before resize/SL existed.  Empty extension keys are therefore omitted just like schema-2 keys.
+_EXTENSIONS = {
+    "resize": {"enabled": _Spec("bool"), "max_increase_usd_per_leg": _Spec("num", **_POS),
+               "max_total_usd_per_leg": _Spec("num", **_POS)},
+    "stop_loss": {"enabled": _Spec("bool"), "working_type": _Spec("enum", words=("MARK_PRICE", "CONTRACT_PRICE")),
+                  "check_interval_s": _Spec("int", lo=Decimal(60))},
 }
 # [perp.<площадка>] — одна схема на площадку; площадки — только известные коллектору.
 # "auto" (владелец 12.09): α/β подбираются под каждый токен по стакану на момент плана и замораживаются в нём;
@@ -417,9 +411,16 @@ def _schema_v2() -> dict[str, _Spec]:
     return out
 
 
+def _schema_extensions() -> dict[str, _Spec]:
+    return {f"{sec}.{k}": s for sec, keys in _EXTENSIONS.items() for k, s in keys.items()}
+
+
 LEGACY_SCHEMA: Mapping[str, _Spec] = MappingProxyType(_schema())
-V2_KEYS = frozenset(_schema_v2())
-SCHEMA: Mapping[str, _Spec] = MappingProxyType({**_schema(), **_schema_v2()})
+EXTENSION_KEYS = frozenset(_schema_extensions())
+SOL_V2_KEYS = frozenset(_schema_v2())
+# Kept as the public set of post-legacy keys for compatibility tests; extensions do not require schema_version = 2.
+V2_KEYS = SOL_V2_KEYS | EXTENSION_KEYS
+SCHEMA: Mapping[str, _Spec] = MappingProxyType({**_schema(), **_schema_v2(), **_schema_extensions()})
 
 # Ключи, у которых пусто — осмысленное значение, а не запрет (live их не требует):
 #   clip_slippage_pct пусто → шлётся slippage_pct; maker_allowed пусто → только тейкер IOC;
@@ -567,12 +568,12 @@ def _flatten(doc: dict) -> tuple[dict[str, Any], list[str]]:
     for top, val in doc.items():
         if top in _TOP or top in _TOP_V2:
             flat[top] = val
-        elif top in _SECTIONS or top in _GROUPS:
+        elif top in _SECTIONS or top in _GROUPS or top in _EXTENSIONS:
             if not isinstance(val, dict):
                 errs.append(f"[{top}] должно быть секцией")
                 continue
             for k, v in val.items():
-                if k in _SECTIONS.get(top, {}):
+                if k in _SECTIONS.get(top, {}) or k in _EXTENSIONS.get(top, {}):
                     flat[f"{top}.{k}"] = v
                 elif k in _GROUPS.get(top, {}):
                     if not isinstance(v, dict):
@@ -626,7 +627,7 @@ def _validate(flat: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
 
 def _validate_v2(flat: dict[str, Any], values: dict[str, Any], errs: list[str]) -> None:
     """Сквозные проверки схемы 2. Работают только по заданным ключам: пустое ловит profile_live_missing."""
-    used = [k for k in flat if k in V2_KEYS and k != "schema_version"]
+    used = [k for k in flat if k in SOL_V2_KEYS and k != "schema_version"]
     if used and flat.get("schema_version") != 2:
         errs.append(f"ключ {used[0]} (связка Solana × Hyperliquid) требует schema_version = 2 в начале файла")
     lim = f"limits.{SOL_HL}."
@@ -895,7 +896,8 @@ class OwnerCfg:
     def frozen(self) -> dict:
         """Пустые ключи схемы 2 в копию не пишутся: копия старого файла байт-в-байт прежняя (её читает и старый код)."""
         return {"path": self.path, "sha256": self.sha256, "loaded": self.loaded,
-                "values": {k: _jsonable(v) for k, v in self.values.items() if not (v is None and k in V2_KEYS)}}
+                "values": {k: _jsonable(v) for k, v in self.values.items()
+                           if not (v is None and k in V2_KEYS | EXTENSION_KEYS)}}
 
     def frozen_json(self) -> str:
         return json.dumps(self.frozen(), sort_keys=True, ensure_ascii=False, separators=(",", ":"))

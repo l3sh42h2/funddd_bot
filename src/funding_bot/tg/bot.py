@@ -280,7 +280,7 @@ class Bot:
         elif name == "entry":
             self.sender.send(chat, views.planning(cmd.coin, "entry"))
             self._job(chat, name, lambda: self.propose(
-                chat, lambda: self.desk.propose_entry(cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat, stop_price=cmd.stop_price)))
+                chat, lambda: self.desk.propose_entry(cmd.coin, cmd.spot, cmd.perp, cmd.usd, chat, stop_price=getattr(cmd, "stop_price", None))))
         elif name == "exit":
             self.sender.send(chat, views.planning(cmd.target, "exit"))
             self._job(chat, name, lambda: self.propose(
