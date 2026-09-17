@@ -15,6 +15,9 @@ def _col(tmp_path, w, name="c"):
     t = [time.time()]
     col = Collector(clients=w, db_path=tmp_path / f"{name}.db", table_path=tmp_path / f"{name}.json",
                     now=lambda: t[0], sleep=lambda s: None, background=False)
+    # Snapshot assertions model a healthy disk.  Host free space is covered by
+    # the explicit low-disk collector test, not by these funding regressions.
+    col.disk_free_gb = lambda: config.DISK_MIN_FREE_GB + 1
     return col, t
 
 
