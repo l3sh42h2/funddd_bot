@@ -932,7 +932,7 @@ class Desk:
     # --- вход ---
     def plan_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, *, cfg: OwnerCfg | None = None,
                    sim: bool | None = None, write_checks: bool = True,
-                   pair: PairInfo | None = None, carry0: D = ZERO) -> tuple[Plan, dict]:
+                   pair: PairInfo | None = None, carry0: D = ZERO, existing_deal: dict | None = None) -> tuple[Plan, dict]:
         """План входа без записи в БД (CLI `plan` и перекотировка у кнопки). ctx — всё для PlanView и spec.
         pair — замороженный инструмент сделки (pair_from: перекотировка входа и добор, ревью 13.09, Н2): строку таблицы
         по монете заново не выбираем; decimals с цепи и контракт с биржи обязаны совпасть с замороженными.
@@ -946,11 +946,11 @@ class Desk:
             con = self.conns.get()
             mx = cfg.get("limits.max_open_deals")
             n_open = len(store.active_deals(con))
-            if mx is not None and n_open >= mx:
+            if existing_deal is None and mx is not None and n_open >= mx:
                 raise Refused(f"открытых сделок {n_open} из {mx} (max_open_deals) — вход запрещён")
             self._daily_stop_check(cfg, sim)
         cap = cfg.get("limits.deal_max_usd_per_leg")
-        if cap is not None and usd > cap:
+        if existing_deal is None and cap is not None and usd > cap:
             raise Refused(f"{v.leg(usd)} больше лимита сделки на ногу {v.leg(cap)} (deal_max_usd_per_leg)")
         # множитель контракта — только с разрешения владельца (cfg: свежий у предложения, замороженный у перекотировки;
         # исполнитель ещё раз читает свежий в _entry_limits)
@@ -958,10 +958,18 @@ class Desk:
         frozen = pair.spec if pair is not None else None
         pair = replace(pair) if pair is not None else self.find_pair(coin, spot_s, perp_s, allow_multiplier=allow)
         if write_checks:
-            for d in store.active_deals(self.conns.get()):
-                if d["token"] == pair.token or (d["perp_venue"] == pair.venue and d["symbol"] == pair.symbol):
-                    st = v.DEAL_STATE_LABEL.get(d["state"], d["state"])
-                    raise Refused(f"по {coin} уже есть сделка {d['id']} ({st}) — вход запрещён")
+            if existing_deal is not None:
+                same = (str(existing_deal.get("chain")) == pair.chain and
+                        str(existing_deal.get("token")).lower() == pair.token.lower() and
+                        str(existing_deal.get("perp_venue")) == pair.venue and
+                        str(existing_deal.get("symbol")) == pair.symbol)
+                if not same:
+                    raise Refused("добор должен использовать замороженные ноги существующей сделки")
+            else:
+                for d in store.active_deals(self.conns.get()):
+                    if d["token"] == pair.token or (d["perp_venue"] == pair.venue and d["symbol"] == pair.symbol):
+                        st = v.DEAL_STATE_LABEL.get(d["state"], d["state"])
+                        raise Refused(f"по {coin} уже есть сделка {d['id']} ({st}) — вход запрещён")
         legs = self._legs_for(pair.chain, pair.venue, sim)
         stable, sdec = config.OKX_DEX_STABLES[tconfig.chain_index(pair.chain)]
         total = int((usd * D(10) ** sdec).to_integral_value(ROUND_FLOOR))
@@ -1125,7 +1133,8 @@ class Desk:
 
     def propose_entry(self, coin: str, spot_s: str, perp_s: str, usd: D, chat: int | None,
                       deal_id: str | None = None) -> Proposal:
-        plan, ctx = self.plan_entry(coin, spot_s, perp_s, usd)
+        plan, ctx = self.plan_entry(coin, spot_s, perp_s, usd, existing_deal=store.get_deal(self.conns.get(), deal_id)
+                                    if deal_id is not None else None)
         con = self.conns.get()
         pair, cfg, sim, inst = ctx["pair"], ctx["cfg"], ctx["sim"], ctx["inst"]
         if deal_id is None:
@@ -1156,6 +1165,62 @@ class Desk:
         store.event(con, "proposed", deal_id=deal_id, intent_id=iid, total_usd=plan.est.get("total_usd"),
                     n=plan.est.get("n"), sim=sim)
         return Proposal(iid, nonce, deal_id, "entry", 'plan', facts, plan)
+
+    # --- добор ---
+    def _resize_check(self, deal: dict, usd: D, cfg: OwnerCfg) -> D:
+        """Prove that an additive entry is bounded and belongs to this exact deal.
+
+        The current notional is recomputed from the journal-owned inventory and a
+        fresh DEX price.  It is deliberately not `deals.leg_usd`, which is the
+        original entry amount and would let repeated increases bypass a ceiling.
+        """
+        if cfg.get("resize.enabled") is not True:
+            raise Refused("добор выключен владельцем (resize.enabled = true)")
+        one, total = cfg.require("resize.max_increase_usd_per_leg", "resize.max_total_usd_per_leg")
+        if usd > one:
+            raise Refused(f"добор {formatters.leg(usd)} больше лимита {formatters.leg(one)} (resize.max_increase_usd_per_leg)")
+        if deal["state"] not in (DealState.OPEN, DealState.PAUSED):
+            raise Refused(f"сделка {deal['id']} не открыта — добор не начинаю")
+        bk = deal_book(self.conns.get(), deal["id"])
+        if not bk.known or not bk.inst_ok or not bk.m_known:
+            raise Refused("состояние сделки или её инструмент не подтверждены — добор не начинаю")
+        legs = self._deal_legs(deal)
+        p = legs.spot.pool_price(deal["token"])
+        if p is None or p <= 0:
+            raise Refused("цена токена на DEX не получена — лимит добора не проверить")
+        owned = bk.tokens(int(deal["token_dec"]))
+        current = owned * p
+        if current + usd > total:
+            raise Refused(f"позиция {formatters.leg(current)} + добор {formatters.leg(usd)} больше лимита "
+                          f"{formatters.leg(total)} (resize.max_total_usd_per_leg)")
+        f = legs.perp.filters(deal["symbol"])
+        if bk.hedged(int(deal["token_dec"]), f.step) is not True:
+            raise Refused("ноги сделки не подтверждены как ровные — сначала сверка/дохедж")
+        return current
+
+    def propose_resize(self, target: str, usd: D, chat: int | None) -> Proposal:
+        deal = self.resolve_deal(target)
+        if is_sol_deal(deal):
+            raise Refused("добор Solana-профиля ещё не подключён: эта команда разрешена только для EVM-сделки")
+        cfg = self.cfg()
+        current = self._resize_check(deal, usd, cfg)
+        inst = deal_instrument(self.conns.get(), deal)
+        pair = self.pair_from(inst, deal, verify_table=False)
+        plan, ctx = self.plan_entry(deal["coin"], f"okx·{deal['chain']}", deal["perp_venue"], usd,
+                                    cfg=cfg, pair=pair, carry0=deal_book(self.conns.get(), deal["id"]).delta(int(deal["token_dec"])) or ZERO,
+                                    existing_deal=deal)
+        plan.deal_id = deal["id"]
+        spec = {"kind": "entry", "coin": deal["coin"], "spot": f"okx·{deal['chain']}",
+                "perp": deal["perp_venue"], "usd": usd, "token": deal["token"],
+                "token_dec": int(deal["token_dec"]), "symbol": deal["symbol"], "period_h": pair.period_h,
+                "sim": bool(deal["sim"]), "owner": cfg.frozen_json(), "funding_h": ctx["mkt"].funding_h,
+                "instrument": inst.as_dict(), "inst_hash": inst.inst_hash(),
+                "resize": {"action": "increase", "current_usd": current, "increment_usd": usd}}
+        iid, nonce = self._root_proposal(deal, "entry", spec, plan, chat)
+        facts = self.plan_view(iid, plan, ctx)
+        store.event(self.conns.get(), "resize_proposed", deal_id=deal["id"], intent_id=iid,
+                    current_usd=current, increase_usd=usd, total_usd=plan.est.get("total_usd"), sim=bool(deal["sim"]))
+        return Proposal(iid, nonce, deal["id"], "entry", "plan", facts, plan)
 
     # --- выход ---
     def resolve_deal(self, target: str) -> dict:
@@ -2708,6 +2773,11 @@ class Engine:
             cfg = self.owner_loader()
         except OwnerConfigError as e:
             raise Pause("owner", f"owner.toml не прочитан: {e}") from None
+        if run.spec.get("resize"):
+            try:
+                self.desk._resize_check(run.deal, D(str(run.spec["resize"]["increment_usd"])), cfg)
+            except Refused as e:
+                raise Pause("limit", str(e)) from None
         mx = cfg.get("limits.max_open_deals")
         n_open = sum(1 for d in store.active_deals(self.conns.get()) if d["id"] != run.did)
         if mx is not None and n_open >= mx:

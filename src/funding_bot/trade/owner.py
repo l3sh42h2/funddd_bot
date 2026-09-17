@@ -127,6 +127,20 @@ _SECTIONS: dict[str, dict[str, _Spec]] = {
         "plan_cost_drift_pct": _Spec("num", **_NONNEG),
         "auto_unwind_naked_after_s": _Spec("num", **_POS),
     },
+    # Disabled until the owner opts in. Both ceilings are required before a live
+    # increase: a one-off amount and total current notional must be bounded.
+    "resize": {
+        "enabled": _Spec("bool"),
+        "max_increase_usd_per_leg": _Spec("num", **_POS),
+        "max_total_usd_per_leg": _Spec("num", **_POS),
+    },
+    # A native stop is intentionally a separate opt-in. The engine refuses a
+    # requested live SL unless its adapter can durably create and later query it.
+    "stop_loss": {
+        "enabled": _Spec("bool"),
+        "working_type": _Spec("enum", words=("MARK_PRICE", "CONTRACT_PRICE")),
+        "check_interval_s": _Spec("int", lo=Decimal(60)),
+    },
 }
 # [perp.<площадка>] — одна схема на площадку; площадки — только известные коллектору.
 # "auto" (владелец 12.09): α/β подбираются под каждый токен по стакану на момент плана и замораживаются в нём;

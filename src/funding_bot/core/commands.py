@@ -267,6 +267,10 @@ class Bot:
             self.sender.notice(chat, 'planning_started', coin=cmd.target, side='exit')
             self._job(chat, name, lambda: self.propose(
                 chat, lambda: self.desk.propose_exit(cmd.target, cmd.usd, cmd.perp_only, chat)))
+        elif name == "resize":
+            self.sender.notice(chat, 'planning_started', coin=cmd.target, side='entry')
+            self._job(chat, name, lambda: self.propose(
+                chat, lambda: self.desk.propose_resize(cmd.target, cmd.usd, chat)))
         elif name == "profile_entry":             # связка Solana × Hyperliquid: инструмент — из реестра профиля
             self.sender.notice(chat, 'planning_started', coin=cmd.coin, side='entry')
             self._job(chat, name, lambda: self.propose(chat, lambda: self.desk.propose_profile_entry(cmd, chat)))

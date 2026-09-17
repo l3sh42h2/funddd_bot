@@ -1333,3 +1333,29 @@ def test_dex_link_rows_are_view_only_not_tradable(tmp_path):
         d2.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=True)
     assert "прямое доказательство" in render(ei.value)
     assert e.desk.plan_entry("AIW3", "okx·bsc", "aster", D(100), sim=True) is not None   # свой контракт — как раньше
+
+
+def test_resize_increase_reuses_only_open_deal_and_enforces_total_limit(tmp_path):
+    e = live_env(tmp_path)
+    first = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(200), chat=OWNER)
+    run_approved(e, first)
+    # Explicit owner opt-in; without these values the operation must remain refused.
+    text = e.path.read_text().replace('[exec]', '[resize]\nenabled = true\nmax_increase_usd_per_leg = 300\nmax_total_usd_per_leg = 450\n[exec]')
+    e.path.write_text(text)
+    added = e.desk.propose_resize(first.deal_id, D(200), OWNER)
+    it = store.get_intent(e.con, added.intent_id)
+    assert it['deal_id'] == first.deal_id
+    assert eng.json.loads(it['spec_json'])['resize']['action'] == 'increase'
+    run_approved(e, added)
+    assert store.get_deal(e.con, first.deal_id)['state'] == DealState.OPEN
+    assert deal_book(e.con, first.deal_id).hedged(18, FILT.step) is True
+    with pytest.raises(eng.Refused, match='max_total_usd_per_leg'):
+        e.desk.propose_resize(first.deal_id, D(200), OWNER)
+
+
+def test_resize_is_refused_without_explicit_owner_opt_in(tmp_path):
+    e = live_env(tmp_path)
+    first = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(200), chat=OWNER)
+    run_approved(e, first)
+    with pytest.raises(eng.Refused, match='resize.enabled'):
+        e.desk.propose_resize(first.deal_id, D(100), OWNER)

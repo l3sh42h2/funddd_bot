@@ -60,7 +60,15 @@ class Entry:
     spot: str               # «okx·bsc»
     perp: str               # «aster»
     usd: Decimal            # на ногу
+    stop_price: Decimal | None = None  # native perp SL, set only after a proven entry
     name: str = "entry"
+
+
+@dataclass(frozen=True)
+class Resize:
+    target: str
+    usd: Decimal
+    name: str = "resize"
 
 
 @dataclass(frozen=True)
@@ -158,12 +166,12 @@ class ProfilePositions:
     name: str = "positions"
 
 
-Command = (Entry | Exit | Positions | Status | Stop | Resume | Rehedge | Undo | Help | Start | Unknown | ProfileEntry
+Command = (Entry | Exit | Resize | Positions | Status | Stop | Resume | Rehedge | Undo | Help | Start | Unknown | ProfileEntry
            | ProfileExit | ProfilePositions)
 
 _SLASH = {"/status": "статус", "/positions": "позиции", "/stop": "стоп", "/help": "помощь", "/start": "/start"}
 _WORDS = {
-    "вход": "entry", "выход": "exit", "позиции": "positions", "статус": "status", "стоп": "stop",
+    "вход": "entry", "выход": "exit", "добор": "resize", "уменьшить": "exit", "позиции": "positions", "статус": "status", "стоп": "stop",
     "продолжить": "resume", "дохедж": "rehedge", "откат": "undo", "помощь": "help", "/start": "start",
 }
 
@@ -267,6 +275,10 @@ def parse(text: str) -> Command:
     if kind == "entry":
         res = _entry(raw, args)
         return (_profile_entry(raw, args, _raw_args(text, len(args))) or res) if isinstance(res, Unknown) else res
+    if kind == "resize":
+        if len(args) in (2, 3) and (t := parse_target(args[0])) and (usd := amount_of(args[1:])):
+            return Resize(t, usd)
+        return Unknown(raw, "формат: добор <id|монета> <сумма>")
     if kind == "exit":
         res = _exit(raw, args)
         return (_profile_exit(raw, args, _raw_args(text, len(args))) or res) if isinstance(res, Unknown) else res
@@ -305,12 +317,18 @@ def _entry(raw: str, args: list[str]) -> Command:
     if perp is None:
         return Unknown(raw, f"перп «{rest[0][:20]}» не понят — площадки: {', '.join(config.PERP_VENUES)}")
     amount_toks = rest[1:]
+    stop_price = None
+    if len(amount_toks) >= 2 and amount_toks[-2] in ("sl", "стоплосс"):
+        stop_price = parse_amount(amount_toks[-1])
+        amount_toks = amount_toks[:-2]
+        if stop_price is None:
+            return Unknown(raw, "SL — положительная цена, например: вход AIW3 okx·bsc aster 500 sl 0.03")
     if not amount_toks or len(amount_toks) > 2:
         return Unknown(raw, "формат: " + ENTRY_FMT)
     usd = amount_of(amount_toks)
     if usd is None:
         return Unknown(raw, f"сумма «{' '.join(amount_toks)[:20]}» не понята — число USDT на ногу, например 500")
-    return Entry(coin=coin, spot=spot, perp=perp, usd=usd)
+    return Entry(coin=coin, spot=spot, perp=perp, usd=usd, stop_price=stop_price)
 
 
 def _exit(raw: str, args: list[str]) -> Command:
