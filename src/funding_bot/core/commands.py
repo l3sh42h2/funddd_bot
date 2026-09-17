@@ -223,6 +223,14 @@ class Bot:
         except Exception as e:
             log.warning("approval delivery deferred: %s", redact(e))
         finally:
+            # An expired exit is never revived: quote and reduce-only size are stale.
+            # Build a fresh proposal through the regular path so one late tap cannot trap
+            # the owner in a dead plan or submit an old order.
+            if r.closed == "expired" and r.intent_id and d.chat_id is not None:
+                it = store.get_intent(con, r.intent_id)
+                if it is not None and it["kind"] == "exit":
+                    self._job(d.chat_id, "refresh-expired-exit",
+                              lambda iid=r.intent_id: self.requote(iid, "план истёк"))
             if r.submit:
                 log.info("tg: намерение %s одобрено владельцем — исполнителю", r.intent_id)
                 self.engine.submit(r.intent_id)

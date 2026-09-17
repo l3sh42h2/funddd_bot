@@ -120,6 +120,8 @@ class FinalView:
     perp_qty: Decimal | None = None     # модуль
     impact_usd: Decimal | None = None   # против котировки плана
     planned_impact_usd: Decimal | None = None
+    perp_slip_usd: Decimal | None = None
+    perp_fee_usd: Decimal | None = None
     gas_usd: Decimal | None = None      # свопы
     approve_gas_usd: Decimal | None = None
     swaps: int = 0                      # свопов с чеком (газ на один своп — для запаса BNB)

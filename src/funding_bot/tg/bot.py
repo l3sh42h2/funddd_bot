@@ -241,6 +241,14 @@ class Bot:
         self._answer(d.callback_id, r.answer)
         if r.closed and d.chat_id is not None and d.message_id is not None:
             self.sender.edit(d.chat_id, d.message_id, self._closed(r.intent_id, r.closed, now), reply_markup=None)
+        # A close plan is intentionally short lived: its quote and reduce-only quantity must not be
+        # accepted after the market moved.  Previously an owner who pressed an expired exit button
+        # had to type the command again. Rebuild a new proposal through the normal Desk path; never
+        # revive or submit the expired intent itself.
+        if r.closed == "expired" and r.intent_id and d.chat_id is not None:
+            it = store.get_intent(con, r.intent_id)
+            if it is not None and it["kind"] == "exit":
+                self._job(d.chat_id, "refresh-expired-exit", lambda iid=r.intent_id: self.requote(iid, "план истёк"))
         if r.submit:
             log.info("tg: намерение %s одобрено владельцем — исполнителю", r.intent_id)
             self.engine.submit(r.intent_id)

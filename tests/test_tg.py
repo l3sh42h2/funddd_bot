@@ -273,6 +273,15 @@ def test_stale_owner_message_reply():
     assert txt.startswith("⌛") and "устарела" in txt and views.hm(d.date) in txt
 
 
+def test_final_reports_actual_cost_components_when_over_plan():
+    text = flat(views.final(views.FinalView(
+        "E1", "entry", "AIW3", "bsc", "aster", "D1", cost_usd=D("69.75"), planned_cost_usd=D("6.09"),
+        impact_usd=D("65.10"), perp_slip_usd=D("2.30"), perp_fee_usd=D("0.98"), gas_usd=D("0.07"),
+    )))
+    assert "Издержки 69.75 $ — план 6.09 $" in text
+    assert "Факт: спот 65.10 $ · перп 2.30 $ · комиссия 0.98 $ · газ 0.07 $" in text
+
+
 # ================================ кнопка: CAS ================================
 def test_double_tap_gives_one_submit(con):
     iid, nonce = _intent(con)

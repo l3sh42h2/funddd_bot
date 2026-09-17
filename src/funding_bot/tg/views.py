@@ -879,6 +879,21 @@ def _final_warns(v: FinalView, coin: str, venue: str) -> list[str]:
     return ws
 
 
+def _cost_parts(v: FinalView) -> str | None:
+    """Explain a materially worse fill with the same four facts used by report.final_numbers.
+
+    Showing only the aggregate led the operator to read execution loss as a reporting error.
+    None means the journal did not prove every component, so the renderer must not invent a zero.
+    """
+    cost, planned = _d(v.cost_usd), _d(v.planned_cost_usd)
+    if cost is None or planned is None or planned <= 0 or cost <= planned * (1 + tconfig.SHOW_COST_OVER_PLAN):
+        return None
+    parts = (("спот", _d(v.impact_usd)), ("перп", _d(v.perp_slip_usd)),
+             ("комиссия", _d(v.perp_fee_usd)), ("газ", _sum(v.gas_usd, v.approve_gas_usd)))
+    known = [f"{name} {money(value)}" for name, value in parts if value is not None]
+    return "Факт: " + " · ".join(known) if known else None
+
+
 def final(v: FinalView) -> str:
     coin, venue, did = escape(v.coin), _venue(v.perp_venue), escape(v.deal_id)
     ws = _final_warns(v, coin, venue)
@@ -892,7 +907,7 @@ def final(v: FinalView) -> str:
         body = [f"Спот {tok(v.spot_qty, True, ts)} · шорт {venue} "
                 f"{contracts(None if pq is None else -pq, v.m, True, v.step, coin=coin)}",
                 f"{_funding_usd(v.expected_usd_h)} · курсовой {pct(v.basis_pct, 2, sign=True)}",
-                _cost_line(v.cost_usd, v.exit_cost_usd, v.breakeven_h, v.expected_usd_h),
+                _cost_line(v.cost_usd, v.exit_cost_usd, v.breakeven_h, v.expected_usd_h), _cost_parts(v),
                 " · ".join([f"<code>выход {did}</code>"] + ([links] if links else []))]
         return _compose(icon, head, ws, body, v.sim)
     if not v.partial:

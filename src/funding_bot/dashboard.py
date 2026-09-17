@@ -66,6 +66,7 @@ a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
 .ctl label{display:inline-flex;gap:4px;align-items:center}
 .ctl input,.ctl select{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:4px;padding:2px 6px}
 .ctl input[type=number]{width:70px}.ctl input[type=text]{width:100px}
+.pg{font:inherit;font-weight:600;padding:1px 6px;border:1px solid var(--line);border-radius:4px;background:var(--card);color:var(--fg);cursor:pointer}.pg:disabled{opacity:.45;cursor:default}
 /* таблица сама прокручивается по вертикали — иначе прилипающая шапка не прилипает (ревью 10.09) */
 .tbl{overflow:auto;max-height:calc(100vh - 150px);border:1px solid var(--line);border-radius:6px;background:var(--card)}
 table{border-collapse:collapse;width:100%;min-width:1000px}
@@ -140,12 +141,13 @@ const $ = s => document.querySelector(s);
 // spSel / ppSel — включённые споты / фьючерсы (null = все); min1d — «1d >» в процентах (ключ новый: прежний «Текущий ≥»
 // из сохранённых настроек не должен перебить значение по умолчанию 0.5)
 const DEF = {mode:'sf', ff:{sort:'spread', dir:-1}, sf:{sort:'spread', dir:-1}, open:{ff:[], sf:[]},
-             hideMis:false, spSel:null, ppSel:null, min1d:'0.5', q:''};
+             hideMis:false, spSel:null, ppSel:null, min1d:'0.5', q:'', page:{ff:0,sf:0}};
 let ui = Object.assign({}, DEF);
 // fb_ui4 — настройки прежней версии страницы (режим, сортировки, фильтры); убранная сортировка dev сбрасывается ниже
 try { ui = Object.assign({}, DEF, JSON.parse(localStorage.getItem('fb_ui5') || localStorage.getItem('fb_ui4') || '{}')); } catch(e) {}
 ui.ff = Object.assign({}, DEF.ff, ui.ff); ui.sf = Object.assign({}, DEF.sf, ui.sf);
 ui.open = Object.assign({ff:[], sf:[]}, ui.open);
+ui.page = Object.assign({ff:0, sf:0}, ui.page);
 if(ui.mode !== 'ff' && ui.mode !== 'sf') ui.mode = 'sf';
 // сохранённый выбор — только из площадок, что есть сейчас; включены все — это «все» (null)
 for(const p of Object.values(PICK)){
@@ -478,13 +480,24 @@ function render(){
   renderControls(); renderHead();
   const rows = filtered(), groups = grouped(rows), open = new Set(ui.open[ui.mode] || []);
   const rowFn = ui.mode === 'ff' ? rowFF : rowSF;
+  // Keep all comparisons available for sorting and filters, but do not create tens of
+  // thousands of DOM nodes on a phone. The page boundary is coin groups, not raw rows.
+  const PAGE_SIZE = 100, pages = Math.max(1, Math.ceil(groups.length / PAGE_SIZE));
+  let page = Number(ui.page[ui.mode]) || 0;
+  if(page < 0 || page >= pages) page = 0;
+  ui.page[ui.mode] = page;
+  const visible = groups.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
   let h = '';
-  for(const g of groups){
+  for(const g of visible){
     const isOpen = g.length > 1 && (open.has(gkey(g[0])) || open.has(g[0].base)), show = isOpen ? g : [g[0]];
     show.forEach((r, i) => { h += rowFn(r, i === 0 ? coinCell(g, show.length, isOpen) : '', isOpen); });
   }
   $('#rows').innerHTML = h;
-  $('#shown').textContent = plural(groups.length, 'монета', 'монеты', 'монет') + ' · ' + rows.length + ' из ' + rawRows().length;   // счёт — без второго разворота всех строк
+  $('#shown').innerHTML = plural(groups.length, 'монета', 'монеты', 'монет') + ' · ' + rows.length + ' из ' + rawRows().length +
+    (pages > 1 ? ` · <button class="pg" data-p="-1"${page === 0 ? ' disabled' : ''}>←</button> ${page + 1}/${pages} <button class="pg" data-p="1"${page + 1 === pages ? ' disabled' : ''}>→</button>` : '');
+  $('#shown').querySelectorAll('button.pg').forEach(b => b.onclick = () => {
+    ui.page[ui.mode] = page + Number(b.dataset.p); save(); safeRender(); $('.tbl').scrollTop = 0;
+  });
   renderStatus(srvNow());
 }
 function toggle(base){

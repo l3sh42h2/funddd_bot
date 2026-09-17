@@ -3144,6 +3144,7 @@ class Engine:
             perp_venue=run.deal["perp_venue"], deal_id=run.did, leg_usd=run.plan.leg_usd if entry else None,
             deal_leg_usd=dget(run.deal["leg_usd"]), spot_qty=dex["tokens"], spot_usd=dex["usd"], perp_qty=pl["qty"],
             impact_usd=fn["impact_usd"], planned_impact_usd=plan_impact, gas_usd=gas["swap_usd"],
+            perp_slip_usd=fn["perp_slip_usd"], perp_fee_usd=fn["commission_usd"],
             approve_gas_usd=gas["approve_usd"] if approves else None, swaps=swaps, native_px=legs.native_px(),
             leverage=run.cfg.get(f"perp.{run.deal['perp_venue']}.leverage"),
             margin_type=run.cfg.get(f"perp.{run.deal['perp_venue']}.margin_type"),
