@@ -8,6 +8,7 @@ import pytest, requests
 from funding_bot.trade import keys, store, tconfig
 from funding_bot.tg import api as tgapi, auth, parse, poller as tgpoller, sender as tgsender, views
 from funding_bot.tg.parse import Entry, Exit, Help, Positions, Rehedge, Resume, Start, Status, Stop, Undo, Unknown
+from funding_bot.operator_commands import Resize
 
 TOKEN = "123456789:AAFake-Token_for_tests"
 OWNER = 777000111
@@ -264,6 +265,15 @@ def test_stranger_start_is_rate_limited_per_chat_and_globally():
     assert auth.classify(u, OWNER, now=clk(), limiter=lim).verdict == auth.STRANGER_START
     reply = views.start_reply(STRANGER, STRANGER)
     assert str(STRANGER) in reply and html_ok(reply)
+
+
+def test_resize_and_entry_stop_syntax_are_strict():
+    from funding_bot import operator_commands as commands
+    assert commands.parse("добор DQA9Q 200") == Resize("DQA9Q", Decimal("200"))
+    assert commands.parse("уменьшить DQA9Q 100") == commands.Exit("DQA9Q", Decimal("100"), False)
+    got = commands.parse("вход AIW3 okx·bsc aster 200 sl 0.03")
+    assert isinstance(got, commands.Entry) and got.stop_price == Decimal("0.03")
+    assert isinstance(commands.parse("добор DQA9Q 200 300"), commands.Unknown)
 
 
 def test_stale_owner_message_reply():
