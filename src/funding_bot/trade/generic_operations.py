@@ -273,7 +273,10 @@ class GenericOperationCoordinator:
         deal = validate_generic_parent(self.con, deal["id"], plan)
         if spec.get("plan_fingerprint") != plan.fingerprint or op["inst_hash"] != "generic:" + _generic_identity(plan):
             raise store.StoreError("generic intent frozen plan identity changed")
-        run = SimpleNamespace(iid=intent_id, did=deal["id"], kind=intent["kind"], it=intent,
+        # OperationController admission also evaluates exit flags (for example
+        # native-stop cancellation).  Keep the immutable decoded intent spec
+        # on the generic run just like the legacy/Solana run contexts do.
+        run = SimpleNamespace(iid=intent_id, did=deal["id"], kind=intent["kind"], it=intent, spec=spec,
                               deal=deal, op_id=op["id"], legs=SimpleNamespace(sim=bool(deal["sim"])))
         return run, plan, op
 
