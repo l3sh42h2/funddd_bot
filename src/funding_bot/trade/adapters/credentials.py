@@ -115,6 +115,22 @@ class CredentialProvider:
             return tuple(K.ApiSecret(value, name) for value, name in zip(values, ('GATE_API_KEY', 'GATE_API_SECRET')))
         return self.once('gate', load)
 
+    def binance(self):
+        """One api-key/secret pair for BOTH Binance Futures (binance_trade.py) and Binance Spot
+        (binance_spot_trade.py) — a single Binance account grants Futures/Spot permissions independently on the
+        same key (Binance API Management), so this loads the env once and both native traders share it; there is
+        no second BINANCE_* pair to load. HMAC api-key/secret, not an EOA signature — trade/keys.py's own loader
+        (load()) does not need to know this venue, exactly like gate()."""
+        def load():
+            from ..binance_trade import load_env_keys
+            values = load_env_keys(self._env)
+            self._env.pop('BINANCE_API_KEY', None)
+            self._env.pop('BINANCE_API_SECRET', None)
+            for value in values:
+                K._remember_exact(value)
+            return tuple(K.ApiSecret(value, name) for value, name in zip(values, ('BINANCE_API_KEY', 'BINANCE_API_SECRET')))
+        return self.once('binance', load)
+
     def solana(self, cfg, mode):
         if mode == 'dry':
             raise K.KeysForbidden('dry: Solana credentials are not loaded')

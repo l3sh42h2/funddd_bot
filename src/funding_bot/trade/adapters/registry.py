@@ -37,9 +37,13 @@ class AdapterRegistry:
 
 
 def production_registry():
-    from .native import EvmSpotAdapter, SolanaSpotAdapter, FuturesAdapter
+    from .native import CexSpotAdapter, EvmSpotAdapter, SolanaSpotAdapter, FuturesAdapter
     registry = AdapterRegistry()
+    # "binance"/"binance_spot" (18.09): first real (non-example) CEX legs — no profile references them yet
+    # (owner.toml has no matching profile/limits section for a CEX-spot × CEX-perp pair), so registering the
+    # factory here is inert by ADAPTER_GUIDE.md's own rule: a registry entry is not a live permission.
     for name, cls in (('okx_evm', EvmSpotAdapter), ('sol_best', SolanaSpotAdapter),
-                      ('aster', FuturesAdapter), ('gate', FuturesAdapter), ('hyperliquid', FuturesAdapter)):
+                      ('aster', FuturesAdapter), ('gate', FuturesAdapter), ('hyperliquid', FuturesAdapter),
+                      ('binance', FuturesAdapter), ('binance_spot', CexSpotAdapter)):
         registry.register(name, lambda spec, context, cls=cls: cls(spec, context.for_leg(spec)))
     return registry

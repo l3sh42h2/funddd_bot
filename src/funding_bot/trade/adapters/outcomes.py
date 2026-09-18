@@ -196,6 +196,58 @@ def evm_swap(result, spec, side):
                   **_identity(spec, ref), **fields)
 
 
+_CEX_SPOT_TERMINAL = frozenset({'FILLED', 'EXPIRED', 'CANCELED', 'CANCELLED', 'REJECTED'})
+
+
+def _to_raw(value, decimals):
+    """Exact Decimal -> non-negative raw integer at `decimals` precision, or None if absent/negative/inexact.
+    A CEX quantity string is always an exact multiple of the exchange's own step at its own asset precision, so
+    this never silently rounds a real fill; it only refuses a value that does not fit the declared precision."""
+    if not isinstance(value, D) or not value.is_finite() or value < 0:
+        return None
+    scaled = value * (D(10) ** decimals)
+    if scaled != scaled.to_integral_value():
+        return None
+    return int(scaled)
+
+
+def cex_spot(fill, spec, side):
+    """Map a native CEX-spot order fill (BinanceSpotTrade.SpotFill-shaped: status/base_qty/quote_qty/avg_px/
+    client_id/order_id — no wallet, gas, chain or token) into Result v2. spec.decimals/quote_decimals here are
+    the venue's own asset precision (e.g. Binance baseAssetPrecision/quoteAssetPrecision), not an on-chain
+    token decimals(); _spot_amounts below is exchange-agnostic and already used by evm_swap/sol_swap."""
+    if side not in {'BUY', 'SELL'}:
+        raise AdapterError(ErrorKind.IDENTITY, 'spot result side missing')
+    status = {'FILLED': Status.SETTLED, 'PARTIALLY_FILLED': Status.PARTIAL,
+              'EXPIRED': Status.CANCELLED, 'CANCELED': Status.CANCELLED, 'CANCELLED': Status.CANCELLED,
+              'REJECTED': Status.REJECTED, 'NEW': Status.ACCEPTED}.get(getattr(fill, 'status', None), Status.UNKNOWN)
+    terminal = getattr(fill, 'status', None) in _CEX_SPOT_TERMINAL
+    order_id = getattr(fill, 'order_id', None)
+    ref = _spot_ref('order', order_id) if order_id is not None else _spot_ref('client_order', fill.client_id)
+    evidence = (redact(str((spec.scope, fill.client_id, order_id, fill.status, side))),)
+    if spec.decimals is None or spec.quote_decimals is None:
+        return Result(Status.UNKNOWN, None, 'invalid_exchange_execution', True, evidence,
+                      error=ErrorKind.UNKNOWN, **_identity(spec, ref))
+    base_raw = _to_raw(getattr(fill, 'base_qty', None), spec.decimals)
+    quote_raw = _to_raw(getattr(fill, 'quote_qty', None), spec.quote_decimals)
+    amount_in, amount_out = (quote_raw, base_raw) if side == 'BUY' else (base_raw, quote_raw)
+    amounts = _spot_amounts(spec, side, amount_in, amount_out)
+    usable = amounts is not None and amounts[0].raw > 0 and amounts[1].raw > 0
+    if status == Status.SETTLED and not usable:
+        return Result(Status.UNKNOWN, None, 'incomplete_receipt', True, evidence,
+                      error=ErrorKind.UNKNOWN, **_identity(spec, ref))
+    fields = {}
+    qty = None
+    if amounts is not None and (status != Status.UNKNOWN or usable):
+        incoming, outgoing, qty, avg = amounts
+        fields = dict(spot_input_raw=incoming, spot_output_raw=outgoing, avg_price=avg)
+    return Result(status, qty, 'exchange_terminal' if terminal else 'exchange_observation', not terminal,
+                  evidence, terminal=terminal,
+                  error=ErrorKind.UNKNOWN if status == Status.UNKNOWN else
+                  ErrorKind.REJECTED if status == Status.REJECTED else None,
+                  **_identity(spec, ref), **fields)
+
+
 def _legacy_sol(result, spec, side):
     final = result.commitment == 'finalized'
     ok = result.state == 'ok' and final

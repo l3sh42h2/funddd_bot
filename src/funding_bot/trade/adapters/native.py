@@ -152,3 +152,17 @@ class SolanaSpotAdapter(NativeAdapter):
         if self.spec.decimals is None:
             raise AdapterError(ErrorKind.IDENTITY, 'token decimals unknown')
         return outcomes.sol_swap(native, self.spec, side)
+
+
+class CexSpotAdapter(NativeAdapter):
+    """First real (non-example) CEX-spot adapter (Binance): no wallet, gas, chain or token identity — the
+    account/instrument scope is the exchange's own account and symbol. docs/migration/examples/cex_spot.py is
+    the registration template; this class maps a genuine native order fill through outcomes.cex_spot instead
+    of assuming the native transport already returns a Result."""
+    market_kind = 'spot'
+    network_family = None
+
+    def normalize(self, native, side):
+        if self.spec.decimals is None or self.spec.quote_decimals is None:
+            raise AdapterError(ErrorKind.IDENTITY, 'asset decimals unknown')
+        return outcomes.cex_spot(native, self.spec, side)
