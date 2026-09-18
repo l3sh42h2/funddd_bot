@@ -39,7 +39,12 @@ class AdapterRegistry:
 def production_registry():
     from .native import EvmSpotAdapter, SolanaSpotAdapter, FuturesAdapter
     registry = AdapterRegistry()
+    # 'lighter' зарегистрирован (PATCHNOTES/lighter-futures-adapter-20260918.md) — регистрация сама по себе не
+    # разрешает live (см. docs/migration/ADAPTER_GUIDE.md): нужны профиль/лимиты и Bindings поверх реального
+    # trade/lighter_trade.LighterTrade, а его подписанные операции сами отказывают до решения владельца о
+    # подписи Lighter (SigningNotAvailable). Ни один профиль/фабрика в runtime.py на 'lighter' пока не ссылается.
     for name, cls in (('okx_evm', EvmSpotAdapter), ('sol_best', SolanaSpotAdapter),
-                      ('aster', FuturesAdapter), ('gate', FuturesAdapter), ('hyperliquid', FuturesAdapter)):
+                      ('aster', FuturesAdapter), ('gate', FuturesAdapter), ('hyperliquid', FuturesAdapter),
+                      ('lighter', FuturesAdapter)):
         registry.register(name, lambda spec, context, cls=cls: cls(spec, context.for_leg(spec)))
     return registry

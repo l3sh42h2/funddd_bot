@@ -163,3 +163,23 @@ auto_unwind_naked_after_s = ""   # владелец 12.09: голую ногу �
 # auto_sell_surplus_after_resolved_hedge = false
 # auto_correct_known_delta = false
 # <<< ПРЕДЛОЖЕНИЕ
+
+[perp.lighter]
+# Lighter (zkLighter, mainnet-инстанс) зарегистрирован как venue перпетюалов в trade/adapters/registry.py
+# (FuturesAdapter) — "lighter" уже входит в config.PERP_VENUES (список площадок скринера дашборда), поэтому эта
+# секция схемой уже понимается, ключи ниже — те же самые из общей схемы _PERP, что и у [perp.aster] выше.
+# Подпись L2-транзакций Lighter (Schnorr/ECgFp5/Poseidon2 — см. докстроку trade/lighter_trade.py) НЕ реализована:
+# ioc()/cancel_order()/setup() отказывают кодом SigningNotAvailable, пока владелец не решит про зависимость от
+# официального сигнера. Ни один профиль (profiles.*) пока не ссылается на perp_venue="lighter" — с какой
+# спот-ногой её связывать, тоже решает владелец (см. PATCHNOTES/lighter-futures-adapter-20260918.md). Эта секция
+# сама по себе никого не торгует: ПУСТО = ЗАПРЕЩЕНО, все поля ниже пусты, как и было до этой задачи.
+leverage = ""
+margin_type = ""
+max_slip_bps = ""
+touch_frac_max = ""
+maker_allowed = ""
+liq_alert_pct = ""
+# Опознание аккаунта (account_index/api_key_index/приватный ключ подписанта) в схеме владельца пока не заведено:
+# нужен реальный подписант и выбранная пара, прежде чем добавлять [wallets.<профиль>] по образцу [wallets.sol_hl]
+# (см. патчноут). Схема .env-ключа зарезервирована как LIGHTER_API_PRIVATE_KEY (trade/lighter_trade.py) —
+# загрузчик значения не реализован, значение никогда не коммитится (docs/COORDINATION.md §2).
