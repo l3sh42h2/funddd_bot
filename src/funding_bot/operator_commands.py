@@ -279,7 +279,17 @@ def parse(text: str) -> Command:
         return {"positions": Positions, "status": Status, "help": Help, "start": Start}[kind]()
     if kind == "entry":
         res = _entry(raw, args)
-        return (_profile_entry(raw, args, _raw_args(text, len(args))) or res) if isinstance(res, Unknown) else res
+        profile = _profile_entry(raw, args, _raw_args(text, len(args)))
+        if profile is not None:
+            return profile
+        # There is no legacy execution route for a Solana spot leg.  Leaving
+        # this seemingly valid old form as ``Entry`` sends it to the EVM desk,
+        # which then asks for the obsolete ``wallets.solana`` key.  Refuse
+        # before planning and require the dex that identifies the HL market.
+        if (isinstance(res, Entry) and res.spot == "okx" + SEP + "sol"
+                and res.perp == "hyperliquid"):
+            return Unknown(raw, "для Solana × Hyperliquid укажите dex: " + PROFILE_ENTRY_FMT)
+        return res
     if kind == "resize":
         if len(args) in (2, 3) and (t := parse_target(args[0])) and (usd := amount_of(args[1:])):
             return Resize(t, usd)

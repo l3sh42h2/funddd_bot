@@ -13,6 +13,9 @@ SNAP = json.loads((DATA / "legacy_snapshot.json").read_text(encoding="utf-8"))
 NEW = {"вход ANSEM jupiter·sol aster 200", "вход ANSEM jupiter·sol hyperliquid·para 200",
        "вход ANSEM okx·sol hl·para 200 usdc", "вход ANSEM okx·sol hyperliquid·para 200",
        "вход ANSEM sol-auto hyperliquid·para 200", "вход para:ANSEM sol-auto hyperliquid 200",
+       "вход ANSEM okx·sol hl 200", "вход ansem okx sol hyperliquid 200",
+       "вход ANSEM okx·sol hyperliquid 200", "вход $ansem okx·sol hl 3",
+       "вход AIW3 okx dex solana hl 450",
        "выход ANSEM 500 ansem", "выход ANSEM sol", "выход ANSEM sol 200", "позиции hyperliquid·para", "позиции sol"}
 
 
@@ -76,9 +79,14 @@ def test_profile_entry_refusals(text, needle):
     assert isinstance(got, Unknown) and needle in got.reason, got
 
 
-def test_old_forms_stay_old():
-    """okx·sol + перп без dex — прежняя команда Entry (как до связки), а не новая."""
-    assert parse.parse("вход ANSEM okx·sol hl 200") == Entry("ANSEM", "okx·sol", "hyperliquid", D(200))
+def test_ambiguous_sol_form_refuses_before_legacy_engine():
+    """Без dex у Solana × HL нельзя попасть в legacy EVM desk и запросить wallets.solana."""
+    for text in ("вход ANSEM okx·sol hl 200", "вход ansem okx sol hyperliquid 200",
+                 "вход ANSEM okx·sol hyperliquid 200", "вход $ansem okx·sol hl 3",
+                 "вход AIW3 okx dex solana hl 450"):
+        got = parse.parse(text)
+        assert isinstance(got, Unknown)
+        assert "укажите dex" in got.reason and "hyperliquid·<dex>" in got.reason
     assert parse.parse("выход ANSEM 200") == Exit("ANSEM", D(200))
     assert parse.parse("выход ANSEM") == Exit("ANSEM", None)
     assert parse.parse("вход ANSEM okx·sol bybit 200").reason.startswith("перп «bybit» не понят — площадки:")
