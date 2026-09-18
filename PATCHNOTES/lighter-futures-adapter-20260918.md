@@ -138,7 +138,8 @@
 
 ## Тесты (`tests/test_trade_lighter.py`, новый файл, фейковый HTTP-транспорт, никаких реальных вызовов)
 
-32 теста: instrument/filters по `orderBookDetails`, позиция (long/short знак, отсутствие символа = флэт, а не
+30 тестов (28 функций, 2 параметризованы на 3 значения — независимо пересчитано `pytest --collect-only`):
+instrument/filters по `orderBookDetails`, позиция (long/short знак, отсутствие символа = флэт, а не
 `None`), маржа, «аккаунт не найден», 429/405 (пауза и восстановление после неё), 5xx (ретраи, потом `LighterNetError`),
 документированный код ошибки (21507 → `insufficient_funds_or_margin`), `next_nonce`/`apikeys`, детерминированность
 `client_order_index`, точность `_scale` (и отказ не выровненного по шагу значения), валидация `ioc()` ДО подписи
@@ -167,11 +168,13 @@
 
 Результаты (venv `.venv-lighter/`, Python 3.12.4, macOS, `pip install -e ".[dev,trade,sol]"` — не коммитится,
 не часть репозитория):
-- `tests/test_trade_lighter.py`: **32 passed**.
+- `tests/test_trade_lighter.py`: **30 passed** (независимая проверка подтвердила то же число).
 - `tests/test_trade_lighter.py tests/test_migration_m3.py tests/test_m4_adapter_results.py tests/
   test_m4_execution_history_port.py tests/test_m4_native_adapter_journal.py tests/test_generic_adapter_matrix.py
-  tests/test_generic_leg_cash.py`: **210 passed**.
-- Полный `tests/`: **3038 passed, 3 skipped**, 1 **не связанная** ошибка — `tests/test_sol_c4_release.py::
+  tests/test_generic_leg_cash.py`: **210 passed** (независимо воспроизведено точно).
+- Полный `tests/`: у меня 3038 passed/3 skipped; независимая проверка на другом чистом venv получила 3037
+  passed/4 skipped (сумма та же, 3042 — разница в одном version-зависимом skip где-то ещё в наборе, не
+  относится к Lighter). В обоих случаях — 1 **не связанная** ошибка — `tests/test_sol_c4_release.py::
   test_lock_is_closed_and_matches_this_environment` (мой локальный `pip install` разрешил более новые transitive-
   версии `rlp`/`hexbytes`/`eth-rlp`/`eth-keys`, чем зафиксировано в `deploy/requirements.lock`; тест сам говорит,
   что боевая проверка идёт «в чистом venv `.next` (Python 3.11 Linux)» — другое окружение, которое эта задача не
@@ -219,3 +222,18 @@
 - Полный `git diff` этой ветки — 4 файла: новый `src/funding_bot/trade/lighter_trade.py`, новый `tests/
   test_trade_lighter.py`, точечная правка `src/funding_bot/trade/adapters/registry.py` (1 запись факторки),
   точечная правка `deploy/owner.toml.example` (1 новая секция). `.venv-lighter/` — локальный, не коммитится.
+
+## Дополнение — независимая проверка, 18.09.2026
+
+Независимая проверка подтвердила и усилила вывод про подпись: официальные аудиты zkSecurity (6 отчётов) все
+про ZK-цепочку (Plonky2/PLONK/BN254), ни один про клиентский signer; официальный TypeScript SDK (`lighter-ts`)
+тоже не подписывает сам — инжектирует внешний сигнер (WASM/native), то же архитектурное решение Lighter во
+всех трёх официальных SDK, не пробел конкретно Python. Найдено то, что я не проверил: у elliottech есть
+публичный **чистый Go**-пакет `poseidon_crypto` (не сторонний!) с offline-проверяемыми тест-векторами для
+самого примитива Schnorr/Poseidon2/ECgFp5 (`signature/schnorr/schnorr_test.go`). Это значит формулировка «нет
+вообще никакого способа проверить» была чуть сильнее, чем есть — примитив проверяем офлайн. Но денежный слой
+сериализации полей ордера перед хешем (`lighter-go/types/txtypes/`, 23 файла) не покрыт тестами вообще ни у
+кого — то есть решение не реализовывать подпись в этой задаче остаётся верным: даже с проверенным примитивом,
+сериализация осталась бы без публичного эталона и требовала бы либо живого эксперимента с реальной подписанной
+tx (риск и решение владельца), либо принятия бинарной зависимости `lighter-python`. Если решите делать нативный
+Python-сигнер позже — `elliottech/poseidon_crypto` — правильная точка старта для слоя примитивов.
