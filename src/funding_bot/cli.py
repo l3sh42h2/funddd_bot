@@ -154,7 +154,7 @@ def main(argv=None):
         errs = {pid: v["error"] for pid, v in live.items() if v.get("error")}
         if errs:
             print(f"manual-poll: {len(errs)} из {len(live)} с ошибкой: {errs}", file=sys.stderr)
-        return 0
+        return 1 if errs else 0    # как audit (cli.py) — крон видит сбой по коду возврата, не только по логу
     return 0
 
 

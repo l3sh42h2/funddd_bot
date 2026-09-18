@@ -781,8 +781,11 @@ def summary_text(snap: dict) -> str:
 
 
 def deals_fragment(snap: dict) -> str:
+    # Ручные позиции — не из ядра (см. manual_positions.py): недоступность ядра/протухший снимок (snap["err"])
+    # не имеет права спрятать их — владелец просил именно независимый от ядра взгляд на них.
+    manual_html = "".join(deal_card(v) for v in snap["deals"] if v.get("manual"))
     if snap.get("err"):
-        return f'<div class="empty r">{html.escape(snap["err"])}</div>'
+        return manual_html + f'<div class="empty r">{html.escape(snap["err"])}</div>'
     if not snap["deals"]:
         return '<div class="empty">сделок пока нет</div>'
     return "".join(deal_card(v) for v in snap["deals"])

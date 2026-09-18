@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal as D
 import pytest
-from funding_bot import manual_positions as mp
+from funding_bot import cli, manual_positions as mp
 
 TOML = """
 [[position]]
@@ -48,8 +48,11 @@ class FakeSession:
 
 
 ACCOUNT_OK = {"accounts": [{"positions": [
-    {"symbol": "ANSEM", "position": "-26040.994142", "mark_price": "0.281", "total_funding_paid_out": "5.1354"},
-    {"symbol": "OTHER", "position": "10"},
+    # Реальный API Lighter: "position" — величина БЕЗ ЗНАКА, сторона — отдельное поле "sign" (-1 шорт, 1 лонг).
+    # Проверено 18.09 независимым ревью против живого API — сторона по знаку "position" была бы багом.
+    {"symbol": "ANSEM", "sign": -1, "position": "26040.994142", "avg_entry_price": "0.281",
+     "total_funding_paid_out": "5.1354"},
+    {"symbol": "OTHER", "sign": 1, "position": "10"},
 ]}]}
 
 
@@ -89,6 +92,38 @@ def test_poll_lighter_account_found_short_position():
     assert D(out["mark"]) == D("0.281")
     assert D(out["funding_total"]) == D("5.1354")
     assert s.calls[0][1] == {"by": "l1_address", "value": "0xE4Eb..."}
+
+
+def test_poll_lighter_account_long_side_from_positive_sign():
+    s = FakeSession(body=ACCOUNT_OK)
+    out = mp.poll_lighter_account("0xE4Eb...", "OTHER", session=s)
+    assert out["side"] == "long" and D(out["size"]) == D("10")
+
+
+def test_poll_lighter_account_side_ignores_position_string_sign():
+    """Регрессия P1 (независимое ревью 18.09): даже если "position" пришла бы со знаком, сторону решает только
+    "sign" — величина всегда берётся по модулю."""
+    body = {"accounts": [{"positions": [{"symbol": "X", "sign": 1, "position": "-5"}]}]}
+    out = mp.poll_lighter_account("0xE4Eb...", "X", session=FakeSession(body=body))
+    assert out["side"] == "long" and D(out["size"]) == D("5")
+
+
+def test_poll_lighter_account_missing_sign_field_is_unknown_side():
+    body = {"accounts": [{"positions": [{"symbol": "X", "position": "5"}]}]}
+    out = mp.poll_lighter_account("0xE4Eb...", "X", session=FakeSession(body=body))
+    assert out["side"] is None
+
+
+def test_poll_lighter_account_non_dict_account_entry_does_not_crash():
+    s = FakeSession(body={"accounts": ["not-a-dict"]})
+    out = mp.poll_lighter_account("0xE4Eb...", "ANSEM", session=s)
+    assert out["error"] == "аккаунт не найден"
+
+
+def test_poll_lighter_account_null_position_entry_does_not_crash():
+    body = {"accounts": [{"positions": [None, {"symbol": "ANSEM", "sign": -1, "position": "1"}]}]}
+    out = mp.poll_lighter_account("0xE4Eb...", "ANSEM", session=FakeSession(body=body))
+    assert out["side"] == "short"
 
 
 def test_poll_lighter_account_missing_symbol():
@@ -196,3 +231,15 @@ def test_deal_views_surfaces_per_position_error(tmp_path):
                                 "positions": {"ansem-1": {"error": "рынок не найден"}}}))
     [v] = mp.deal_views(now=1789750000.0, config_path=cfg, live_path=live)
     assert v["error"] == "рынок не найден"
+
+
+# --- CLI (manual-poll): код возврата — как у audit, крон должен видеть сбой ------------------------------------
+def test_cli_manual_poll_exit_0_when_no_errors(monkeypatch):
+    monkeypatch.setattr(mp, "poll_once", lambda: {"a": {"side": "long"}})
+    assert cli.main(["manual-poll"]) == 0
+
+
+def test_cli_manual_poll_exit_1_when_any_position_errors(monkeypatch, capsys):
+    monkeypatch.setattr(mp, "poll_once", lambda: {"a": {"error": "boom"}, "b": {"side": "short"}})
+    assert cli.main(["manual-poll"]) == 1
+    assert "boom" in capsys.readouterr().err

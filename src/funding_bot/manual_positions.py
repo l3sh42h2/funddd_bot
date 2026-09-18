@@ -83,7 +83,12 @@ def load_config(path=None) -> list[dict]:
 
 def poll_lighter_account(l1_address: str, symbol: str, *, session=None, timeout: float = POLL_TIMEOUT_S) -> dict:
     """GET /api/v1/account?by=l1_address — публично, без ключей. total_funding_paid_out — счётчик самого Lighter
-    (не история и не наш расчёт), это и есть «фандос» из просьбы владельца."""
+    (не история и не наш расчёт), это и есть «фандос» из просьбы владельца.
+
+    Независимая проверка 18.09 (sonnet-max) поймала P1: `position` в ответе Lighter — БЕЗ ЗНАКА (величина),
+    сторона — отдельное поле `sign` (-1 шорт, 1 лонг; проверено против живого API и схемы официального SDK
+    lighter-python). Первая версия угадывала сторону по знаку `position`/`size`, которого там нет, — на реальном
+    аккаунте владельца шорт показался бы «лонг». Исправлено: сторона — только из `sign`."""
     s = session or requests.Session()
     try:
         r = s.get(LIGHTER_ACCOUNT_URL, params={"by": "l1_address", "value": l1_address}, timeout=timeout,
@@ -93,15 +98,17 @@ def poll_lighter_account(l1_address: str, symbol: str, *, session=None, timeout:
     except (requests.RequestException, ValueError) as e:
         return {"error": f"{type(e).__name__}: {e}"[:200]}
     accounts = body.get("accounts") if isinstance(body, dict) else None
-    if not accounts:
+    if not accounts or not isinstance(accounts[0], dict):
         return {"error": "аккаунт не найден"}
     positions = accounts[0].get("positions") or []
-    pos = next((p for p in positions if str(p.get("symbol") or p.get("market_symbol") or "") == symbol), None)
+    pos = next((p for p in positions if isinstance(p, dict)
+               and str(p.get("symbol") or p.get("market_symbol") or "") == symbol), None)
     if pos is None:
         return {"error": f"рынок {symbol} не найден в позициях аккаунта"}
     size = _dv(pos.get("position") if pos.get("position") is not None else pos.get("size"))
-    side = None if size is None or size == 0 else ("short" if size < 0 else "long")
-    mark = _dv(pos.get("mark_price") or pos.get("avg_entry_price"))
+    sign = pos.get("sign")
+    side = None if size is None or size == 0 or sign not in (-1, 1) else ("short" if sign < 0 else "long")
+    mark = _dv(pos.get("avg_entry_price"))
     funding = _dv(pos.get("total_funding_paid_out"))
     # JSON/atomic_json не сериализует Decimal — числа наружу только строками (как TEXT из БД у остального кабинета;
     # deal_views() читает их обратно через _dv()).

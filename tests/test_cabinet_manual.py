@@ -11,9 +11,9 @@ HASH = cabinet.make_hash(PW)
 T0 = 1_789_750_000.0
 
 
-def make_cab(tmp_path, manual_loader, deals=(), env=None):
+def make_cab(tmp_path, manual_loader, deals=(), env=None, err=None):
     env = {"CABINET_LOGIN": LOGIN, "CABINET_PASS_HASH": HASH} if env is None else env
-    snap = {"now": T0, "deals": list(deals), "drafts": 0, "err": None}
+    snap = {"now": T0, "deals": list(deals), "drafts": 0, "err": err}
     return cabinet.Cabinet(environ=env, clock=lambda: T0, snapshot_loader=lambda: snap,
                            manual_positions_loader=manual_loader)
 
@@ -124,3 +124,13 @@ def test_no_manual_positions_means_no_extra_card(tmp_path):
     cab = make_cab(tmp_path, lambda now: [])
     page = page_of(cab)
     assert "Ручной вход" not in page and "сделок пока нет" in page
+
+
+def test_manual_card_survives_core_unavailable_error(tmp_path):
+    """Регрессия P2 (независимое ревью 18.09): ручная позиция — не из ядра, недоступность ядра/протухший снимок
+    (core_not_ready, projection_stale — рутинно при рестарте, см. docs/COORDINATION.md §8) не имеет права её
+    спрятать вместе с сообщением об ошибке ядра."""
+    cab = make_cab(tmp_path, lambda now: [manual_view()], err="Торговое ядро недоступно или данные устарели")
+    page = page_of(cab)
+    assert "✋ Ручной вход" in page
+    assert "Торговое ядро недоступно или данные устарели" in page
