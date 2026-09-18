@@ -45,6 +45,9 @@ def main(argv=None):
     sh = sub.add_parser("sol-hl", help="связка SOL×HL, только чтение: doctor | quote-compare | hl-preflight | record")
     sh.add_argument("sol_cmd", choices=["doctor", "quote-compare", "hl-preflight", "record"])
     sh.add_argument("sol_args", nargs=argparse.REMAINDER, help="ключи команды: funding_bot sol-hl doctor --help")
+    sub.add_parser("manual-poll", help="разовый опрос ручных позиций владельца (runtime/manual_positions.toml) → "
+                                       "runtime/manual_positions_live.json; крон/таймер раз в минуту, только чтение "
+                                       "публичных API, trade.db не трогает")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -145,6 +148,13 @@ def main(argv=None):
     elif a.cmd == "sol-hl":
         from . import sol_doctor
         return sol_doctor.main([a.sol_cmd, *a.sol_args])
+    elif a.cmd == "manual-poll":
+        from . import manual_positions
+        live = manual_positions.poll_once()
+        errs = {pid: v["error"] for pid, v in live.items() if v.get("error")}
+        if errs:
+            print(f"manual-poll: {len(errs)} из {len(live)} с ошибкой: {errs}", file=sys.stderr)
+        return 0
     return 0
 
 

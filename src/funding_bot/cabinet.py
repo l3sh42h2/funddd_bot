@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from . import config
+from . import config, manual_positions
 from .cabinet_text import STATE_VIEW, REASON_TEXT, reason_text, event_text
 from .trade.report import dval, fmt_num
 
@@ -483,7 +483,7 @@ CAB_CSS = """
 .sum{color:var(--mut);font-size:12px;margin:2px 0 12px}
 .deal{background:var(--card);border:1px solid var(--line);border-left-width:4px;border-radius:8px;padding:12px 14px;margin:0 0 10px}
 .st-open{border-left-color:var(--good)}.st-run{border-left-color:var(--info)}.st-pause{border-left-color:var(--warn)}
-.st-halt{border-left-color:var(--bad)}.st-done{border-left-color:var(--line)}
+.st-halt{border-left-color:var(--bad)}.st-done{border-left-color:var(--line)}.st-manual{border-left-color:var(--acc)}
 .deal .hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
 .deal .stt{font-size:18px;font-weight:700}
 .deal .cn{font-size:15px;font-weight:600}
@@ -682,7 +682,47 @@ def history_block(v: dict) -> str:
             f'<div class="tot">всего: <b class="mono {sgn(tot)}">{e(_pnl_usd(tot, unit))}</b></div></details>')
 
 
+def _short(s: str | None, head: int = 4, tail: int = 4) -> str:
+    s = str(s or "")
+    return s if len(s) <= head + tail + 1 else f"{s[:head]}…{s[-tail:]}"
+
+
+def manual_deal_card(v: dict) -> str:
+    """Позиция, открытая владельцем вручную вне бота (не из trade.db — см. manual_positions.py). PnL никогда не
+    посчитан (cost basis спота не отслеживается), фандинг — счётчик самого Lighter, не наш расчёт."""
+    e = lambda x: html.escape("" if x is None else str(x))            # noqa: E731
+    perp, spot, fund = v["perp"], v["spot"], v["funding"]
+    out = [f'<article class="deal st-manual"><div class="hd"><span class="stt">✋ Ручной вход</span>'
+           f'<span class="cn">{e(v["coin"])}</span><span class="m mono">{e(v["id"])}</span></div>']
+    side = {"short": "шорт", "long": "лонг"}.get(perp.get("side"), "сторона неизвестна")
+    size = "—" if perp.get("size") is None else fmt_num(dval(perp["size"]), 4)
+    out.append(f'<div class="pair">перп {e(perp.get("venue") or "—")} <span class="dn">▼</span> '
+               f'<span class="mono" title="{e(perp.get("address"))}">{e(_short(perp.get("address")))}</span> · '
+               f'{side} {size} <span class="mono">{e(perp.get("symbol"))}</span>'
+               f'{" · $" + e(fmt_num(dval(perp["mark"]), 4)) if perp.get("mark") is not None else ""}</div>')
+    out.append(f'<div class="pair">спот {e(spot.get("venue") or "—")} <span class="up">▲</span> '
+               f'кошелёк <span class="mono" title="{e(spot.get("wallet"))}">{e(_short(spot.get("wallet")))}</span> · '
+               f'mint <span class="mono" title="{e(spot.get("mint"))}">{e(_short(spot.get("mint")))}</span></div>')
+    out.append('<div class="pnl"><div class="pl m">PnL: нет подтверждённой оценки (ручной вход — '
+               'cost basis спота не отслеживается).</div></div>')
+    ft = fund.get("total")
+    fline = (_pnl_usd(ft, fund.get("ccy") or "USDC") if ft is not None else "—")
+    kv = [_kv("открыта", _t(v.get("opened"))),
+          _kv("фандинг с входа (счётчик Lighter)", f'<b class="mono {"g" if ft and ft > 0 else "r" if ft and ft < 0 else ""}">{e(fline)}</b>')]
+    if v.get("error"):
+        kv.append(_kv("данные Lighter", f'<span class="unk">{e(v["error"])}</span>'))
+    elif v.get("stale"):
+        kv.append(_kv("данные Lighter", _stale(v.get("live_ts"))))
+    out.append(f'<div class="kv">{"".join(kv)}</div>')
+    if v.get("note"):
+        out.append(f'<div class="ev">{e(v["note"])}</div>')
+    out.append("</article>")
+    return "".join(out)
+
+
 def deal_card(v: dict) -> str:
+    if v.get("manual"):
+        return manual_deal_card(v)
     e = lambda x: html.escape("" if x is None else str(x))
     emo, label, cls = STATE_VIEW.get(v["state"], ("❔", str(v["state"]), "st-done"))
     sim = ' <span class="chip c-info">симуляция</span>' if v["sim"] else ""
@@ -726,12 +766,15 @@ def deal_card(v: dict) -> str:
 
 
 def summary_text(snap: dict) -> str:
-    ds = snap["deals"]
+    ds = [d for d in snap["deals"] if not d.get("manual")]
+    manual_n = sum(1 for d in snap["deals"] if d.get("manual"))
     c = Counter(d["state"] for d in ds)
     work = sum(c[s] for s in ("ENTERING", "EXITING", "PAUSED", "HALTED_MISMATCH"))
     s = f"сделок {len(ds)} · открыто {c['OPEN']} · в работе и на паузе {work} · закрыто {c['CLOSED']}"
     if c["ABORTED"]:
         s += f" · отменено {c['ABORTED']}"
+    if manual_n:
+        s += f" · ручных {manual_n}"
     if snap.get("drafts"):
         s += f" · планов без «да»: {snap['drafts']} (не показаны)"
     return s
@@ -756,7 +799,7 @@ def deals_page(snap: dict) -> Resp:
 # --- кабинет ----------------------------------------------------------------------------------------------
 class Cabinet:
     def __init__(self, environ=None, db_path=None, *, clock=time.time, sleep=time.sleep,
-                 fail_delay_s: float = FAIL_DELAY_S, snapshot_loader=None):
+                 fail_delay_s: float = FAIL_DELAY_S, snapshot_loader=None, manual_positions_loader=None):
         env = os.environ if environ is None else environ
         login, raw = (env.get(ENV_LOGIN) or "").strip(), (env.get(ENV_HASH) or "").strip()
         self._hash = parse_hash(raw) if raw else None
@@ -769,6 +812,7 @@ class Cabinet:
             self.why_off = None
         self.db_path = Path(db_path) if db_path else None
         self.snapshot_loader = snapshot_loader
+        self.manual_positions_loader = manual_positions_loader or manual_positions.deal_views
         if self.snapshot_loader is None and db_path is not None:
             # Explicit legacy test backend only. Production instance() never passes a db_path.
             from .core.readmodel import legacy_snapshot
@@ -886,10 +930,20 @@ class Cabinet:
 
     # --- данные ---
     def snapshot(self) -> dict:
+        now = self.clock()
         if self.snapshot_loader is not None:
-            return self.snapshot_loader()
-        from .interface.projections import fetch_positions
-        return fetch_positions(now=self.clock())
+            snap = self.snapshot_loader()
+        else:
+            from .interface.projections import fetch_positions
+            snap = fetch_positions(now=now)
+        try:
+            extra = self.manual_positions_loader(now=now)
+        except Exception:                      # noqa — ручной вход не имеет права уронить страницу кабинета
+            log.exception("кабинет: ручные позиции не прочитаны")
+            extra = []
+        if extra:
+            snap = {**snap, "deals": [*extra, *snap.get("deals", [])]}
+        return snap
 
 
 _inst: Cabinet | None = None
