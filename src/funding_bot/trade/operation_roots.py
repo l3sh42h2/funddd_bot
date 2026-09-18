@@ -383,6 +383,23 @@ def _approve_generic(con, intent: Mapping, op: Mapping, spec: Mapping) -> str:
             raise store.StoreError("generic proposed bounds do not match intent")
         older = store.active_operation(con, op["deal_id"])
         if older is not None and older["id"] != op["id"]:
+            if older["side"] == "entry" \
+                    and older["reserved_raw"] == "0" and older["target_raw"] == older["confirmed_raw"]:
+                stop = store.get_native_stop(con, intent["deal_id"])
+                if stop is not None and stop["state"] == "TRIGGERED":
+                    if older["state"] == OpState.RUNNING:
+                        store.set_operation_state(con, older["id"], OpState.OPEN, expect=OpState.RUNNING)
+                    elif older["state"] == OpState.PAUSED_UNKNOWN:
+                        # The only unknown was the conditional acknowledgement;
+                        # its full fill is now independently proven.
+                        store.set_operation_state(con, older["id"], OpState.PAUSED_RISK,
+                                                  expect=OpState.PAUSED_UNKNOWN, reason="native SL fill proven")
+                        store.set_operation_state(con, older["id"], OpState.ABANDONED,
+                                                  expect=OpState.PAUSED_RISK, reason="superseded by native SL unwind")
+                    older = None
+            if older is None:
+                store.set_operation_state(con, op["id"], OpState.APPROVED, expect=OpState.PROPOSED)
+                return op["id"]
             if older["state"] not in _RESUMABLE or older["reserved_raw"] != "0":
                 raise store.StoreError(f"operation {older['id']}: unresolved active root blocks approval")
             store.set_operation_state(con, older["id"], OpState.ABANDONED,
@@ -442,7 +459,9 @@ def propose(con, *, deal: Mapping, kind: str, spec: Mapping, plan: Any, profile_
     target_kind, asset, decimals, planned = _target(deal, kind, source, plan)
     with store.tx(con):
         from .adapters.obligations import require_resolved
-        require_resolved(con, deal)
+        allow_native_stop = kind == "exit" and source.get("all") is True and source.get("perp_only") is not True
+        require_resolved(con, deal, allow_triggered_native_stop=source.get("stop_unwind") is True,
+                         allow_native_stop=allow_native_stop)
         if operation_id is None:
             op_id = store.create_operation(
                 con, deal_id=deal["id"], profile_id=profile_id, inst_hash=inst_hash,
@@ -477,7 +496,10 @@ def approve_linked(con, intent: Mapping) -> str | None:
         if spec.get(_GENERIC_MARKER) is True:
             return _approve_generic(con, intent, op, spec)
         from .adapters.obligations import require_resolved
-        require_resolved(con, store.get_deal(con, intent["deal_id"]))
+        allow_native_stop = intent["kind"] == "exit" and spec.get("all") is True and spec.get("perp_only") is not True
+        require_resolved(con, store.get_deal(con, intent["deal_id"]),
+                         allow_triggered_native_stop=spec.get("stop_unwind") is True,
+                         allow_native_stop=allow_native_stop)
         planned = _planned_raw(intent["kind"], spec, _plan(intent))
         remaining = store.operation_remaining(op)
         if planned != remaining:
@@ -495,10 +517,30 @@ def approve_linked(con, intent: Mapping) -> str | None:
                 raise store.StoreError(f"operation {op['id']}: proposed bounds do not match intent")
             older = store.active_operation(con, op["deal_id"])
             if older is not None and older["id"] != op["id"]:
-                if older["state"] not in _RESUMABLE or older["reserved_raw"] != "0":
-                    raise store.StoreError(f"operation {older['id']}: unresolved active root blocks approval")
-                store.set_operation_state(con, older["id"], OpState.ABANDONED,
-                                          expect=older["state"], reason=f"superseded by approved {op['id']}")
+                # A stop can fill in the narrow interval after a fully hedged
+                # entry has consumed its reserve but before its root was marked
+                # OPEN.  The proven trigger is the only case allowed to settle
+                # that predecessor here; UNKNOWN/partial roots still fence the
+                # automatic spot unwind.
+                full_exit_with_stop = intent["kind"] == "exit" and spec.get("all") is True \
+                    and spec.get("perp_only") is not True
+                if (spec.get("stop_unwind") is True or full_exit_with_stop) and older["side"] == "entry" \
+                        and older["reserved_raw"] == "0" and older["target_raw"] == older["confirmed_raw"]:
+                    stop = store.get_native_stop(con, intent["deal_id"])
+                    if stop is not None and stop["state"] in ("OPEN", "TRIGGERED"):
+                        if older["state"] == OpState.RUNNING:
+                            store.set_operation_state(con, older["id"], OpState.OPEN, expect=OpState.RUNNING)
+                        elif older["state"] == OpState.PAUSED_UNKNOWN:
+                            store.set_operation_state(con, older["id"], OpState.PAUSED_RISK,
+                                                      expect=OpState.PAUSED_UNKNOWN, reason="native SL fill proven")
+                            store.set_operation_state(con, older["id"], OpState.ABANDONED,
+                                                      expect=OpState.PAUSED_RISK, reason="superseded by native SL unwind")
+                        older = None
+                if older is not None:
+                    if older["state"] not in _RESUMABLE or older["reserved_raw"] != "0":
+                        raise store.StoreError(f"operation {older['id']}: unresolved active root blocks approval")
+                    store.set_operation_state(con, older["id"], OpState.ABANDONED,
+                                              expect=older["state"], reason=f"superseded by approved {op['id']}")
             store.set_operation_state(con, op["id"], OpState.APPROVED, expect=OpState.PROPOSED)
         elif op["state"] in _RESUMABLE:
             if op["reserved_raw"] != "0":

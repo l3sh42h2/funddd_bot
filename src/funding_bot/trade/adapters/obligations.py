@@ -16,7 +16,7 @@ def _instrument(deal):
     return inst if isinstance(inst, dict) else {}
 
 
-def unresolved(con, deal):
+def unresolved(con, deal, *, allow_triggered_native_stop: bool = False, allow_native_stop: bool = False):
     did = deal['id']
     reasons = []
     if con.execute("SELECT 1 FROM clips c JOIN intents i ON i.id=c.intent_id WHERE i.deal_id=? "
@@ -26,6 +26,13 @@ def unresolved(con, deal):
                    "JOIN intents i ON i.id=c.intent_id WHERE i.deal_id=? "
                    "AND p.state IN ('INTENT','SENT','UNKNOWN') LIMIT 1", (did,)).fetchone():
         reasons.append('perp_unresolved')
+    # A native conditional is a durable external obligation although it has no clip.
+    # It must fence every new operation until a terminal outcome is recorded.
+    if not allow_native_stop:
+        native_states = "('INTENT','SENT','OPEN','UNKNOWN')" if allow_triggered_native_stop else \
+                        "('INTENT','SENT','OPEN','UNKNOWN','TRIGGERED')"
+        if con.execute("SELECT 1 FROM native_stops WHERE deal_id=? AND state IN " + native_states + " LIMIT 1", (did,)).fetchone():
+            reasons.append('native_stop_unresolved')
     if con.execute("SELECT 1 FROM operations WHERE deal_id=? AND reserved_raw<>'0' LIMIT 1", (did,)).fetchone():
         reasons.append('reserved_input')
     # A native approval can exist before there is a clip. Match its frozen wallet
@@ -75,7 +82,8 @@ def unresolved(con, deal):
     return tuple(dict.fromkeys(reasons))
 
 
-def require_resolved(con, deal):
-    reasons = unresolved(con, deal)
+def require_resolved(con, deal, *, allow_triggered_native_stop: bool = False, allow_native_stop: bool = False):
+    reasons = unresolved(con, deal, allow_triggered_native_stop=allow_triggered_native_stop,
+                         allow_native_stop=allow_native_stop)
     if reasons:
         raise store.StoreError('unresolved execution blocks new operation: ' + ', '.join(reasons))

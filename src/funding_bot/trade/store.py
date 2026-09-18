@@ -420,7 +420,7 @@ PERP_ORDER_NEXT: dict[str, frozenset] = {
                                       PerpOrderState.OPEN})
                            | _PERP_RESULT,
     PerpOrderState.SENT: frozenset({PerpOrderState.UNKNOWN, PerpOrderState.OPEN}) | _PERP_RESULT,
-    PerpOrderState.UNKNOWN: frozenset({PerpOrderState.NOT_PLACED}) | _PERP_RESULT,
+    PerpOrderState.UNKNOWN: frozenset({PerpOrderState.NOT_PLACED, PerpOrderState.OPEN}) | _PERP_RESULT,
     PerpOrderState.OPEN: frozenset({PerpOrderState.UNKNOWN}) | _PERP_RESULT,
 }
 
@@ -1168,6 +1168,61 @@ def set_native_stop_state(con, deal_id: str, state: str, *, order_id: int | None
         fields.append("triggered=COALESCE(triggered, ?)"); vals.append(ts)
     vals.extend([deal_id])
     return con.execute("UPDATE native_stops SET " + ", ".join(fields) + " WHERE deal_id=?", vals).rowcount == 1
+
+
+def resolve_native_stop(con, deal_id: str, native_state: str, perp_state: str, *, order_id: int | None = None,
+                        filled_qty: Decimal | None = None, sign_nonce: int | None = None, err: str | None = None,
+                        now: float | None = None) -> bool:
+    """Commit one observed native-stop outcome to both durable records.
+
+    A conditional order has no clip, so its ``native_stops`` row and the linked
+    ``perp_orders`` row are one lifecycle.  Updating only one of them lets a
+    later gate see a contradictory answer and can permit a new risk operation.
+    This function is the only reader-resolution path; it validates both state
+    machines and commits both rows in the same SQLite transaction.
+    """
+    if native_state not in _STOP_STATES:
+        raise ValueError(f"native stop state {native_state!r}")
+    ts = time.time() if now is None else now
+    with tx(con):
+        stop = con.execute("SELECT * FROM native_stops WHERE deal_id=?", (deal_id,)).fetchone()
+        if stop is None:
+            raise LookupError(f"native stop: нет сделки {deal_id}")
+        order = con.execute("SELECT state FROM perp_orders WHERE client_id=?", (stop["client_id"],)).fetchone()
+        if order is None:
+            raise LookupError("native stop: нет связанной perp_orders записи")
+        old = str(order[0])
+        if perp_state != old and perp_state not in PERP_ORDER_NEXT.get(old, frozenset()):
+            raise BadTransition(f"perp_orders {stop['client_id']}: {old} → {perp_state} недопустимо")
+        sets = ["state=?"]
+        vals: list[Any] = [str(perp_state)]
+        if order_id is not None:
+            sets.append("order_id=?"); vals.append(int(order_id))
+        if filled_qty is not None:
+            sets.append("executed_qty=?"); vals.append(amt(filled_qty))
+        if sign_nonce is not None:
+            sets.append("sign_nonce=?"); vals.append(int(sign_nonce))
+        if err is not None:
+            sets.append("err=?"); vals.append(redact_secrets(err))
+        if str(perp_state) != str(PerpOrderState.UNKNOWN):
+            sets.append("resolved_ts=?"); vals.append(ts)
+        vals.extend([stop["client_id"], old])
+        if con.execute("UPDATE perp_orders SET " + ", ".join(sets) + " WHERE client_id=? AND state=?", vals).rowcount != 1:
+            return False
+        nsets = ["state=?", "updated=?"]
+        nvals: list[Any] = [native_state, ts]
+        if order_id is not None:
+            nsets.append("order_id=?"); nvals.append(int(order_id))
+        if filled_qty is not None:
+            nsets.append("filled_qty=?"); nvals.append(amt(filled_qty))
+        if err is not None:
+            nsets.append("err=?"); nvals.append(redact_secrets(err))
+        if native_state == "TRIGGERED":
+            nsets.append("triggered=COALESCE(triggered, ?)"); nvals.append(ts)
+        nvals.append(deal_id)
+        if con.execute("UPDATE native_stops SET " + ", ".join(nsets) + " WHERE deal_id=?", nvals).rowcount != 1:
+            raise StoreError("native stop disappeared during resolution")
+    return True
 
 
 def get_perp_order(con, client_id: str) -> dict | None:

@@ -34,6 +34,28 @@ def release_manifest(release_id):
             'schema_version': 2, 'min_reader': 2, 'compatible_readers': [2]}
 
 
+def test_native_stop_reader_floor_matches_current_deploy_compatibility(tmp_path):
+    """A newly armed stop must not make a healthy current release fail itself."""
+    from decimal import Decimal
+    from funding_bot.trade import store
+    con = store.connect(tmp_path / 'trade.db')
+    did = store.create_deal(con, coin='AIW3', chain='bsc', token='0x' + 'a1' * 20, token_dec=18,
+                            perp_venue='aster', symbol='AIW3USDT', leg_usd=Decimal(10), owner_json='{}', sim=True)
+    cid = store.client_order_id(did, 'stop', 0, 1, 1)
+    store.perp_order_intent(con, clip_id=None, client_id=cid, venue='aster', symbol='AIW3USDT', side='BUY',
+                            reduce_only=True, tif='TAKE_PROFIT_MARKET', price=Decimal('0.03'), qty=Decimal(100))
+    store.create_native_stop(con, deal_id=did, client_id=cid, venue='aster', symbol='AIW3USDT',
+                             trigger_price=Decimal('0.03'), working_type='MARK_PRICE', qty=Decimal(100))
+    manifest = json.loads((Path(__file__).resolve().parents[1] / 'deploy/migration/compatibility.json').read_text())
+    db = job.database_info(tmp_path / 'trade.db')
+    assert (manifest['schema_version'], manifest['compatible_readers']) == (6, [1, 2, 3, 4, 5, 6])
+    health = dict(ready=True, release_id='r', source_sha256='s', artifact_sha256='a', ipc_version=1,
+                  schema_version=db['schema_version'], min_reader=db['min_reader'], drain=True,
+                  drain_epoch='e', recovery_complete=True, execution_lock_held=True)
+    checked = dict(manifest, release_id='r', source_sha256='s', artifact_sha256='a')
+    assert job.health_matches(health, checked, database=db) == health
+
+
 def test_drain_waits_for_fresh_safe_epoch_without_killing_executor():
     class Client:
         def __init__(self): self.values = [safe_state(safe=False), safe_state()]

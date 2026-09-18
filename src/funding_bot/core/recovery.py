@@ -29,6 +29,8 @@ def check(con, legs_fn, *, resolve=True):
                 blockers.append("position_unverified")
         else:
             legs = reconcile._evm_legs(legs_fn, deal)
+            if resolve and legs is not None:
+                blockers.extend(reconcile.resolve_native_stops(con, deal, legs))
             result = reconcile.check_deal(con, deal, legs, resolve=resolve)
         if result.matched is not True:
             blockers.append('position_unverified')

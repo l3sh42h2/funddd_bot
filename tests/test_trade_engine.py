@@ -441,6 +441,14 @@ class LivePerp(JournalBoundIoc):
     def query_conditional(self, symbol, client_id):
         return self.stops.get(client_id) or PerpFill(client_id, None, "NOT_FOUND", D(0), D(0), D(0), 0, -2013)
 
+    def cancel_conditional(self, symbol, client_id):
+        old = self.stops.get(client_id)
+        if old is None:
+            return PerpFill(client_id, None, "NOT_FOUND", D(0), D(0), D(0), 0, -2013)
+        f = PerpFill(client_id, old.order_id, "EXPIRED", D(0), D(0), D(0), 0)
+        self.stops[client_id] = f
+        return f
+
     def trigger_stop(self, client_id, qty):
         self.seq += 1
         self.pos += qty
@@ -1413,3 +1421,60 @@ def test_native_stop_partial_fill_never_autosells_spot(tmp_path):
     e.engine._check_stops()
     assert len(e.spot.swaps) == before and e.engine.q.empty()
     assert store.get_deal(e.con, p.deal_id)['state'] == DealState.PAUSED
+
+
+def test_resize_refuses_armed_native_stop(tmp_path):
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    e.path.write_text(e.path.read_text().replace('[exec]', '[resize]\nenabled = true\nmax_increase_usd_per_leg = 200\nmax_total_usd_per_leg = 400\n[exec]'))
+    with pytest.raises(eng.Refused, match='активным.*SL'):
+        e.desk.propose_resize(p.deal_id, D(100), OWNER)
+
+
+def test_full_exit_cancels_native_stop_before_selling_spot(tmp_path):
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    stop = store.get_native_stop(e.con, p.deal_id)
+    out = e.desk.propose_exit(p.deal_id, None, False, OWNER)
+    run_approved(e, out)
+    assert store.get_deal(e.con, p.deal_id)['state'] == DealState.CLOSED
+    assert store.get_native_stop(e.con, p.deal_id)['state'] == 'DONE'
+    assert store.get_perp_order(e.con, stop['client_id'])['state'] == 'EXPIRED'
+
+
+def test_stop_unwind_refuses_spot_sale_if_live_short_reappears(tmp_path):
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\ncheck_interval_s = 60\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    stop = store.get_native_stop(e.con, p.deal_id)
+    e.perp.trigger_stop(stop['client_id'], D(str(stop['qty'])))
+    e.engine._check_stops()
+    iid = e.engine.q.get_nowait()
+    # A late/manual short appears after the watcher proof but before the swap.
+    e.perp.pos = D(-1)
+    before = len(e.spot.swaps)
+    e.engine.execute(iid)
+    assert len(e.spot.swaps) == before
+    assert store.get_deal(e.con, p.deal_id)['state'] == DealState.PAUSED
+
+
+def test_core_recovery_queries_armed_native_stop_without_starting_spot_unwind(tmp_path):
+    from funding_bot.core import recovery
+    e = live_env(tmp_path)
+    e.path.write_text(e.path.read_text() + '\n[stop_loss]\nenabled = true\nworking_type = "MARK_PRICE"\n')
+    p = e.desk.propose_entry("AIW3", "okx·bsc", "aster", D(100), chat=OWNER, stop_price=D("0.03"))
+    run_approved(e, p)
+    stop = store.get_native_stop(e.con, p.deal_id)
+    # Simulate an ACK-loss state that only recovery can repair to OPEN.
+    store.resolve_native_stop(e.con, p.deal_id, 'UNKNOWN', PerpOrderState.UNKNOWN, err='ack lost')
+    before = len(e.spot.swaps)
+    blockers = recovery.check(e.con, e.legs, resolve=True)
+    assert 'native_stop_unresolved' in blockers
+    assert store.get_native_stop(e.con, p.deal_id)['state'] == 'OPEN'
+    assert store.get_perp_order(e.con, stop['client_id'])['state'] == 'OPEN'
+    assert len(e.spot.swaps) == before

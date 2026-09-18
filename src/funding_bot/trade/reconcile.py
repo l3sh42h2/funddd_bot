@@ -46,6 +46,42 @@ OPEN_PERP = (str(PerpOrderState.INTENT), str(PerpOrderState.SENT), str(PerpOrder
 FOREIGN_NONCE = "nonce занят не нашей транзакцией"
 
 
+def resolve_native_stops(con, deal: dict, legs: Legs) -> list[str]:
+    """Resolve an EVM native SL without initiating the spot unwind.
+
+    This is deliberately usable by startup/deploy recovery: it reads the
+    conditional and records its proven lifecycle, but never sends a swap.  A
+    trigger remains a visible blocker for the normal engine to turn into the
+    separately guarded stop-unwind operation after drain ends.
+    """
+    stop = store.get_native_stop(con, deal["id"])
+    if stop is None or stop["state"] not in ("INTENT", "SENT", "OPEN", "UNKNOWN", "TRIGGERED"):
+        return []
+    if stop["state"] == "TRIGGERED":
+        return ["native_stop_triggered"]
+    if legs.sim:
+        return ["native_stop_unresolved"]
+    query = getattr(legs.perp, "query_conditional", None)
+    if not callable(query):
+        return ["native_stop_unresolved"]
+    try:
+        fill = query(deal["symbol"], stop["client_id"])
+    except Exception as e:  # a failed read is not evidence that the order vanished
+        store.resolve_native_stop(con, deal["id"], "UNKNOWN", PerpOrderState.UNKNOWN, err=redact(e))
+        return ["native_stop_unresolved"]
+    if fill.status == "OPEN":
+        store.resolve_native_stop(con, deal["id"], "OPEN", PerpOrderState.OPEN, order_id=fill.order_id)
+        return ["native_stop_unresolved"]  # armed order blocks an in-place switch
+    if fill.status == "FILLED" and fill.qty == D(str(stop["qty"])):
+        store.resolve_native_stop(con, deal["id"], "TRIGGERED", PerpOrderState.FILLED,
+                                  order_id=fill.order_id, filled_qty=fill.qty)
+        return ["native_stop_triggered"]
+    store.resolve_native_stop(con, deal["id"], "UNKNOWN", PerpOrderState.UNKNOWN,
+                              order_id=fill.order_id, filled_qty=fill.qty,
+                              err=getattr(legs.perp, "last_error", None) or "SL outcome not proven")
+    return ["native_stop_unresolved"]
+
+
 # --- итог сверки одной сделки ----------------------------------------------------------------------------
 @dataclass
 class DealCheck:

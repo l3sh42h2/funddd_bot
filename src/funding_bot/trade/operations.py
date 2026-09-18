@@ -80,7 +80,15 @@ class OperationController:
                     any(deal[k] != run.deal[k] for k in ('inst_json', 'owner_json', 'chain', 'token',
                                                     'token_dec', 'symbol', 'perp_venue', 'sim'))):
                 raise store.StoreError('admission frozen context changed')
-            require_resolved(self.con, deal)
+            native = store.get_native_stop(self.con, run.did)
+            # The only exception is the dedicated risk-reducing stop unwind.
+            # A normal exit still reaches its own cancellation gate before any
+            # spot action, so merely seeing a triggered stop never authorizes
+            # a new trade.
+            allow_triggered = run.kind == 'exit' and native is not None and native['state'] == 'TRIGGERED'
+            allow_native = run.kind == 'exit' and bool(run.spec.get('all')) and not run.spec.get('perp_only')
+            require_resolved(self.con, deal, allow_triggered_native_stop=allow_triggered,
+                             allow_native_stop=allow_native)
             # Generic entry/exit activation is part of admission, so a
             # rejected pre-send check cannot dirty a DRAFT deal.
             if activate is not None:

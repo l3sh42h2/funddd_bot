@@ -183,6 +183,13 @@ class FakeAster(requests.Session):
                 self.hide_queries -= 1
                 return 400, {"code": -2013, "msg": "Order does not exist."}
             return 200, o
+        if key == ("DELETE", "order"):
+            o = self.orders.get(p["origClientOrderId"])
+            if o is None:
+                return 400, {"code": -2013, "msg": "Order does not exist."}
+            o = dict(o, status="CANCELED")
+            self.orders[p["origClientOrderId"]] = o
+            return 200, o
         if key == ("GET", "userTrades"):
             rows = [t for t in self.trades if t["symbol"] == p["symbol"]
                     and ("fromId" not in p or t["id"] >= int(p["fromId"]))
@@ -785,6 +792,16 @@ def test_native_stop_is_buy_take_profit_reduce_only_and_new_is_proven_open(fake)
     assert (p["side"], p["type"], p["reduceOnly"], p["workingType"], p["stopPrice"]) == (
         "BUY", "TAKE_PROFIT_MARKET", "true", "MARK_PRICE", "0.03")
     assert t.query_conditional(SYM, cid).status == "OPEN"
+
+
+def test_native_stop_cancel_is_signed_and_returns_terminal_zero_fill(fake):
+    t = mk(fake)
+    cid = "fb-D7K2-s00-c1-a1"
+    t.take_profit_on_fall(SYM, D(100), D("0.03"), cid, working_type="MARK_PRICE")
+    f = t.cancel_conditional(SYM, cid)
+    assert f.status == "EXPIRED" and f.qty == 0
+    p = [p for m, path, p in fake.log if m == "DELETE" and path == "/fapi/v3/order"][-1]
+    assert p["symbol"] == SYM and p["origClientOrderId"] == cid and p.get("signature")
 
 
 def test_native_stop_is_durable_and_raises_reader_gate(tmp_path):

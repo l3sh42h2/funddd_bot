@@ -737,6 +737,31 @@ class AsterTrade(JournalBoundIoc):
             return _pf(client_id, "UNKNOWN", code=code)
         return conditional_to_fill(client_id, body, 0)
 
+    def cancel_conditional(self, symbol: str, client_id: str) -> PerpFill:
+        """Cancel an armed conditional by its durable client id.
+
+        The caller records ``UNKNOWN`` on an absent response and never proceeds
+        to a spot sale.  A confirmed cancellation is represented as the normal
+        terminal zero-fill ``EXPIRED`` outcome used by the journal.
+        """
+        if not _CID_RE.match(client_id or ""):
+            raise ValueError(f"client_id не проходит шаблон Aster: {client_id!r}")
+        try:
+            st, body, n = self.call("DELETE", "/fapi/v3/order",
+                                    {"symbol": symbol, "origClientOrderId": client_id}, critical=True)
+        except ModeForbidden:
+            raise
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"[:200]
+            return _pf(client_id, "UNKNOWN")
+        code = _code(body)
+        if code == NO_SUCH_ORDER:
+            return _pf(client_id, "NOT_FOUND", code=code)
+        if _is_error(st, body) or not isinstance(body, dict):
+            self.last_error = f"HTTP {st} code {code} {_msg(body)}"
+            return _pf(client_id, "UNKNOWN", nonce=n, code=code)
+        return conditional_to_fill(client_id, body, n)
+
     def query(self, symbol: str, client_id: str) -> PerpFill:
         """GET /order?origClientOrderId. Один -2013 → NOT_FOUND, но это ОДНО наблюдение, не доказательство
         (заявка могла ещё не дойти до движка биржи) — доказательство даёт только settle_unknown().

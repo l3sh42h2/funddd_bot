@@ -414,8 +414,16 @@ class Bot:
                 usd = Decimal(str(spec["usd"]))
             except (KeyError, InvalidOperation):
                 return
-            fn = lambda: self.desk.propose_entry(spec["coin"], spec["spot"], spec["perp"], usd, chat,
-                                                 deal_id=deal["id"] if deal["state"] == DealState.DRAFT else None)
+            stop = spec.get("stop_loss")
+            try:
+                stop_price = None if stop is None else Decimal(str(stop["token_price"]))
+                stop_working_type = None if stop is None else str(stop["working_type"])
+            except (KeyError, InvalidOperation, TypeError):
+                return
+            fn = lambda: self.desk.propose_entry(
+                spec["coin"], spec["spot"], spec["perp"], usd, chat,
+                deal_id=deal["id"] if deal["state"] == DealState.DRAFT else None,
+                stop_price=stop_price, stop_working_type=stop_working_type)
         elif it["kind"] == "exit":
             fn = lambda: self.desk.propose_exit(deal["id"], None if spec.get("all") else dget(spec.get("usd")),
                                                 bool(spec.get("perp_only")), chat)
