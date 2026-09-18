@@ -30,6 +30,13 @@
 лучшей комбинации.
 Качество данных (внешнее ревью 11.09): строка на устаревшей ставке — бледная и после годных; цена по марку, потому
 что книга не обновилась, — «≈» перед ценами; чип площадки краснеет по возрасту самого старого из её источников.
+Спред стакана (владелец 18.09): тоггл «скрыть спред > 3 дн» рядом с «скрыть «не тот актив»» — по умолчанию
+ВЫКЛЮЧЕН (поведение как раньше, ничего не скрывается). Включённый — прячет строки, где спред обеих ног (спот + перп
+у spot/futures, обе ноги пары у futures/futures; ask−bid к мид, спред стакана каждой ноги, calc.spread_book) больше
+ожидаемого дохода за 3 дня (|текущая часовая ставка строки| × 72 — «пересчитай период ставки в 3 дня», не факт
+истории окна «3 дня»). Строка без годного спреда хоть на одной ноге — спред неизвестен, тоггл её не трогает
+(та же логика, что у «1d >»/«7 %»: неизвестное не скрываем молча). Целиком клиентский фильтр (как «курсовой > 7 %»)
+— table.json не меняется, только новое поле spread_book у строки.
 Данные вшиты при рендере, дальше страница тянет /data.json раз в 10 с; режим, сортировки, фильтры и раскрытые
 монеты — в localStorage.
 Верхняя строка (владелец 12.09: «кнопку refresh и чтоб рядом был таймер свежести», «кнопку справа сверху личного
@@ -140,7 +147,7 @@ const $ = s => document.querySelector(s);
 // spSel / ppSel — включённые споты / фьючерсы (null = все); min1d — «1d >» в процентах (ключ новый: прежний «Текущий ≥»
 // из сохранённых настроек не должен перебить значение по умолчанию 0.5)
 const DEF = {mode:'sf', ff:{sort:'spread', dir:-1}, sf:{sort:'spread', dir:-1}, open:{ff:[], sf:[]},
-             hideMis:false, spSel:null, ppSel:null, min1d:'0.5', q:''};
+             hideMis:false, hideSpread3d:false, spSel:null, ppSel:null, min1d:'0.5', q:''};
 let ui = Object.assign({}, DEF);
 // fb_ui4 — настройки прежней версии страницы (режим, сортировки, фильтры); убранная сортировка dev сбрасывается ниже
 try { ui = Object.assign({}, DEF, JSON.parse(localStorage.getItem('fb_ui5') || localStorage.getItem('fb_ui4') || '{}')); } catch(e) {}
@@ -382,6 +389,13 @@ function filtered(){
   rows = rows.filter(r => nz(r.gap) || !(Math.abs(+(r.gap*100).toFixed(2)) > GAP_HIDE));
   visMis[ui.mode] = rows.filter(r => r.mismatch).length;
   if(ui.hideMis) rows = rows.filter(r => !r.mismatch);
+  // владелец 18.09: «спред стакана (спот+перп) больше 3-дневного заработка — не показывать», тоггл по умолчанию выключен.
+  // Доход за 3 дня — оценка вперёд по текущей часовой ставке строки (spread_h у ff, rate_h у sf) × 72, а не факт истории
+  // (окно «3 дня» = windows['72'] считает то же самое иначе — сумму уже расчитанных ставок; здесь другая величина по
+  // прямому указанию владельца: «пересчитай период ставки в 3 дня»). Спред один раз (вход) — не ×2 на выход, консервативная
+  // нижняя оценка (открытый вопрос, зафиксирован в calc.py); неизвестный спред или ставка — строка не скрывается.
+  const income3d = r => { const rr = ui.mode === 'ff' ? r.spread_h : r.rate_h; return nz(rr) ? null : Math.abs(rr) * 72; };
+  if(ui.hideSpread3d) rows = rows.filter(r => { const i3 = income3d(r); return nz(r.spread_book) || nz(i3) || r.spread_book <= i3; });
   // площадки галочками: сделка видна, если её спот среди включённых спотов, а перп(ы) — среди включённых фьючерсов
   const sp = selOf('sp'), pp = selOf('pp');
   if(ui.mode === 'ff'){ if(pp) rows = rows.filter(r => pp.has(r.va) && pp.has(r.vb)); }
@@ -589,6 +603,7 @@ if(document.addEventListener) document.addEventListener('visibilitychange', onSh
 document.querySelectorAll('.seg button').forEach(b => b.onclick = () => { if(ui.mode !== b.dataset.m){ ui.mode = b.dataset.m; save(); safeRender(); } });
 $('#rows').onclick = e => { const t = e.target && e.target.closest ? e.target.closest('.sp') : null; if(t) toggle(t.dataset.b); };
 { const el = $('#hideMis'); el.checked = !!ui.hideMis; el.onchange = () => { ui.hideMis = el.checked; save(); safeRender(); }; }
+{ const el = $('#hideSpread3d'); el.checked = !!ui.hideSpread3d; el.onchange = () => { ui.hideSpread3d = el.checked; save(); safeRender(); }; }
 for(const id of ['min1d','q']){ const el = $('#'+id); el.value = ui[id] || ''; el.oninput = () => { ui[id] = el.value; save(); safeRender(); }; }
 for(const id of Object.keys(PICK)){
   $('#' + id + 'Btn').onclick = e => { e.stopPropagation(); const m = $('#' + id + 'Menu'), open = m.hidden;
@@ -657,6 +672,8 @@ def render(table: dict) -> str:
  <span class="dd sf-only">спот <button id="spBtn" type="button">все ⌄</button><div class="menu" id="spMenu" hidden></div></span>
  <span class="dd">фьючерсы <button id="ppBtn" type="button">все ⌄</button><div class="menu" id="ppMenu" hidden></div></span>
  <label><input type="checkbox" id="hideMis"> скрыть «не тот актив»<span id="misN"></span></label>
+ <label title="спред стакана обеих ног (ask−bid к мид, спот+перп) больше ожидаемого дохода за 3 дня (текущая ставка × 72)">
+  <input type="checkbox" id="hideSpread3d"> скрыть спред &gt; 3 дн</label>
  <label><span id="minLbl">1d &gt;</span> <input type="number" id="min1d" step="0.1" placeholder="%"></label>
  <label><input type="text" id="q" placeholder="монета"></label>
  <span id="shown" class="m"></span>

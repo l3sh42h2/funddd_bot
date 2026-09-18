@@ -103,6 +103,29 @@ def test_ff_gap_uses_per_token_price_with_factors_and_mark_fallback():
     assert abs(row["gap"] - 0.02) < 1e-9 and row["px_a"] == 10.2
 
 
+def test_ff_spread_book_sum_of_both_legs_none_if_either_missing():
+    """18.09: spread_book — сумма round-trip спредов обеих ног (ask−bid к мид, та же quote_rt, что у комиссии
+    площадок-котировок), для фильтра «спред > 3-дневного заработка» на дашборде. Числа простые для ручной проверки:
+    книга A (9.9|10.1) — мид 10.0, спред 0.2/10.0=0.02; книга B (19.8|20.2) — мид 20.0, спред 0.4/20.0=0.02; сумма 0.04."""
+    row = _ff(book_a={"bid": 9.9, "ask": 10.1}, book_b={"bid": 19.8, "ask": 20.2})
+    assert abs(row["spread_book"] - 0.04) < 1e-9
+    assert _ff(book_a=None)["spread_book"] is None       # книга хоть одной ноги не годна (не свежая/чужой снимок) — None
+    assert _ff(book_b=None)["spread_book"] is None
+
+
+def test_sf_row_spread_book_sum_of_both_legs_and_dex_leg_without_spread():
+    item = dict(key="binance_spot:ABCUSDT|binance:ABCUSDT", base="ABC", spot_ex="binance_spot", spot="ABCUSDT",
+                perp_ex="binance", perp="ABCUSDT")
+    args = ({"interval_h": 8}, {"rate": 0.0002, "mark": 10.0})
+    row = calc.build_sf_row(item, *args, {"bid": 9.9, "ask": 10.1}, {"bid": 19.8, "ask": 20.2}, {}, 1000 * H)
+    assert abs(row["spread_book"] - 0.04) < 1e-9         # перп 0.02 + спот 0.02, как в тесте ff выше
+    assert calc.build_sf_row(item, *args, {"bid": 9.9, "ask": 10.1}, None, {}, 1000 * H)["spread_book"] is None
+    # dexleg.book() отдаёт «книгу без спреда» (bid == ask) — вклад спот-ноги 0, а не None: круг остаётся видимым
+    # (издержка DEX-клипа учтена отдельно в «Комиссии», не здесь — см. docstring build_sf_row)
+    row = calc.build_sf_row(item, *args, {"bid": 9.9, "ask": 10.1}, {"bid": 5.0, "ask": 5.0}, {}, 1000 * H)
+    assert abs(row["spread_book"] - 0.02) < 1e-9
+
+
 def test_sf_row_spot_long_perp_short():
     item = dict(key="binance_spot:PEPEUSDT|binance:1000PEPEUSDT", base="PEPE", spot_ex="binance_spot", spot="PEPEUSDT",
                 spot_asset="PEPE", spot_factor=1.0, perp_ex="binance", perp="1000PEPEUSDT", perp_factor=1000.0)

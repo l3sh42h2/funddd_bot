@@ -16,6 +16,15 @@ spot/futures (лонг спот любой спот-площадки + шорт 
   её собственной котировке без комиссии (config.QUOTE_COST_VENUES: Variational RFQ), — плюс полный спред котировки (ревью
   13.09: иначе такие строки выходили самыми дешёвыми); котировки нет — None («—»), как у DEX-ноги;
 - курсовой = цена A / цена B − 1 за один токен, по мидам книг (исполнимая), при их отсутствии по маркам.
+
+Фильтр по спреду стакана (владелец 18.09, «дашборд-скринер»): у каждой строки — spread_book, доля, спред обеих ног
+(round-trip ask−bid к мид, quote_rt — та же величина, что уже стоит в комиссии у площадок-котировок), сложенный один
+раз (вход, не вход+выход — консервативная нижняя оценка стоимости; см. build_ff_row/build_sf_row); None, если книга
+хоть одной ноги не годна (не свежая/не из того снимка — та же проверка, что у цены и комиссии). «3-дневный заработок»
+не хранится отдельным полем — страница (dashboard.py) берёт уже существующую часовую ставку строки (spread_h у
+futures/futures, rate_h у spot/futures — обе уже в час, доля) и умножает на 72 (правило владельца: «пересчитай период
+ставки в 3 дня»); это НЕ то же самое, что окно «3 дня» (windows['72'] — фактическая сумма расчитанных ставок за
+прошедшие 72 ч): «заработок» здесь — оценка вперёд по текущей ставке, а не факт истории, как и просил владелец.
 """
 from __future__ import annotations
 from bisect import bisect_right
@@ -186,6 +195,10 @@ def build_ff_row(item: dict, ins_a: dict | None, ins_b: dict | None, prem_a: dic
                                spread=None if (na == 0 and nb == 0) else (sa or 0.0) - (sb or 0.0),
                                incomplete=_incomplete([comp_a, comp_b], w, now_ms))
     fee, fee_q, has_q = _costs([(va, book_a, prem_a), (vb, book_b, prem_b)])
+    # спред стакана обеих ног (18.09, фильтр «спред > 3-дневного заработка»): та же величина, что уже стоит в комиссии
+    # у площадок-котировок (quote_rt) — round-trip к мид; нет годной книги хоть у одной ноги — None (страница не скрывает)
+    sp_a, sp_b = quote_rt(book_a, prem_a), quote_rt(book_b, prem_b)
+    spread_book = None if sp_a is None or sp_b is None else sp_a + sp_b
     row = dict(
         key=item["key"], base=item["base"], cls=item.get("cls") or "crypto", va=va, vb=vb, sa=item["sa"], sb=item["sb"],
         la=label(va, item["sa"]), lb=label(vb, item["sb"]),
@@ -198,6 +211,7 @@ def build_ff_row(item: dict, ins_a: dict | None, ins_b: dict | None, prem_a: dic
         fee=fee,
         next_a=(prem_a or {}).get("next_ms"), next_b=(prem_b or {}).get("next_ms"),
         mark_a=mark_a, mark_b=mark_b, px_a=px_a, px_b=px_b, px_src_a=src_a, px_src_b=src_b, gap=gap,
+        spread_book=spread_book,
         windows=windows,
     )
     if has_q:
@@ -236,6 +250,10 @@ def build_sf_row(item: dict, ins: dict | None, prem: dict | None, book: dict | N
         windows[str(w)] = dict(spread=s, n=n, incomplete=_incomplete([comp], w, now_ms))
     rate_h = hourly(rate, iv)
     perp_fee, fee_q, has_q = _costs([(ex, book, prem)])        # перп-нога: тейкер ×2 (+ спред у площадки-котировки)
+    # спред стакана обеих ног (18.09): у DEX-споты dex.book() отдаёт «книгу без спреда» (bid=ask) — там весь ход уже в
+    # cost (dex.extra), quote_rt(spot_book, None) честно даст 0, а не задвоит издержку
+    sp_perp, sp_spot = quote_rt(book, prem), quote_rt(spot_book, None)
+    spread_book = None if sp_perp is None or sp_spot is None else sp_perp + sp_spot
     if item.get("dex"):
         # DEX-нога (владелец 12.09: «DEX всё-включено, CEX как есть»): круг по цене на клип (пул + удар в обе стороны)
         # + газ входа и выхода + налог токена + 2 × тейкер перпа; котировки ещё нет — «—»
@@ -256,7 +274,7 @@ def build_sf_row(item: dict, ins: dict | None, prem: dict | None, book: dict | N
         period=iv, rate=rate, rate_h=rate_h, spread=rate_h, fee=fee, dex=(dex or {}).get("tip") if item.get("dex") else None,
         next_ms=(prem or {}).get("next_ms"), mark=mark, px_spot=px_spot, px_perp=px_perp,
         px_src_perp=src_perp, px_src_spot="book" if px_spot else None, gap=gap,
-        half_perp_bps=half_spread_bps(book), half_spot_bps=half_spread_bps(spot_book),
+        half_perp_bps=half_spread_bps(book), half_spot_bps=half_spread_bps(spot_book), spread_book=spread_book,
         windows=windows,
     )
     if has_q:
