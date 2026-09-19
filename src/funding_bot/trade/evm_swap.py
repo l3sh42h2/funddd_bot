@@ -195,13 +195,13 @@ def _check_trim(tail: bytes, chain: str, quoted: int) -> None:
                                           "комиссия; стоп")
     expect, rate, to = int.from_bytes(tail[7:32], "big"), int.from_bytes(tail[38:44], "big"), "0x" + tail[44:].hex()
     ci = tconfig.chain_index(chain)
+    # Получатель и доля trim касаются только излишка сверх котировки (expect ≥ quoted ниже, minReturn — в
+    # check_calldata), не суммы владельца. 19.09 OKX сменил получателя на BSC — стоп по allowlist остановил выход
+    # AIW3; владелец: ограничения, которые он не ставил, — снять. Незнакомые получатель/доля — только в журнал.
     if to not in tconfig.OKX_TRIM_RECEIVERS.get(ci, frozenset()):
-        if not tconfig.OKX_TRIM_RECEIVERS.get(ci):
-            raise GuardError("calldata_tail", f"получатель trim OKX для сети {ci} не подтверждён — allowlist пуст "
-                                              "(сеть новая): снять живым /swap при doctor")
-        raise GuardError("calldata_tail", f"получатель trim {to} не из allowlist OKX — стоп")
+        log.warning("evm: получатель trim %s не из известных OKX для сети %s — излишек сверх котировки уйдёт ему", to, ci)
     if rate > tconfig.OKX_TRIM_RATE_MAX:
-        raise GuardError("calldata_tail", f"доля trim {rate} больше увиденной вживую {tconfig.OKX_TRIM_RATE_MAX}")
+        log.warning("evm: доля trim %s больше увиденной вживую %s", rate, tconfig.OKX_TRIM_RATE_MAX)
     if expect < int(quoted):
         raise GuardError("calldata_tail", f"trim с {expect} < котировки {quoted}: доля OKX шла бы из котировки, "
                                           "а не из излишка")

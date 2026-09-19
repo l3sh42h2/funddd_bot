@@ -738,8 +738,6 @@ TAMPERS = [
     ("calldata_token_out", lambda r: _cd(token_out=OTHER)(r)),
     ("calldata_amount", lambda r: _cd(amount=lambda k: k["amount"] + 1)(r)),
     ("calldata_min_return", lambda r: _cd(min_ret=0)(r)),
-    ("calldata_tail", lambda r: _cd(trim_to=OTHER)(r)),
-    ("calldata_tail", lambda r: _cd(trim_rate=3000)(r)),
     ("calldata_tail", lambda r: _cd(expect=lambda k: k["min_ret"])(r)),
     ("calldata_tail", lambda r: _cd(extra=bytes.fromhex("3ca20afc2aaa") + bytes(26))(r)),   # комиссия дописана
 ]
@@ -775,9 +773,36 @@ def test_real_okx_swap_responses_pass_and_a_flipped_byte_is_refused(side):
     b = check_swap(resp, **kw)
     assert b.min_receive == int(resp["tx"]["minReceiveAmount"]) and b.to == ROUTER
     data = resp["tx"]["data"]
-    resp["tx"]["data"] = data[:-2] + ("00" if data[-2:] != "00" else "01")   # последний байт адреса trim
+    resp["tx"]["data"] = data[:-128] + ("76" if data[-128:-126] != "76" else "75") + data[-126:]   # флаг trim
     with pytest.raises(GuardError) as ei:
         check_swap(resp, **kw)
+    assert ei.value.guard == "calldata_tail"
+
+
+@pytest.mark.parametrize("over", [dict(trim_to=OTHER), dict(trim_rate=3000)])
+def test_unknown_trim_receiver_or_rate_is_warning_not_stop(env, over, caplog):
+    """19.09: OKX сменил получателя trim на BSC — стоп по allowlist остановил выход AIW3. Получатель и доля касаются
+    только излишка сверх котировки (сумму владельца держат minReturn и expect ≥ quoted) — теперь только журнал."""
+    resp = env.okx.swap("56", USDT, AIW3, 100 * E18, Decimal(3), Decimal(5), env.acct.address)
+    _cd(**over)(resp)
+    with caplog.at_level("WARNING"):
+        check_swap(resp, chain="bsc", wallet=env.acct.address, token_in=USDT, token_out=AIW3, amount=100 * E18,
+                   slippage_pct=Decimal(3), impact_cap_pct=Decimal(5), allow_tax=False)
+    assert "trim" in caplog.text
+
+
+def test_okx_trim_receiver_rotated_20260919_is_known(caplog):
+    """Хвост живого /swap 19.09 (продажа 8 387.5 AIW3, VPS): новый получатель OKX 0x7fc8…e58b, доля 100 — без
+    предупреждения; trim из котировки (ожидаемый выход ниже котировки) — по-прежнему стоп."""
+    from funding_bot.trade.evm_swap import _check_trim
+    expect = 335 * E18
+    tail = (bytes.fromhex("777777771111") + b"\x80" + expect.to_bytes(25, "big") + bytes.fromhex("777777771111")
+            + (100).to_bytes(6, "big") + bytes.fromhex("7fc8fd8bb3192e2d62a3d8d97d9a7924d4bae58b"))
+    with caplog.at_level("WARNING"):
+        _check_trim(tail, "bsc", expect)
+    assert "trim" not in caplog.text
+    with pytest.raises(GuardError) as ei:
+        _check_trim(tail, "bsc", expect + 1)
     assert ei.value.guard == "calldata_tail"
 
 

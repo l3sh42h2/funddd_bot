@@ -53,8 +53,11 @@ class NativeAdapter:
             return fn(*args)
         except AdapterError:
             raise
-        except Exception:
-            raise AdapterError(ErrorKind.TRANSIENT, 'native read unavailable or malformed') from None
+        except Exception as e:
+            # Причина — в текст: 19.09 отказ гарда OKX дошёл до Телеграма общей фразой, и повтор был вслепую.
+            from ..keys import redact
+            why = redact(f'{type(e).__name__}: {e}')[:300]
+            raise AdapterError(ErrorKind.TRANSIENT, f'чтение/котировка не прошли — {why}') from None
 
     def observe(self):
         result = self._read(self.bindings.observe, self.spec)

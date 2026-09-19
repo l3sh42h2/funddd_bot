@@ -109,14 +109,14 @@ def test_check_native_guard_message_native_symbol():
     assert ei2.value.guard == "native" and "BNB" in str(ei2.value)
 
 
-# --- trim receiver: та же логика «не подтверждён», для полноты (обычно не достигается — router отказывает раньше) --
-def test_trim_receiver_unknown_on_robinhood_is_stop():
+# --- trim receiver: незнакомый получатель — только журнал (с 19.09: касается лишь излишка сверх котировки) --------
+def test_trim_receiver_unknown_on_robinhood_is_warning(caplog):
     from funding_bot.trade.evm_swap import _check_trim
     tail = bytes.fromhex("777777771111") + b"\x80" + (10).to_bytes(25, "big") + bytes.fromhex("777777771111") \
         + (0).to_bytes(6, "big") + bytes.fromhex("aa" * 20)
-    with pytest.raises(GuardError) as ei:
+    with caplog.at_level("WARNING"):
         _check_trim(tail, "robinhood", 1)
-    assert ei.value.guard == "calldata_tail" and "не подтверждён" not in str(ei.value)
+    assert "0x" + "aa" * 20 in caplog.text
 
 
 def test_trim_tail_live_4663_passes():
