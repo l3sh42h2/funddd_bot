@@ -47,6 +47,10 @@ class ProfileTests(unittest.TestCase):
                          {"solana": "501", "bsc": "56", "robinhood": "4663"})
         self.assertEqual(len(self.config.SPOT_VENUES), 6)
 
+    def test_profile_cannot_reuse_full_mode_table(self):
+        self.assertEqual(str(self.config.TABLE_PATH),
+                         '/var/lib/funding-bot/collector/public/sf-only/table.json')
+
 
 if __name__ == "__main__":
     unittest.main()

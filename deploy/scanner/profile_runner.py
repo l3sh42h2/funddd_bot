@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 FUTURES = ("aster", "binance", "hyperliquid", "kucoin", "gate")
 MODE = "spot_dex_futures_only"
@@ -21,6 +22,9 @@ def apply_profile():
         raise RuntimeError(f"Installed release lacks futures venues: {sorted(missing)}")
     config.PERP_VENUES = FUTURES
     config.PERP_EXCHANGES = FUTURES
+    # EnvironmentFile overrides systemd Environment= for duplicate names.
+    # Fix the output explicitly, so the old full-mode snapshot cannot leak in.
+    config.TABLE_PATH = Path('/var/lib/funding-bot/collector/public/sf-only/table.json')
     config.EXCHANGES = {k: v for k, v in config.EXCHANGES.items()
                         if k in FUTURES or k in config.SPOT_VENUES}
     # This is a deliberate process-local strategy override, not a source edit.
@@ -59,6 +63,21 @@ def main(argv=None):
                           "spots": config.SPOT_VENUES, "dex_chains": config.OKX_DEX_CHAINS,
                           "clients": sorted(clients)}, ensure_ascii=False))
         return 0
+    if args == ["serve"]:
+        from funding_bot import dashboard
+        original_render = dashboard.render
+
+        def render_profile(table):
+            html = original_render(table)
+            guard = "if(ui.mode !== 'ff' && ui.mode !== 'sf') ui.mode = 'sf';"
+            if guard not in html:
+                raise RuntimeError("Dashboard mode initialization contract changed")
+            html = html.replace(guard, "ui.mode = 'sf';")
+            html = html.replace('</head>', '<style>.seg button[data-m="ff"],.cab{display:none!important}</style></head>')
+            html = html.replace('<body>', '<body><div style="padding:10px;text-align:center">Spot + DEX / Futures · Binance, Hyperliquid, Aster, Gate, KuCoin · только мониторинг</div>')
+            return html
+
+        dashboard.render = render_profile
     from funding_bot.cli import main as cli_main
     return cli_main(args)
 

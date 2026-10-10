@@ -27,6 +27,9 @@ for u in funding_bot-collector funding_bot-core funding_bot-interface funding_bo
         echo "Refusing startup: existing $u is active"; exit 1
     fi
 done
+# Only this profile's own units are restarted; existing bot units were checked
+# inactive above. Stop them before replacing a running launcher.
+systemctl stop funding_bot-sf-web.service funding_bot-sf-collector.service 2>/dev/null || true
 install -d -o root -g root -m 755 /opt/funding-bot/scanner-profile
 install -m 644 profile_runner.py test_profile.py /opt/funding-bot/scanner-profile/
 # systemd reads the root-only EnvironmentFile, exactly as for production units.
