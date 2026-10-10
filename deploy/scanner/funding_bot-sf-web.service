@@ -1,0 +1,32 @@
+[Unit]
+Description=Funding market-only dashboard without Telegram/core
+After=network-online.target funding_bot-sf-collector.service
+Wants=network-online.target funding_bot-sf-collector.service
+Conflicts=funding_bot-interface.service funding_bot-web.service
+
+[Service]
+Slice=funding-scan.slice
+User=funding-interface
+Group=funding-interface
+SupplementaryGroups=funding-market
+WorkingDirectory=/opt/funding-bot/current
+Environment=PYTHONPATH=/opt/funding-bot/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=FUNDING_BOT_RUNTIME=/var/lib/funding-bot/interface
+Environment=FUNDING_TABLE_PATH=/var/lib/funding-bot/collector/public/sf-only/table.json
+Environment=FUNDING_CORE_SOCKET=/nonexistent/scanner-only.sock
+ExecStart=/opt/funding-bot/current/.venv/bin/python /opt/funding-bot/scanner-profile/profile_runner.py serve
+Restart=on-failure
+RestartSec=10
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/funding-bot/interface
+ReadOnlyPaths=/var/lib/funding-bot/collector/public
+InaccessiblePaths=/var/lib/funding-bot/core /var/lib/funding-bot/shared /var/lib/funding-bot/secrets /var/lib/funding-bot/collector/funding_bot.db
+
+[Install]
+WantedBy=multi-user.target

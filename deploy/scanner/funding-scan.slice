@@ -1,0 +1,9 @@
+[Unit]
+Description=Funding public scanner resource budget
+
+[Slice]
+CPUQuota=100%
+CPUWeight=10
+MemoryHigh=1G
+MemoryMax=1536M
+MemorySwapMax=0
