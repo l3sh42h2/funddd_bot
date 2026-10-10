@@ -29,20 +29,14 @@ for u in funding_bot-collector funding_bot-core funding_bot-interface funding_bo
 done
 install -d -o root -g root -m 755 /opt/funding-bot/scanner-profile
 install -m 644 profile_runner.py test_profile.py /opt/funding-bot/scanner-profile/
-# Check with collector's environment inside systemd's sandbox, no secret output.
-cat > "$incoming/check.sh" <<'CHECK'
-#!/bin/bash
-set -eu
-set -a
-source /var/lib/funding-bot/secrets/collector.env
-set +a
-export PYTHONPATH=/opt/funding-bot/current/src
-export PYTHONDONTWRITEBYTECODE=1
-cd /opt/funding-bot/scanner-profile
-exec /opt/funding-bot/current/.venv/bin/python test_profile.py
-CHECK
-chmod 755 "$incoming/check.sh"
-runuser -u funding-collector -- "$incoming/check.sh"
+# systemd reads the root-only EnvironmentFile, exactly as for production units.
+# The collector user must not gain direct access to the secrets directory.
+systemd-run --quiet --wait --pipe --collect --unit="funding-sf-check-$$" \
+    --uid=funding-collector \
+    --property=EnvironmentFile=/var/lib/funding-bot/secrets/collector.env \
+    --setenv=PYTHONPATH=/opt/funding-bot/current/src \
+    --setenv=PYTHONDONTWRITEBYTECODE=1 \
+    /opt/funding-bot/current/.venv/bin/python /opt/funding-bot/scanner-profile/test_profile.py
 systemd-analyze verify funding_bot-sf-collector.service funding_bot-sf-web.service funding-scan.slice
 install -d -o funding-collector -g funding-market -m 750 /var/lib/funding-bot/collector/public/sf-only
 install -m 644 funding_bot-sf-collector.service funding_bot-sf-web.service funding-scan.slice /etc/systemd/system/
