@@ -4,6 +4,6 @@ Description=Funding public scanner resource budget
 [Slice]
 CPUQuota=100%
 CPUWeight=10
-MemoryHigh=1G
+MemoryHigh=1280M
 MemoryMax=1536M
 MemorySwapMax=0
