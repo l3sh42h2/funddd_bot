@@ -71,5 +71,9 @@ else:
     raise SystemExit('No fresh SF-only snapshot; web was not started')
 PY
 systemctl enable --now funding_bot-sf-web.service
-systemctl start funding_bot-tunnel.service
+if [ -e /etc/nginx/sites-enabled/funding-scanner ]; then
+    systemctl start nginx
+else
+    systemctl start funding_bot-tunnel.service
+fi
 systemctl is-active funding_bot-sf-collector.service funding_bot-sf-web.service
